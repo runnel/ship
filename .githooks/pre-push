@@ -1,2 +1,2 @@
 #!/bin/sh
-exec node "$(git rev-parse --show-toplevel)/bin/ship.mjs" leak --pre-push
+exec node "$(git rev-parse --show-toplevel)/bin/ship.mjs" leak --pre-push "$1"

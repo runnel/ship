@@ -67,7 +67,7 @@ cleans up.
 
 ## Leak guard (for this repository)
 
-`ship leak --staged | --msg <file> | --pre-push | --all | --history [--generic-only]` scans for
+`ship leak --staged | --msg <file> | --pre-push [remote] | --all | --history [--generic-only]` scans for
 shapes that must not be published, including commit author and committer identities. Enable with
 `git config core.hooksPath .githooks` and create `~/.config/ship/denylist`.
 

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdir, readFile, writeFile } from 'node:fs/promises';
+import { readdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { Readable } from 'node:stream';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scanText, loadDenylist, runLeak } from '../lib/leak.mjs';
@@ -81,4 +82,121 @@ test("this repository's own files pass the generic rules", async () => {
   const findings = [];
   for (const f of await walk(root)) findings.push(...scanText(await readFile(f, 'utf8'), { source: f.slice(root.length) }));
   assert.deepEqual(findings, []);
+});
+
+// --- fail-closed behaviour (scratch repositories) ---------------------------------------------
+
+const NOREPLY = '1+x' + AT + 'users.noreply.github.com';
+const LEAKY = 'mail bob' + AT + 'corp.ee\n';
+const git = (dir, ...args) => capture('git', ['-C', dir, '-c', 'core.hooksPath=/dev/null', ...args]);
+
+async function scratchRepo(files = {}) {
+  const dir = await tempDir('leak-');
+  await capture('git', ['init', '--quiet', '--initial-branch=main', dir]);
+  await git(dir, 'config', 'user.name', 'x');
+  await git(dir, 'config', 'user.email', NOREPLY);
+  await git(dir, 'config', 'commit.gpgsign', 'false');
+  await writeAll(dir, files);
+  return dir;
+}
+async function writeAll(dir, files) {
+  for (const [name, content] of Object.entries(files)) await writeFile(join(dir, name), content);
+}
+async function commitAll(dir, message = 'm') {
+  await git(dir, 'add', '-A');
+  await git(dir, 'commit', '--quiet', '-m', message);
+  return (await git(dir, 'rev-parse', 'HEAD')).trim();
+}
+const collect = () => {
+  const lines = [];
+  return { lines, out: (l) => lines.push(l) };
+};
+
+test('--pre-push still scans when the remote tip is unknown locally (force push, GitHub-side commit)', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await commitAll(dir, 'one');
+  await writeAll(dir, { 'b.txt': LEAKY });
+  const tip = await commitAll(dir, 'two');
+  const c = collect();
+  const stdin = Readable.from([`refs/heads/main ${tip} refs/heads/main ${'f'.repeat(40)}\n`]);
+  assert.equal(await runLeak(['--pre-push', 'origin', '--generic-only'], { cwd: dir, out: c.out, stdin }), 1);
+  assert.ok(c.lines.some((l) => l.includes('e-mail address')), c.lines.join('\n'));
+});
+
+test('--pre-push: a clean range passes, a deleted ref is skipped, a new branch is scanned', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  const first = await commitAll(dir, 'one');
+  await writeAll(dir, { 'b.txt': 'also clean\n' });
+  const second = await commitAll(dir, 'two');
+  const run = (line) => runLeak(['--pre-push', 'origin', '--generic-only'], { cwd: dir, out: () => {}, stdin: Readable.from([line]) });
+  assert.equal(await run(`refs/heads/main ${second} refs/heads/main ${first}\n`), 0);
+  assert.equal(await run(`(delete) ${'0'.repeat(40)} refs/heads/gone ${first}\n`), 0);
+  await writeAll(dir, { 'c.txt': LEAKY });
+  const third = await commitAll(dir, 'three');
+  assert.equal(await run(`refs/heads/feat ${third} refs/heads/feat ${'0'.repeat(40)}\n`), 1);
+  assert.equal(await run(`refs/heads/main ${third} refs/heads/main ${second}\n`), 1);
+});
+
+test('--history and --all refuse, instead of reporting clean, when git cannot be read', async () => {
+  const notARepo = await tempDir('nogit-');
+  for (const mode of ['--history', '--all']) {
+    const c = collect();
+    assert.equal(await runLeak([mode, '--generic-only'], { cwd: notARepo, out: c.out }), 1, mode);
+    assert.ok(c.lines.some((l) => l.includes('cannot verify')), c.lines.join('\n'));
+    assert.ok(!c.lines.some((l) => l.includes('clean')), c.lines.join('\n'));
+  }
+});
+
+test('a binary blob is a finding unless its path is allowlisted', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await writeFile(join(dir, 'blob.bin'), Buffer.from('bin\0ary ' + LEAKY));
+  await git(dir, 'add', '-A');
+  const c = collect();
+  assert.equal(await runLeak(['--staged', '--generic-only'], { cwd: dir, out: c.out }), 1);
+  assert.ok(c.lines.some((l) => l.includes('blob.bin') && l.includes('binary file')), c.lines.join('\n'));
+  assert.equal(await runLeak(['--staged', '--generic-only'], { cwd: dir, out: () => {}, binaryAllow: ['*.bin'] }), 0);
+});
+
+test('binary files added in history are findings too (git log -p only says "Binary files differ")', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await commitAll(dir, 'one');
+  await writeFile(join(dir, 'blob.bin'), Buffer.from('bin\0ary ' + LEAKY));
+  await commitAll(dir, 'two');
+  const c = collect();
+  assert.equal(await runLeak(['--history', '--generic-only'], { cwd: dir, out: c.out }), 1);
+  assert.ok(c.lines.some((l) => l.includes('binary file')), c.lines.join('\n'));
+  assert.equal(await runLeak(['--history', '--generic-only'], { cwd: dir, out: () => {}, binaryAllow: ['*.bin'] }), 0);
+});
+
+test('a NUL byte later in a text patch does not exempt the whole commit from scanning', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await commitAll(dir, 'one');
+  await writeFile(join(dir, 'late.txt'), LEAKY + 'x'.repeat(9000) + '\0tail\n');
+  await commitAll(dir, 'two');
+  assert.equal(await runLeak(['--history', '--generic-only'], { cwd: dir, out: () => {} }), 1);
+});
+
+test('--all scans the committed blobs, not the working tree', async () => {
+  const dir = await scratchRepo({ 'notes.txt': LEAKY, 'gone.txt': LEAKY });
+  await commitAll(dir);
+  await writeAll(dir, { 'notes.txt': 'clean now\n' }); // edited after the commit, never staged
+  await rm(join(dir, 'gone.txt'));
+  const c = collect();
+  assert.equal(await runLeak(['--all', '--generic-only'], { cwd: dir, out: c.out }), 1);
+  assert.ok(c.lines.some((l) => l.startsWith('✗ notes.txt:1')), c.lines.join('\n'));
+  assert.ok(c.lines.some((l) => l.startsWith('✗ gone.txt:1')), c.lines.join('\n'));
+});
+
+test('--msg scans the message file and refuses an unreadable one', async () => {
+  const dir = await tempDir();
+  await writeFile(join(dir, 'ok'), 'fix: something\n');
+  await writeFile(join(dir, 'bad'), 'fix: ' + LEAKY);
+  assert.equal(await runLeak(['--msg', join(dir, 'ok'), '--generic-only'], { cwd: dir, out: () => {} }), 0);
+  assert.equal(await runLeak(['--msg', join(dir, 'bad'), '--generic-only'], { cwd: dir, out: () => {} }), 1);
+  assert.equal(await runLeak(['--msg', join(dir, 'missing'), '--generic-only'], { cwd: dir, out: () => {} }), 1);
+});
+
+test('.gitignore keeps Finder metadata out of the published tree', async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  assert.ok((await readFile(join(root, '.gitignore'), 'utf8')).split('\n').includes('.DS_Store'));
 });
