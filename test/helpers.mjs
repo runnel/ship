@@ -67,9 +67,9 @@ export const CONFIG = (steps, extra = {}) =>
 // origin: main has the config + a.txt; branch feat adds featFiles; main then moves with mainFiles.
 export async function setupCheck({
   steps = ['test -f src/x.ts', 'test -f b.txt'], checkExtra = {},
-  featFiles = { 'src/x.ts': 'x\n' }, mainFiles = { 'b.txt': 'b\n' }, prOverrides = {}, mainConfig = true,
+  featFiles = { 'src/x.ts': 'x\n' }, mainFiles = { 'b.txt': 'b\n' }, prOverrides = {}, mainConfig = true, configText = null,
 } = {}) {
-  const { origin, work, root } = await makeOrigin({ ...(mainConfig ? { 'ship.config.mjs': CONFIG(steps, checkExtra) } : {}), 'a.txt': 'a\n' });
+  const { origin, work, root } = await makeOrigin({ ...(mainConfig ? { 'ship.config.mjs': configText ?? CONFIG(steps, checkExtra) } : {}), 'a.txt': 'a\n' });
   await git(['checkout', '--quiet', '-b', 'feat'], work);
   const head = await commitFiles(work, featFiles, 'feat');
   await git(['push', '--quiet', 'origin', 'feat'], work);

@@ -97,3 +97,13 @@ test('a repository with no config anywhere is an error, not a pass', async () =>
   assert.equal(last.state, 'error');
   assert.match(last.description, /no ship\.config\.mjs/);
 });
+
+test('a status description never carries a local path', async () => {
+  // The config function quotes the worktree path it is given, as many real error messages do.
+  const s = await setup({ configText: "export default ({ root }) => { throw new Error('cannot read ' + root); };\n" });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1);
+  const last = (await s.statuses()).at(-1);
+  assert.equal(last.state, 'error');
+  assert.ok(last.description.startsWith('config: cannot read $SHIP_TMP/w/'), last.description);
+  assert.ok(!last.description.includes(s.deps.tmpRoot), last.description);
+});
