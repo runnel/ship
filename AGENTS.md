@@ -16,4 +16,8 @@ This repository is **public**. Before anything else:
 - The leak guard runs on commit, commit message and push (`git config core.hooksPath .githooks`)
   and needs `~/.config/ship/denylist` (one term per line; never committed).
 - Changes go through pull requests; GitHub CI (free for public repos) runs the tests.
+- Pull requests are judged by main's copy of the leak guard, not their own (the self-check and CI
+  extract `lib` and `bin` from main). So a `BINARY_ALLOW` entry must land in its own pull request
+  before the binary it allows, and a false positive that is already in history can only be cleared
+  by the owner bypassing the branch protection.
 - Zero runtime dependencies. Node >= 24. `npm test` runs everything.
