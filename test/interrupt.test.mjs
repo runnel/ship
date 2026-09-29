@@ -56,7 +56,7 @@ setInterval(() => {}, 1000);
   }
 });
 
-test('a second signal during the unwind does not start a second unwind', { timeout: 30_000 }, async () => {
+test('a repeated signal during the unwind starts no second unwind, and says why nothing happens (once)', { timeout: 30_000 }, async () => {
   const dir = await tempDir();
   const out = join(dir, 'out');
   const script = join(dir, 's.mjs');
@@ -64,19 +64,25 @@ test('a second signal during the unwind does not start a second unwind', { timeo
   await writeFile(script, `
 import { appendFileSync } from 'node:fs';
 import { onInterrupt } from ${JSON.stringify(mod)};
-onInterrupt(async () => { appendFileSync(${JSON.stringify(out)}, 'x,'); await new Promise((r) => setTimeout(r, 400)); });
+onInterrupt(async () => { appendFileSync(${JSON.stringify(out)}, 'x,'); await new Promise((r) => setTimeout(r, 600)); });
 process.stdout.write('ready\\n');
 setInterval(() => {}, 1000);
 `);
-  const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'inherit'] });
+  const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '';
+  child.stderr.on('data', (b) => { stderr += b; });
   try {
     await ready(child);
     child.kill('SIGTERM');
     await new Promise((r) => setTimeout(r, 100));
     child.kill('SIGINT');
+    await new Promise((r) => setTimeout(r, 100));
+    child.kill('SIGINT');
     const [code] = await Promise.race([once(child, 'exit'), deadline(10_000, 'child exit')]);
     assert.equal(code, 130);
     assert.equal(await readFile(out, 'utf8'), 'x,');
+    assert.equal(stderr.split('\n').filter((l) => /already interrupted/.test(l)).length, 1, stderr);
+    assert.match(stderr, /at most 30 s/);
   } finally {
     child.kill('SIGKILL');
   }
