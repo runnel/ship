@@ -268,3 +268,25 @@ for (const target of ['process', 'group']) {
     }
   });
 }
+
+test('a hanging error POST (captive portal, half-open connection) does not hold the cleanup until the hard deadline', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const started = join(dir, 'started');
+  const s = await setupCheck({
+    steps: [`trap "exit 0" TERM INT; touch ${started}; sleep 31.4159 & wait`],
+    ghOptions: { apiDelay: { ms: 120_000, match: 'state=error' } }, // the error POST never answers
+  });
+  const run = await spawnCheckLeader(s, dir, { unwindPostTimeoutMs: 800 });
+  try {
+    await waitFor(() => exists(started), 30_000, 'the first step to start');
+    const signalled = Date.now();
+    run.child.kill('SIGTERM');
+    assert.equal(await Promise.race([run.exited, deadline(15_000, 'ship exit')]), 130, run.out.text);
+    assert.ok(Date.now() - signalled < 12_000, `took ${Date.now() - signalled} ms`);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'lanes')), []);
+    assert.ok(!(await s.statuses()).some((x) => x.state === 'success'));
+  } finally {
+    run.kill();
+  }
+});
