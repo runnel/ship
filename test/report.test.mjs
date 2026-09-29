@@ -39,3 +39,15 @@ test('scrubPaths also replaces the system temp directory (where configs are eval
   assert.equal(scrubPaths("Cannot find module '/var/t/T/ship-config-ab12/x.mjs'", roots), "Cannot find module '$TMPDIR/ship-config-ab12/x.mjs'");
   assert.equal(scrubPaths('/var/t/T/ship-1/w/c-1', roots), '$SHIP_TMP/w/c-1'); // the longer root wins
 });
+
+test('an invalid SHIP_TZ (or zone) falls back to the system zone instead of throwing', () => {
+  const saved = process.env.SHIP_TZ;
+  process.env.SHIP_TZ = 'Not/AZone';
+  try {
+    assert.match(localTime('2026-09-29T11:32:00Z'), /^\d\d\/\d\d, \d\d:\d\d$/);
+    assert.match(localTime('2026-09-29T11:32:00Z', { timeZone: 'Also/Wrong' }), /^\d\d\/\d\d, \d\d:\d\d$/);
+  } finally {
+    if (saved === undefined) delete process.env.SHIP_TZ;
+    else process.env.SHIP_TZ = saved;
+  }
+});
