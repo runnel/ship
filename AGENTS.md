@@ -5,7 +5,9 @@ This repository is **public**. Before anything else:
 - Never put a real project, client, person or company name, an absolute user path, an e-mail
   address, a service id (Supabase ref, Cloudflare account id, named `*.workers.dev` subdomain) or
   a secret in a file or a commit message. Use `example-app`, `example.workers.dev`,
-  `acme/app`.
+  `acme/app`. The only e-mail addresses that may appear are `noreply@anthropic.com`,
+  `noreply@github.com` (GitHub's own committer address), `*@users.noreply.github.com`,
+  `git@github.com` (an SSH remote) and `example.com|org|net` addresses.
 - Commits must be authored with the GitHub noreply address (`git config user.email`); the
   pre-commit hook refuses anything else.
 - Incident history, measurements and war stories about a particular project belong in that

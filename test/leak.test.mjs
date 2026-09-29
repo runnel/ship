@@ -25,6 +25,11 @@ test('flags e-mail addresses except allowed ones', () => {
   assert.deepEqual(rules('git' + AT + 'github.com:acme/app.git'), []);
 });
 
+test("GitHub's own committer address (web merges, squash merges) is allowed", () => {
+  assert.deepEqual(rules('GitHub <noreply' + AT + 'github.com>'), []);
+  assert.deepEqual(rules('other-noreply' + AT + 'github.com'), ['e-mail address']);
+});
+
 test('flags service identifiers', () => {
   assert.deepEqual(rules('https://' + 'abcdefghij0123456789' + '.supa' + 'base.co'), ['Supabase project URL']);
   assert.deepEqual(rules('id ' + '0123456789abcdef'.repeat(2)), ['Cloudflare account id']);
