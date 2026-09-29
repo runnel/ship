@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
-import { buildEnv, run, capture } from '../lib/proc.mjs';
+import { buildEnv, run, capture, ownsItsGroup } from '../lib/proc.mjs';
 import { isGone, killQuietly, readPid, tempDir } from './helpers.mjs';
 
 const tmp = () => tempDir('proc-');
@@ -121,4 +121,14 @@ test('a descendant that ignores SIGTERM is SIGKILLed and the timeout still retur
   } finally {
     killQuietly(await readPid(pidFile).catch(() => 0));
   }
+});
+
+test('a process group is ship\'s own only when ship leads it and has no controlling terminal', () => {
+  assert.equal(ownsItsGroup({ pid: 10, pgid: '10', tty: '??' }), true); // macOS, after setsid
+  assert.equal(ownsItsGroup({ pid: 10, pgid: 10, tty: '?' }), true); // Linux, after setsid
+  assert.equal(ownsItsGroup({ pid: 10, pgid: '10', tty: 'ttys003' }), false); // a shell job: `ship check | tee log`
+  assert.equal(ownsItsGroup({ pid: 10, pgid: '10', tty: 'pts/3' }), false);
+  assert.equal(ownsItsGroup({ pid: 10, pgid: '4', tty: '??' }), false); // not the leader
+  assert.equal(ownsItsGroup({ pid: 10, pgid: '10', tty: '' }), false); // unknown is not ours
+  assert.equal(ownsItsGroup({ pid: 10, pgid: undefined, tty: '??' }), false);
 });
