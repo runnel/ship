@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { readdir, readFile, writeFile, rm, symlink, unlink } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,6 +39,16 @@ test('flags service identifiers', () => {
   assert.deepEqual(rules('gh' + 'p_' + 'a'.repeat(36)), ['GitHub token']);
 });
 
+test('flags more secret shapes', () => {
+  assert.deepEqual(rules('key ' + 'sk-' + 'ant-' + 'api03-' + 'a'.repeat(30)), ['Anthropic API key']);
+  assert.deepEqual(rules('key ' + 'sk_' + 'live_' + 'a'.repeat(24)), ['Stripe live key']);
+  assert.deepEqual(rules('key ' + 'rk_' + 'live_' + 'a'.repeat(24)), ['Stripe live key']);
+  assert.deepEqual(rules('token ' + 'xox' + 'b-' + '1234567890-abcdefghij'), ['Slack token']);
+  assert.deepEqual(rules('token ' + 'npm' + '_' + 'a'.repeat(36)), ['npm token']);
+  assert.deepEqual(rules('key ' + 'AI' + 'za' + 'a'.repeat(35)), ['Google API key']);
+  assert.deepEqual(rules('sk-learn and npm_config are ordinary words'), []);
+});
+
 test('denylist terms match whole words, case-insensitively, reported without the term', () => {
   assert.deepEqual(scanText('Hello Acme-Client world', { denylist: ['acme-client'], source: 'x.md' }), [{ source: 'x.md', line: 1, rule: 'denylist' }]);
   assert.deepEqual(rules('Canada day', { denylist: ['ada'] }), []);
@@ -52,6 +62,13 @@ test('loadDenylist ignores comments and blanks, and fails closed when missing', 
   await writeFile(file, '# terms\nAcme\n\n  Other Corp \n');
   assert.deepEqual(await loadDenylist(file), ['acme', 'other corp']);
   await assert.rejects(() => loadDenylist(join(dir, 'missing')));
+});
+
+test('an empty denylist is refused like a missing one', async () => {
+  const dir = await tempDir();
+  const file = join(dir, 'denylist');
+  await writeFile(file, '# only comments\n\n');
+  await assert.rejects(() => loadDenylist(file), /empty/);
 });
 
 test('--staged refuses a commit identity that is not a noreply address', async () => {
@@ -199,4 +216,53 @@ test('--msg scans the message file and refuses an unreadable one', async () => {
 test('.gitignore keeps Finder metadata out of the published tree', async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
   assert.ok((await readFile(join(root, '.gitignore'), 'utf8')).split('\n').includes('.DS_Store'));
+});
+
+test('file names are scanned too, and a staged type change is not skipped', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n', 'link': 'clean\n' });
+  await commitAll(dir);
+  await writeFile(join(dir, 'bob' + AT + 'corp.ee.txt'), 'clean\n');
+  await git(dir, 'add', '-A');
+  const c = collect();
+  assert.equal(await runLeak(['--staged', '--generic-only'], { cwd: dir, out: c.out }), 1);
+  assert.ok(c.lines.some((l) => l.includes('e-mail address (in the file name)')), c.lines.join('\n'));
+  await git(dir, 'reset', '--quiet');
+  await rm(join(dir, 'bob' + AT + 'corp.ee.txt'));
+
+  // regular file -> symlink whose target text leaks: a "T" entry in the index diff
+  await unlink(join(dir, 'link'));
+  await symlink('x/bob' + AT + 'corp.ee', join(dir, 'link'));
+  await git(dir, 'add', '-A');
+  assert.equal(await runLeak(['--staged', '--generic-only'], { cwd: dir, out: () => {} }), 1);
+});
+
+test('a denylisted term in a file name is a finding', async () => {
+  const dir = await scratchRepo({});
+  await writeFile(join(dir, 'zebra-notes.txt'), 'clean\n');
+  await git(dir, 'add', '-A');
+  const list = join(await tempDir(), 'denylist');
+  await writeFile(list, 'zebra\n');
+  const saved = process.env.SHIP_DENYLIST;
+  process.env.SHIP_DENYLIST = list;
+  try {
+    const c = collect();
+    assert.equal(await runLeak(['--staged'], { cwd: dir, out: c.out }), 1);
+    assert.ok(c.lines.some((l) => l.endsWith(': denylist (in the file name)')), c.lines.join('\n'));
+  } finally {
+    if (saved === undefined) delete process.env.SHIP_DENYLIST;
+    else process.env.SHIP_DENYLIST = saved;
+  }
+});
+
+test('--pre-push trusts only the remote being pushed to', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await commitAll(dir, 'one');
+  await writeAll(dir, { 'b.txt': LEAKY });
+  const tip = await commitAll(dir, 'two');
+  await git(dir, 'update-ref', 'refs/remotes/other/main', tip); // another remote already has it
+  const push = (remote) => runLeak(['--pre-push', remote, '--generic-only'], {
+    cwd: dir, out: () => {}, stdin: Readable.from([`refs/heads/main ${tip} refs/heads/main ${'0'.repeat(40)}\n`]),
+  });
+  assert.equal(await push('origin'), 1);
+  assert.equal(await push('other'), 0);
 });
