@@ -35,6 +35,14 @@ test('mirror, worktree, merge with main, diff since the merge base', async () =>
   await assert.rejects(() => access(wt));
 });
 
+test('showFile answers null only for a file that is not there; other git errors are not swallowed', async () => {
+  const { mirror } = await branchAndMain({ feat: { 'src/x.ts': 'x\n' }, main: { 'b.txt': 'b\n' } });
+  assert.equal(await showFile(mirror, 'refs/heads/main', 'nope.txt'), null);
+  assert.equal(await showFile(mirror, 'refs/heads/main', 'b.txt'), 'b\n');
+  await assert.rejects(() => showFile(mirror, 'f'.repeat(40), 'b.txt'));
+  await assert.rejects(() => showFile(join(mirror, 'not-a-repository'), 'refs/heads/main', 'b.txt'));
+});
+
 test('a conflicting merge is reported, not thrown', async () => {
   const { root, head, mirror } = await branchAndMain({ feat: { 'a.txt': 'feature\n' }, main: { 'a.txt': 'main\n' } });
   const wt = join(root, 'wt');

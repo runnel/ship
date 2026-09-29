@@ -82,3 +82,18 @@ test('the config comes from main, not from the PR', async () => {
   });
   assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1);
 });
+
+test('a repository whose main has no config yet is checked with the PR\'s own, and says so', async () => {
+  const s = await setup({ mainConfig: false, steps: ['exit 5'], featFiles: { 'src/x.ts': 'x\n', 'ship.config.mjs': CONFIG(['exit 5']) } });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1);
+  assert.match((await s.statuses()).at(-1).description, /^unit: exit 5 failed/);
+  assert.ok(s.lines.some((l) => l.includes('has no ship.config.mjs') && l.includes('PR')), s.lines.join('\n'));
+});
+
+test('a repository with no config anywhere is an error, not a pass', async () => {
+  const s = await setup({ mainConfig: false });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1);
+  const last = (await s.statuses()).at(-1);
+  assert.equal(last.state, 'error');
+  assert.match(last.description, /no ship\.config\.mjs/);
+});
