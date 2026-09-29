@@ -60,3 +60,35 @@ process.exit(1);
   const calls = async () => (await readFile(log, 'utf8').catch(() => '')).split('\n').filter(Boolean).map((l) => JSON.parse(l));
   return { gh: script, calls };
 }
+
+export const CONFIG = (steps, extra = {}) =>
+  `export default { repo: 't/r', docsOnly: ['*.md'], checks: [${JSON.stringify({ name: 'unit', paths: ['src/**'], steps, ...extra })}] };\n`;
+
+// origin: main has the config + a.txt; branch feat adds featFiles; main then moves with mainFiles.
+export async function setupCheck({
+  steps = ['test -f src/x.ts', 'test -f b.txt'], checkExtra = {},
+  featFiles = { 'src/x.ts': 'x\n' }, mainFiles = { 'b.txt': 'b\n' }, prOverrides = {},
+} = {}) {
+  const { origin, work, root } = await makeOrigin({ 'ship.config.mjs': CONFIG(steps, checkExtra), 'a.txt': 'a\n' });
+  await git(['checkout', '--quiet', '-b', 'feat'], work);
+  const head = await commitFiles(work, featFiles, 'feat');
+  await git(['push', '--quiet', 'origin', 'feat'], work);
+  await git(['checkout', '--quiet', 'main'], work);
+  await commitFiles(work, mainFiles, 'main moves');
+  await git(['push', '--quiet', 'origin', 'main'], work);
+  await git(['checkout', '--quiet', 'feat'], work);
+  await git(['remote', 'set-url', 'origin', 'https://github.com/t/r.git'], work);
+  const pr = { number: 7, headRefOid: head, headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'OPEN', ...prOverrides };
+  const fake = await fakeGh(root, { pr });
+  const lines = [];
+  const deps = {
+    gh: fake.gh, remoteUrl: () => origin,
+    mirrorRoot: join(root, 'mirrors'), tmpRoot: join(root, 'tmp'), logRoot: join(root, 'logs'),
+    out: (s) => lines.push(s), pollMs: 10,
+  };
+  const statuses = async () =>
+    (await fake.calls())
+      .filter((a) => a[0] === 'api')
+      .map((a) => Object.fromEntries(a.filter((x) => /^(state|description)=/.test(x)).map((x) => [x.slice(0, x.indexOf('=')), x.slice(x.indexOf('=') + 1)])));
+  return { work, deps, statuses, lines, origin, root, gh: fake.gh };
+}
