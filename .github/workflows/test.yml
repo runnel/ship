@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -14,5 +16,10 @@ jobs:
         with:
           node-version: '24'
       - run: node --test "test/**/*.test.mjs"
+      # A pull request must not weaken its own gate: the guard that judges the tree is main's copy.
       # The private denylist exists only on the owner's machine; CI checks the generic shapes.
-      - run: node bin/ship.mjs leak --all --generic-only
+      - run: |
+          set -o pipefail
+          guard=$(mktemp -d)
+          git archive origin/main lib bin | tar -x -C "$guard"
+          node "$guard/bin/ship.mjs" leak --all --generic-only
