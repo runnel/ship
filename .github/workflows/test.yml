@@ -1,0 +1,18 @@
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - run: node --test "test/**/*.test.mjs"
+      # The private denylist exists only on the owner's machine; CI checks the generic shapes.
+      - run: node bin/ship.mjs leak --all --generic-only
