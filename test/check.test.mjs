@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdir, symlink } from 'node:fs/promises';
+import { join } from 'node:path';
 import { runCheck } from '../lib/check.mjs';
 import { setupCheck as setup, CONFIG, git } from './helpers.mjs';
 
@@ -106,4 +108,12 @@ test('a status description never carries a local path', async () => {
   assert.equal(last.state, 'error');
   assert.ok(last.description.startsWith('config: cannot read $SHIP_TMP/w/'), last.description);
   assert.ok(!last.description.includes(s.deps.tmpRoot), last.description);
+});
+
+test('a temp root that is a symlink is refused before anything is written', async () => {
+  const s = await setup();
+  await mkdir(join(s.root, 'elsewhere'));
+  await symlink(join(s.root, 'elsewhere'), join(s.root, 'linked-tmp'));
+  await assert.rejects(() => runCheck({ cwd: s.work, deps: { ...s.deps, tmpRoot: join(s.root, 'linked-tmp') } }), /not a plain directory/);
+  assert.equal((await s.statuses()).length, 0);
 });
