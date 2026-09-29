@@ -41,7 +41,9 @@ export async function makeOrigin(files) {
 }
 
 // A fake `gh` executable: answers the calls ship makes and records every invocation.
-export async function fakeGh(dir, { pr, repo = { defaultBranchRef: { name: 'main' } }, runs = [] }) {
+// apiDelay = { ms, match }: `gh api` calls whose arguments contain `match` answer after `ms`; every
+// answered api call is logged again as ['done', ...args], so a call that was killed is visible.
+export async function fakeGh(dir, { pr, repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null }) {
   const log = join(dir, 'gh.log');
   const script = join(dir, 'gh');
   await writeFile(script, `#!/usr/bin/env node
@@ -52,9 +54,14 @@ const reply = (v) => { process.stdout.write(JSON.stringify(v)); process.exit(0);
 if (args[0] === 'pr' && args[1] === 'view') reply(${JSON.stringify(pr)});
 if (args[0] === 'repo' && args[1] === 'view') reply(${JSON.stringify(repo)});
 if (args[0] === 'run' && args[1] === 'list') reply(${JSON.stringify(runs)});
-if (args[0] === 'api') reply({});
-process.stderr.write('fake gh: unhandled ' + args.join(' '));
-process.exit(1);
+if (args[0] === 'api') {
+  const delay = ${JSON.stringify(apiDelay)};
+  const ms = delay && args.join(' ').includes(delay.match) ? delay.ms : 0;
+  setTimeout(() => { fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(['done', ...args]) + '\\n'); reply({}); }, ms);
+} else {
+  process.stderr.write('fake gh: unhandled ' + args.join(' '));
+  process.exit(1);
+}
 `);
   await chmod(script, 0o755);
   const calls = async () => (await readFile(log, 'utf8').catch(() => '')).split('\n').filter(Boolean).map((l) => JSON.parse(l));
@@ -67,7 +74,7 @@ export const CONFIG = (steps, extra = {}) =>
 // origin: main has the config + a.txt; branch feat adds featFiles; main then moves with mainFiles.
 export async function setupCheck({
   steps = ['test -f src/x.ts', 'test -f b.txt'], checkExtra = {},
-  featFiles = { 'src/x.ts': 'x\n' }, mainFiles = { 'b.txt': 'b\n' }, prOverrides = {}, mainConfig = true, configText = null,
+  featFiles = { 'src/x.ts': 'x\n' }, mainFiles = { 'b.txt': 'b\n' }, prOverrides = {}, mainConfig = true, configText = null, ghOptions = {},
 } = {}) {
   const { origin, work, root } = await makeOrigin({ ...(mainConfig ? { 'ship.config.mjs': configText ?? CONFIG(steps, checkExtra) } : {}), 'a.txt': 'a\n' });
   await git(['checkout', '--quiet', '-b', 'feat'], work);
@@ -79,7 +86,7 @@ export async function setupCheck({
   await git(['checkout', '--quiet', 'feat'], work);
   await git(['remote', 'set-url', 'origin', 'https://github.com/t/r.git'], work);
   const pr = { number: 7, headRefOid: head, headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'OPEN', ...prOverrides };
-  const fake = await fakeGh(root, { pr });
+  const fake = await fakeGh(root, { pr, ...ghOptions });
   const lines = [];
   const deps = {
     gh: fake.gh, remoteUrl: () => origin,
@@ -90,5 +97,5 @@ export async function setupCheck({
     (await fake.calls())
       .filter((a) => a[0] === 'api')
       .map((a) => Object.fromEntries(a.filter((x) => /^(state|description)=/.test(x)).map((x) => [x.slice(0, x.indexOf('=')), x.slice(x.indexOf('=') + 1)])));
-  return { work, deps, statuses, lines, origin, root, gh: fake.gh };
+  return { work, deps, statuses, lines, origin, root, gh: fake.gh, calls: fake.calls };
 }
