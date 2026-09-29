@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, readFile, mkdir } from 'node:fs/promises';
+import { access, readFile, mkdir, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { ensureMirror, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile } from '../lib/git.mjs';
+import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile } from '../lib/git.mjs';
 import { validateConfig } from '../lib/config.mjs';
 import { classify } from '../lib/classify.mjs';
 import { makeOrigin, commitFiles, git, tempDir } from './helpers.mjs';
@@ -124,4 +124,29 @@ test('changedFiles returns unquoted, NUL-separated names for non-ASCII paths', a
   await git(['push', '--quiet', 'origin', 'feat'], o.work);
   const mirror = await ensureMirror('t/r', { root: join(o.root, 'mirrors'), url: o.origin });
   assert.deepEqual(await changedFiles(mirror, await revParse(mirror, 'refs/heads/main'), head), [name]);
+});
+
+test('a mirror left without the fetch refspec (an interrupted first clone) heals on the next call', async () => {
+  const o = await makeOrigin({ 'a.txt': 'a\n' });
+  const root = join(await tempDir(), 'mirrors');
+  await mkdir(root, { recursive: true });
+  const mirror = mirrorPath('t/r', root);
+  await git(['clone', '--bare', '--quiet', o.origin, mirror]); // as far as an interrupted ensureMirror got
+  const sha = await commitFiles(o.work, { 'c.txt': 'c\n' }, 'more');
+  await git(['push', '--quiet', 'origin', 'main'], o.work);
+  await ensureMirror('t/r', { root, url: o.origin });
+  assert.equal(await revParse(mirror, 'refs/heads/main'), sha);
+});
+
+test('the first clone is renamed into place and leaves nothing beside it', async () => {
+  const o = await makeOrigin({ 'a.txt': 'a\n' });
+  const root = join(await tempDir(), 'mirrors');
+  await ensureMirror('t/r', { root, url: o.origin });
+  assert.deepEqual(await readdir(root), ['t__r.git']);
+});
+
+test('a failed first clone leaves no mirror and no staging directory', async () => {
+  const root = join(await tempDir(), 'mirrors');
+  await assert.rejects(() => ensureMirror('t/r', { root, url: join(root, 'no-such-origin') }));
+  assert.deepEqual(await readdir(root), []);
 });
