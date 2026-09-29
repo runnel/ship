@@ -44,7 +44,8 @@ export async function makeOrigin(files) {
 // A fake `gh` executable: answers the calls ship makes and records every invocation.
 // apiDelay = { ms, match }: `gh api` calls whose arguments contain `match` answer after `ms`; every
 // answered api call is logged again as ['done', ...args], so a call that was killed is visible.
-export async function fakeGh(dir, { pr, repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null }) {
+// apiFail = { match }: `gh api` calls whose arguments contain `match` fail (exit 1), as gh does offline.
+export async function fakeGh(dir, { pr, repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null }) {
   const log = join(dir, 'gh.log');
   const script = join(dir, 'gh');
   await writeFile(script, `#!/usr/bin/env node
@@ -56,6 +57,8 @@ if (args[0] === 'pr' && args[1] === 'view') reply(${JSON.stringify(pr)});
 if (args[0] === 'repo' && args[1] === 'view') reply(${JSON.stringify(repo)});
 if (args[0] === 'run' && args[1] === 'list') reply(${JSON.stringify(runs)});
 if (args[0] === 'api') {
+  const fail = ${JSON.stringify(apiFail)};
+  if (fail && args.join(' ').includes(fail.match)) { process.stderr.write('fake gh: forced failure'); process.exit(1); }
   const delay = ${JSON.stringify(apiDelay)};
   const ms = delay && args.join(' ').includes(delay.match) ? delay.ms : 0;
   setTimeout(() => { fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(['done', ...args]) + '\\n'); reply({}); }, ms);
@@ -104,17 +107,17 @@ export async function setupCheck({
 // runCheck in a child process that leads its own process group, as bin/ship.mjs makes ship do.
 // Printed lines go to `out.text`; `exited` resolves with the exit code; `kill()` ends the whole
 // group (the test's cleanup: nothing may outlive it).
-export async function spawnCheckLeader(s, dir, { env = process.env } = {}) {
+export async function spawnCheckLeader(s, dir, { env = process.env, pollMs = 10 } = {}) {
   const script = join(dir, 'check.mjs');
   const mod = new URL('../lib/check.mjs', import.meta.url).href;
   await writeFile(script, `
 import { runCheck } from ${JSON.stringify(mod)};
 const a = JSON.parse(process.argv[2]);
-const deps = { gh: a.gh, remoteUrl: () => a.origin, mirrorRoot: a.mirrorRoot, tmpRoot: a.tmpRoot, logRoot: a.logRoot, pollMs: 10, out: (l) => process.stdout.write(l + '\\n') };
+const deps = { gh: a.gh, remoteUrl: () => a.origin, mirrorRoot: a.mirrorRoot, tmpRoot: a.tmpRoot, logRoot: a.logRoot, pollMs: a.pollMs, out: (l) => process.stdout.write(l + '\\n') };
 const code = await runCheck({ cwd: a.cwd, deps });
 process.stdout.write('RETURNED ' + code + '\\n');
 `);
-  const arg = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot });
+  const arg = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot, pollMs });
   const child = spawn(process.execPath, [script, arg], { detached: true, stdio: ['ignore', 'pipe', 'inherit'], env });
   const out = { text: '' };
   child.stdout.on('data', (b) => { out.text += b; });

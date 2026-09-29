@@ -189,3 +189,48 @@ test('an interrupt while waiting for the lane ends in error and leaves the holde
     await holder();
   }
 });
+
+// --- the error POST fails (offline, GitHub 5xx, expired gh auth) ------------------------------
+// Exactly when Ctrl-C is likely to be pressed. The unwind must still remove the worktree and free
+// the lane: each of its steps stands on its own.
+
+test('an interrupt during a step still removes the worktree when the error POST fails', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const started = join(dir, 'started');
+  const s = await setupCheck({
+    steps: [`trap "exit 0" TERM INT; touch ${started}; sleep 3.1415 & wait`],
+    ghOptions: { apiFail: { match: 'state=error' } },
+  });
+  const bin = await slowWorktreeRemoval(dir);
+  const run = await spawnCheckLeader(s, dir, { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+  try {
+    await waitFor(() => exists(started), 30_000, 'the first step to start');
+    run.child.kill('SIGTERM');
+    assert.equal(await Promise.race([run.exited, deadline(30_000, 'ship exit')]), 130, run.out.text);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'lanes')), []);
+    assert.ok(!(await s.statuses()).some((x) => x.state === 'success'));
+  } finally {
+    run.kill();
+  }
+});
+
+test('an interrupt while waiting for the lane still removes the worktree when the error POST fails', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const s = await setupCheck({ steps: ['true'], ghOptions: { apiFail: { match: 'state=error' } } });
+  const laneDir = join(s.deps.tmpRoot, 'lanes', 'light');
+  const holder = await acquire(laneDir, await ownerInfo({ label: 'holder' }), { pollMs: 10 });
+  // The production poll interval: the flow sleeps in acquire, and only the unwind can remove the tree.
+  const run = await spawnCheckLeader(s, dir, { pollMs: 5000 });
+  try {
+    await waitFor(() => run.out.text.includes('waiting for the light lane'), 30_000, 'the lane wait');
+    run.child.kill('SIGTERM');
+    assert.equal(await Promise.race([run.exited, deadline(30_000, 'ship exit')]), 130, run.out.text);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'checks')), []);
+    assert.equal((await readOwner(laneDir)).label, 'holder');
+  } finally {
+    run.kill();
+    await holder();
+  }
+});
