@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, readFile, mkdir, readdir } from 'node:fs/promises';
+import { access, readFile, mkdir, readdir, utimes } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile } from '../lib/git.mjs';
 import { validateConfig } from '../lib/config.mjs';
@@ -149,4 +149,17 @@ test('a failed first clone leaves no mirror and no staging directory', async () 
   const root = join(await tempDir(), 'mirrors');
   await assert.rejects(() => ensureMirror('t/r', { root, url: join(root, 'no-such-origin') }));
   assert.deepEqual(await readdir(root), []);
+});
+
+test('an ensureMirror sweeps the stale staging directory of a clone that was killed', async () => {
+  const o = await makeOrigin({ 'a.txt': 'a\n' });
+  const root = join(await tempDir(), 'mirrors');
+  await mkdir(join(root, 't__r.git.new-old'), { recursive: true });
+  await mkdir(join(root, 't__r.git.new-fresh'));
+  await mkdir(join(root, 'other__repo.git.new-old'));
+  const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  await utimes(join(root, 't__r.git.new-old'), twoHoursAgo, twoHoursAgo);
+  await utimes(join(root, 'other__repo.git.new-old'), twoHoursAgo, twoHoursAgo);
+  await ensureMirror('t/r', { root, url: o.origin });
+  assert.deepEqual((await readdir(root)).sort(), ['other__repo.git.new-old', 't__r.git', 't__r.git.new-fresh']);
 });
