@@ -97,7 +97,9 @@ for (const target of ['process', 'group']) {
     const second = join(dir, 'second');
     const pidFile = join(dir, 'pid');
     const s = await setupCheck({
-      steps: [`trap "exit 0" TERM INT; sleep 3.1415 & echo $! > ${pidFile}; touch ${started}; wait`, `touch ${second}`],
+      // The background process ignores TERM and INT and lives far longer than any wait of this test,
+      // so only ship stopping it (its own SIGKILL) can make it disappear; the group signal cannot.
+      steps: [`trap "exit 0" TERM INT; (trap '' TERM INT; exec sleep 31.4159) & echo $! > ${pidFile}; touch ${started}; wait`, `touch ${second}`],
     });
     const run = await spawnCheckLeader(s, dir);
     const { child, out } = run;
