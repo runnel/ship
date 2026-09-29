@@ -83,7 +83,9 @@ failure or error, 2 refused.
 
 Output is one line per step; on failure the last lines of the failing step and the full log path
 under `~/.ship/logs/`. A step that outlives its `timeoutMin` is killed together with everything it
-started. Two checks of the same commit started at the same time run once. Ctrl-C stops the running
+started. Background processes a step leaves running (a build worker, a dev server) stay available to
+the later steps and are stopped when the check ends, with a line saying so. A daemon that detaches
+itself (`setsid`, `pg_ctl start`) escapes that: stop it from a `trap` in the script that starts it. Two checks of the same commit started at the same time run once. Ctrl-C stops the running
 step, marks the status as errored (never as success) and cleans up. Times in messages use the
 system time zone; `SHIP_TZ=UTC` (any IANA name) overrides it.
 

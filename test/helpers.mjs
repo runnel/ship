@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, mkdir, chmod, readFile } from 'node:fs/promises';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -98,4 +99,26 @@ export async function setupCheck({
       .filter((a) => a[0] === 'api')
       .map((a) => Object.fromEntries(a.filter((x) => /^(state|description)=/.test(x)).map((x) => [x.slice(0, x.indexOf('=')), x.slice(x.indexOf('=') + 1)])));
   return { work, deps, statuses, lines, origin, root, gh: fake.gh, calls: fake.calls };
+}
+
+// runCheck in a child process that leads its own process group, as bin/ship.mjs makes ship do.
+// Printed lines go to `out.text`; `exited` resolves with the exit code; `kill()` ends the whole
+// group (the test's cleanup: nothing may outlive it).
+export async function spawnCheckLeader(s, dir, { env = process.env } = {}) {
+  const script = join(dir, 'check.mjs');
+  const mod = new URL('../lib/check.mjs', import.meta.url).href;
+  await writeFile(script, `
+import { runCheck } from ${JSON.stringify(mod)};
+const a = JSON.parse(process.argv[2]);
+const deps = { gh: a.gh, remoteUrl: () => a.origin, mirrorRoot: a.mirrorRoot, tmpRoot: a.tmpRoot, logRoot: a.logRoot, pollMs: 10, out: (l) => process.stdout.write(l + '\\n') };
+const code = await runCheck({ cwd: a.cwd, deps });
+process.stdout.write('RETURNED ' + code + '\\n');
+`);
+  const arg = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot });
+  const child = spawn(process.execPath, [script, arg], { detached: true, stdio: ['ignore', 'pipe', 'inherit'], env });
+  const out = { text: '' };
+  child.stdout.on('data', (b) => { out.text += b; });
+  const exited = new Promise((resolve) => child.on('close', (code) => resolve(code)));
+  const kill = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group already gone */ } };
+  return { child, out, exited, kill };
 }

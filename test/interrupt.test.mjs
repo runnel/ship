@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { access, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { capture } from '../lib/proc.mjs';
-import { setupCheck, tempDir } from './helpers.mjs';
+import { setupCheck, spawnCheckLeader, tempDir } from './helpers.mjs';
 
 const deadline = (ms, what) => new Promise((_, reject) => setTimeout(() => reject(new Error(`${what}: no result within ${ms} ms`)), ms).unref());
 const exists = (p) => access(p).then(() => true, () => false);
@@ -91,33 +91,21 @@ for (const target of ['process', 'group']) {
     const s = await setupCheck({
       steps: [`trap "exit 0" TERM INT; touch ${started}; sleep 3.1415 & wait`, `touch ${second}`],
     });
-    const script = join(dir, 'check.mjs');
-    const mod = new URL('../lib/check.mjs', import.meta.url).href;
-    await writeFile(script, `
-import { runCheck } from ${JSON.stringify(mod)};
-const a = JSON.parse(process.argv[2]);
-const deps = { gh: a.gh, remoteUrl: () => a.origin, mirrorRoot: a.mirrorRoot, tmpRoot: a.tmpRoot, logRoot: a.logRoot, pollMs: 10, out: (l) => process.stdout.write(l + '\\n') };
-const code = await runCheck({ cwd: a.cwd, deps });
-process.stdout.write('RETURNED ' + code + '\\n');
-`);
-    const arg = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot });
-    // A group leader, like bin/ship.mjs makes it; the wrapper forwards signals to the whole group.
-    const child = spawn(process.execPath, [script, arg], { detached: true, stdio: ['ignore', 'pipe', 'inherit'] });
-    let stdout = '';
-    child.stdout.on('data', (b) => { stdout += b; });
-    const exited = new Promise((resolve) => child.on('close', (code) => resolve(code)));
+    const run = await spawnCheckLeader(s, dir);
+    const { child, out } = run;
+    const exited = run.exited;
     try {
       await waitFor(() => exists(started), 30_000, 'the first step to start');
       if (target === 'group') process.kill(-child.pid, 'SIGTERM');
       else child.kill('SIGTERM');
       const code = await Promise.race([exited, deadline(20_000, 'ship exit')]);
-      assert.equal(code, 130, stdout);
+      assert.equal(code, 130, out.text);
 
       const states = (await s.statuses()).map((x) => x.state);
       assert.ok(states.length >= 2, states.join(','));
       assert.ok(!states.includes('success'), `posted ${states.join(', ')}`);
       assert.equal(states.at(-1), 'error', states.join(', '));
-      assert.ok(!stdout.includes('local-ci success'), stdout);
+      assert.ok(!out.text.includes('local-ci success'), out.text);
       assert.equal(await exists(second), false, 'a new step was started after the interrupt');
 
       // The worktree and both locks are gone; nothing that outlives ship is left running.
@@ -126,7 +114,7 @@ process.stdout.write('RETURNED ' + code + '\\n');
       assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'checks')), []);
       assert.equal((await capture('pgrep', ['-f', 'sleep 3.1415']).catch(() => '')).trim(), '');
     } finally {
-      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group already gone */ }
+      run.kill();
     }
   });
 }
