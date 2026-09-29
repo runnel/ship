@@ -1,10 +1,24 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { tallinn, duration, scrubPaths } from '../lib/report.mjs';
+import { localTime, duration, scrubPaths } from '../lib/report.mjs';
 
-test('tallinn converts UTC to Estonian time (summer and winter)', () => {
-  assert.match(tallinn('2026-09-29T11:32:00Z'), /14:32/);
-  assert.match(tallinn('2026-11-02T11:32:00Z'), /13:32/);
+test('localTime formats an instant in the given zone, across daylight saving', () => {
+  assert.match(localTime('2026-09-29T11:32:00Z', { timeZone: 'Asia/Tokyo' }), /20:32/);
+  assert.match(localTime('2026-09-29T11:32:00Z', { timeZone: 'America/New_York' }), /07:32/); // summer time
+  assert.match(localTime('2026-11-02T11:32:00Z', { timeZone: 'America/New_York' }), /06:32/); // winter time
+  assert.match(localTime('2026-09-29T23:32:00Z', { timeZone: 'Asia/Tokyo' }), /30\/09/); // the date moves with the zone
+});
+
+test('localTime defaults to SHIP_TZ, then to the system zone', () => {
+  const saved = process.env.SHIP_TZ;
+  process.env.SHIP_TZ = 'Asia/Tokyo';
+  try {
+    assert.match(localTime('2026-09-29T11:32:00Z'), /20:32/);
+  } finally {
+    if (saved === undefined) delete process.env.SHIP_TZ;
+    else process.env.SHIP_TZ = saved;
+  }
+  assert.match(localTime('2026-09-29T11:32:00Z'), /^\d\d\/\d\d, \d\d:\d\d$/);
 });
 
 test('duration formats seconds and minutes', () => {
