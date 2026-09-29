@@ -4,7 +4,7 @@ import { mkdtemp, writeFile, mkdir, chmod, readFile } from 'node:fs/promises';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { capture } from '../lib/proc.mjs';
+import { capture, isPid } from '../lib/proc.mjs';
 
 // One scratch root per test process, removed when the process exits.
 const ROOT = mkdtempSync(join(tmpdir(), 'ship-tests-'));
@@ -131,10 +131,13 @@ process.stdout.write('RETURNED ' + code + '\\n');
 // Process checks by recorded pid: `pgrep -f <text>` is machine-wide, so two runs of the suite at
 // once (or ship checking this repository while the suite runs) could fail each other.
 //
-// Only real pids are ever passed to process.kill: 0 means "my whole process group" and a negative
-// number a whole other one, so a missing or empty pid file (a step that never ran, a test that timed
-// out first) must not turn a cleanup into killing the runner, or ship itself when ship checks itself.
-const isPid = (pid) => Number.isInteger(pid) && pid > 0;
+// Only real pids are ever passed to process.kill (isPid, the same definition ship itself uses): 0
+// means "my whole process group" and a negative number a whole other one, so a missing or empty
+// pid file (a step that never ran, a test that timed out first) must not turn a cleanup into
+// killing the runner, or ship itself when ship checks itself.
+//
+// A pid that isGone proved dead is never signalled again: it may have been reused since.
+const provenGone = new Set();
 
 export const isAlive = (pid) => {
   if (!isPid(pid)) return false;
@@ -157,6 +160,7 @@ export async function isGone(pid, ms = 3000) {
     if (Date.now() > until) return false;
     await new Promise((r) => setTimeout(r, 25));
   }
+  if (isPid(pid)) provenGone.add(pid);
   return true;
 }
 // The step recorded a pid, and that process is gone. A missing pid file fails loudly here instead
@@ -166,7 +170,8 @@ export async function assertGone(file, message, ms = 3000) {
   assert.ok(pid, 'the step never recorded its pid');
   assert.equal(await isGone(pid, ms), true, message);
 }
-export const killQuietly = (pid) => {
-  if (!isPid(pid) || pid === process.pid) return;
-  try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+// `kill` is injectable so that the guard can be tested without real signals.
+export const killQuietly = (pid, { kill = (p, sig) => process.kill(p, sig) } = {}) => {
+  if (!isPid(pid) || pid === process.pid || provenGone.has(pid)) return;
+  try { kill(pid, 'SIGKILL'); } catch { /* gone */ }
 };
