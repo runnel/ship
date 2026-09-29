@@ -242,3 +242,27 @@ test('an interrupt while waiting for the lane still removes the worktree when th
     await holder();
   }
 });
+
+// A step that shuts down gracefully by starting a cleanup process: it starts it after the interrupt
+// has taken its snapshot of the group, so only a later sweep can stop it.
+for (const target of ['process', 'group']) {
+  test(`a process a step starts while it shuts down does not outlive an interrupted check (signal to the ${target})`, { timeout: 60_000 }, async () => {
+    const dir = await tempDir('late-');
+    const started = join(dir, 'started');
+    const latePid = join(dir, 'late-pid');
+    const s = await setupCheck({
+      steps: [`trap 'sleep 0.3; sleep 44.1 >/dev/null 2>&1 & echo $! > ${latePid}; exit 0' TERM INT; touch ${started}; sleep 31.4159 >/dev/null 2>&1 & wait`],
+    });
+    const run = await spawnCheckLeader(s, dir);
+    try {
+      await waitFor(() => exists(started), 30_000, 'the step to start');
+      if (target === 'group') process.kill(-run.child.pid, 'SIGTERM');
+      else run.child.kill('SIGTERM');
+      assert.equal(await Promise.race([run.exited, deadline(30_000, 'ship exit')]), 130, run.out.text);
+      await assertGone(latePid, 'a process the step started while shutting down is still running');
+    } finally {
+      run.kill();
+      killQuietly(await readPid(latePid));
+    }
+  });
+}
