@@ -33,3 +33,9 @@ test('scrubPaths replaces local roots, longest first, and the home directory', (
   assert.equal(scrubPaths(`open /var/t/ship-1/w/c-1 and ${HOME}/x`, roots), 'open $SHIP_TMP/w/c-1 and ~/x');
   assert.equal(scrubPaths('nothing local here', roots), 'nothing local here');
 });
+
+test('scrubPaths also replaces the system temp directory (where configs are evaluated)', () => {
+  const roots = { tmp: '/var/t/T/ship-1', sysTmp: '/var/t/T', home: '/ho' + 'me/u' };
+  assert.equal(scrubPaths("Cannot find module '/var/t/T/ship-config-ab12/x.mjs'", roots), "Cannot find module '$TMPDIR/ship-config-ab12/x.mjs'");
+  assert.equal(scrubPaths('/var/t/T/ship-1/w/c-1', roots), '$SHIP_TMP/w/c-1'); // the longer root wins
+});

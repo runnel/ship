@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { mkdir, readdir, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runCheck } from '../lib/check.mjs';
 import { setupCheck as setup, CONFIG, git, tempDir } from './helpers.mjs';
@@ -151,4 +152,14 @@ test('after a green and after a red check no worktree or lock directory is left 
     const checks = await readdir(join(s.deps.tmpRoot, 'checks'));
     assert.ok(checks.length > 0 && checks.every((n) => n.endsWith('.json')), checks.join(','));
   }
+});
+
+test('a config that fails to import does not post the system temp path', async () => {
+  const s = await setup({ configText: "import './nope.mjs';\nexport default {};\n" });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1);
+  const last = (await s.statuses()).at(-1);
+  assert.equal(last.state, 'error');
+  assert.ok(last.description.startsWith('config: Cannot find module'), last.description);
+  assert.ok(!last.description.includes(tmpdir()), last.description);
+  assert.ok(last.description.includes('$TMPDIR/'), last.description);
 });
