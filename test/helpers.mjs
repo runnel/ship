@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, mkdir, chmod, readFile } from 'node:fs/promises';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -128,7 +129,14 @@ process.stdout.write('RETURNED ' + code + '\\n');
 
 // Process checks by recorded pid: `pgrep -f <text>` is machine-wide, so two runs of the suite at
 // once (or ship checking this repository while the suite runs) could fail each other.
+//
+// Only real pids are ever passed to process.kill: 0 means "my whole process group" and a negative
+// number a whole other one, so a missing or empty pid file (a step that never ran, a test that timed
+// out first) must not turn a cleanup into killing the runner, or ship itself when ship checks itself.
+const isPid = (pid) => Number.isInteger(pid) && pid > 0;
+
 export const isAlive = (pid) => {
+  if (!isPid(pid)) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -136,7 +144,11 @@ export const isAlive = (pid) => {
     return e.code === 'EPERM';
   }
 };
-export const readPid = async (file) => Number((await readFile(file, 'utf8')).trim());
+// The pid a step wrote to `file`, or null when there is none (missing, empty, not a number).
+export async function readPid(file) {
+  const pid = Number((await readFile(file, 'utf8').catch(() => '')).trim());
+  return isPid(pid) ? pid : null;
+}
 // True once the process is gone (a killed orphan is reaped a moment later), false after `ms`.
 export async function isGone(pid, ms = 3000) {
   const until = Date.now() + ms;
@@ -146,6 +158,14 @@ export async function isGone(pid, ms = 3000) {
   }
   return true;
 }
+// The step recorded a pid, and that process is gone. A missing pid file fails loudly here instead
+// of passing (isGone of nothing).
+export async function assertGone(file, message, ms = 3000) {
+  const pid = await readPid(file);
+  assert.ok(pid, 'the step never recorded its pid');
+  assert.equal(await isGone(pid, ms), true, message);
+}
 export const killQuietly = (pid) => {
+  if (!isPid(pid) || pid === process.pid) return;
   try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
 };

@@ -36,7 +36,8 @@ async function startWrapper(s) {
 
 // Ship is the wrapper's only child, and the leader of its own group.
 async function killShip(child) {
-  const kids = (await capture('pgrep', ['-P', String(child.pid)]).catch(() => '')).split('\n').filter(Boolean).map(Number);
+  const kids = (await capture('pgrep', ['-P', String(child.pid)]).catch(() => '')).split('\n').filter(Boolean).map(Number)
+    .filter((pid) => Number.isInteger(pid) && pid > 0); // never 0: that is this process's own group
   for (const pid of kids) { try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } }
   try { child.kill('SIGKILL'); } catch { /* gone */ }
 }

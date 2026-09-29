@@ -4,7 +4,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { buildEnv, run, capture, ownsItsGroup } from '../lib/proc.mjs';
-import { isGone, killQuietly, readPid, tempDir } from './helpers.mjs';
+import { assertGone, killQuietly, readPid, tempDir } from './helpers.mjs';
 
 const tmp = () => tempDir('proc-');
 
@@ -43,9 +43,9 @@ test('a command past its timeout is killed with its descendants and returns 124'
     assert.equal(r.code, 124);
     assert.ok(Date.now() - started < 4000);
     assert.match(r.tail.at(-1), /timed out/);
-    assert.equal(await isGone(await readPid(pidFile)), true, 'the descendant is still running');
+    await assertGone(pidFile, 'the descendant is still running');
   } finally {
-    killQuietly(await readPid(pidFile).catch(() => 0));
+    killQuietly(await readPid(pidFile));
   }
 });
 
@@ -93,7 +93,7 @@ test('a step that exits but leaves a background process holding its output retur
     assert.ok(r.tail.includes('done'));
     assert.ok(Date.now() - started < 6_000);
   } finally {
-    killQuietly(await readPid(pidFile).catch(() => 0)); // this process is not a group leader: it does not stop orphans
+    killQuietly(await readPid(pidFile)); // this process is not a group leader: it does not stop orphans
   }
 });
 
@@ -104,9 +104,9 @@ test('a timed-out step returns promptly and its orphan (re-parented, holding std
     const r = await runAsLeader(`(sleep 20.4712 & echo $! > ${pidFile}); exit 0`, 300, dir);
     assert.equal(r.code, 124);
     assert.ok(r.ms < 4_000, `took ${r.ms} ms`);
-    assert.equal(await isGone(await readPid(pidFile)), true, 'the orphan is still running');
+    await assertGone(pidFile, 'the orphan is still running');
   } finally {
-    killQuietly(await readPid(pidFile).catch(() => 0));
+    killQuietly(await readPid(pidFile));
   }
 });
 
@@ -117,9 +117,9 @@ test('a descendant that ignores SIGTERM is SIGKILLed and the timeout still retur
     const r = await runAsLeader(`trap '' TERM; sleep 20.4714 & echo $! > ${pidFile}; wait`, 300, dir);
     assert.equal(r.code, 124);
     assert.ok(r.ms < 4_500, `took ${r.ms} ms`);
-    assert.equal(await isGone(await readPid(pidFile)), true, 'the descendant is still running');
+    await assertGone(pidFile, 'the descendant is still running');
   } finally {
-    killQuietly(await readPid(pidFile).catch(() => 0));
+    killQuietly(await readPid(pidFile));
   }
 });
 

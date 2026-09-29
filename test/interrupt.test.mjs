@@ -6,7 +6,7 @@ import { access, chmod, mkdir, readFile, readdir, writeFile } from 'node:fs/prom
 import { join } from 'node:path';
 import { capture } from '../lib/proc.mjs';
 import { acquire, ownerInfo, readOwner } from '../lib/lock.mjs';
-import { isGone, killQuietly, readPid, setupCheck, spawnCheckLeader, tempDir } from './helpers.mjs';
+import { assertGone, killQuietly, readPid, setupCheck, spawnCheckLeader, tempDir } from './helpers.mjs';
 
 const deadline = (ms, what) => new Promise((_, reject) => setTimeout(() => reject(new Error(`${what}: no result within ${ms} ms`)), ms).unref());
 const exists = (p) => access(p).then(() => true, () => false);
@@ -120,10 +120,10 @@ for (const target of ['process', 'group']) {
       assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
       assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'lanes')), []);
       assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'checks')), []);
-      assert.equal(await isGone(await readPid(pidFile)), true, 'the step\'s background process is still running');
+      await assertGone(pidFile, 'the step\'s background process is still running');
     } finally {
       run.kill();
-      killQuietly(await readPid(pidFile).catch(() => 0));
+      killQuietly(await readPid(pidFile));
     }
   });
 }
