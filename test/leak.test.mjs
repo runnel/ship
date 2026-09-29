@@ -266,3 +266,30 @@ test('--pre-push trusts only the remote being pushed to', async () => {
   assert.equal(await push('origin'), 1);
   assert.equal(await push('other'), 0);
 });
+
+test('findings about a file name never print the name, nor does any other finding of that file', async () => {
+  const dir = await scratchRepo({});
+  const emailName = 'bob' + AT + 'corp.ee.txt';
+  await writeFile(join(dir, emailName), 'clean\n');
+  await writeFile(join(dir, 'zebra-notes.txt'), LEAKY);
+  await writeFile(join(dir, 'fine.txt'), LEAKY);
+  await git(dir, 'add', '-A');
+  const list = join(await tempDir(), 'denylist');
+  await writeFile(list, 'zebra\n');
+  const saved = process.env.SHIP_DENYLIST;
+  process.env.SHIP_DENYLIST = list;
+  try {
+    const c = collect();
+    assert.equal(await runLeak(['--staged'], { cwd: dir, out: c.out }), 1);
+    const printed = c.lines.join('\n');
+    assert.ok(!printed.includes('corp.ee'), printed);
+    assert.ok(!printed.includes('zebra'), printed);
+    assert.ok(c.lines.some((l) => l.includes('(name withheld):0: e-mail address (in the file name)')), printed);
+    assert.ok(c.lines.some((l) => l.includes('(name withheld):0: denylist (in the file name)')), printed);
+    assert.ok(c.lines.some((l) => l.includes('(name withheld):1: e-mail address')), printed); // zebra-notes.txt's content
+    assert.ok(c.lines.some((l) => l.startsWith('✗ fine.txt:1: e-mail address')), printed); // a clean name is still shown
+  } finally {
+    if (saved === undefined) delete process.env.SHIP_DENYLIST;
+    else process.env.SHIP_DENYLIST = saved;
+  }
+});
