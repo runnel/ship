@@ -290,3 +290,43 @@ test('a hanging error POST (captive portal, half-open connection) does not hold 
     run.kill();
   }
 });
+
+// A status POST that was in flight ahead of the error POST hangs: the interrupt must not wait for
+// it (the error POST used to queue behind it until the hard deadline), and the hung gh must not
+// stay behind in ship's process group, where it would keep the locks looking held.
+test('a hung earlier status POST does not hold up the interrupt, and is stopped', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const s = await setupCheck({ steps: ['true'], ghOptions: { apiDelay: { ms: 120_000, match: 'state=pending' } } });
+  const run = await spawnCheckLeader(s, dir, { unwindPostTimeoutMs: 800 });
+  try {
+    await waitFor(async () => (await s.calls()).some((c) => c[0] === 'api' && c.includes('state=pending')), 30_000, 'the first status POST to start');
+    const signalled = Date.now();
+    run.child.kill('SIGTERM'); // ship only: the POST in flight is not signalled
+    assert.equal(await Promise.race([run.exited, deadline(15_000, 'ship exit')]), 130, run.out.text);
+    assert.ok(Date.now() - signalled < 12_000, `took ${Date.now() - signalled} ms`);
+    assert.ok((await s.calls()).some((c) => c[0] === 'api' && c.includes('state=error')), 'no error status was posted');
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'checks')), []);
+    // Nothing of ship's is left in its process group (that is what the locks test for liveness).
+    assert.equal((await capture('pgrep', ['-g', String(run.child.pid)]).catch(() => '')).trim(), '', 'the hung gh is still running');
+  } finally {
+    run.kill();
+  }
+});
+
+// The real CLI turns an interrupt that makes a call fail into exit 130 (lib/cli.mjs); the harness
+// must do the same, or it would report a product bug that is not there.
+test('a group signal during the first status POST ends as the real CLI does: exit 130, error posted', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const s = await setupCheck({ steps: ['true'], ghOptions: { apiDelay: { ms: 1500, match: 'state=pending' } } });
+  const run = await spawnCheckLeader(s, dir);
+  try {
+    await waitFor(async () => (await s.calls()).some((c) => c[0] === 'api' && c.includes('state=pending')), 30_000, 'the first status POST to start');
+    process.kill(-run.child.pid, 'SIGTERM'); // the whole group: the POST in flight dies with it
+    assert.equal(await Promise.race([run.exited, deadline(20_000, 'ship exit')]), 130, run.out.text);
+    const states = (await s.statuses()).map((x) => x.state);
+    assert.equal(states.at(-1), 'error', states.join(', '));
+    assert.ok(!states.includes('success'), states.join(', '));
+  } finally {
+    run.kill();
+  }
+});

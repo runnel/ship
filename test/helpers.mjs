@@ -113,11 +113,20 @@ export async function spawnCheckLeader(s, dir, { env = process.env, pollMs = 10,
   const mod = new URL('../lib/check.mjs', import.meta.url).href;
   await writeFile(script, `
 import { runCheck } from ${JSON.stringify(mod)};
+import { isInterrupted } from ${JSON.stringify(new URL('../lib/interrupt.mjs', import.meta.url).href)};
 const a = JSON.parse(process.argv[2]);
 const deps = { gh: a.gh, remoteUrl: () => a.origin, mirrorRoot: a.mirrorRoot, tmpRoot: a.tmpRoot, logRoot: a.logRoot, pollMs: a.pollMs, out: (l) => process.stdout.write(l + '\\n') };
 if (a.unwindPostTimeoutMs) deps.unwindPostTimeoutMs = a.unwindPostTimeoutMs;
-const code = await runCheck({ cwd: a.cwd, deps });
+// Like lib/cli.mjs: an interrupt that makes a call fail is exit 130, anything else a plain failure.
+let code;
+try {
+  code = await runCheck({ cwd: a.cwd, deps });
+} catch (e) {
+  if (e?.aborted || isInterrupted()) code = 130;
+  else { process.stderr.write('ship check: ' + e.message + '\\n'); code = 1; }
+}
 process.stdout.write('RETURNED ' + code + '\\n');
+process.exitCode = code;
 `);
   const arg = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot, pollMs, unwindPostTimeoutMs });
   const child = spawn(process.execPath, [script, arg], { detached: true, stdio: ['ignore', 'pipe', 'inherit'], env });
