@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { buildEnv, run, capture } from '../lib/proc.mjs';
 import { tempDir } from './helpers.mjs';
@@ -47,4 +48,75 @@ test('a command past its timeout is killed with its descendants and returns 124'
 test('capture returns stdout and throws on failure', async () => {
   assert.equal(await capture('printf', ['hi']), 'hi');
   await assert.rejects(() => capture('false', []));
+});
+
+// --- a step whose descendants keep its output open ---------------------------------------------
+
+const deadline = (ms, what) => new Promise((_, reject) => setTimeout(() => reject(new Error(`${what} did not return within ${ms} ms`)), ms).unref());
+const stillRunning = async (marker) => (await capture('pgrep', ['-f', marker]).catch(() => '')).trim();
+const killMarked = (marker) => capture('pkill', ['-f', marker]).catch(() => {});
+
+// ship runs as the leader of its own process group (bin/ship.mjs); this reproduces that setup so
+// that run() may stop orphans by group membership. A hard deadline kills the whole group.
+async function runAsLeader(command, timeoutMs) {
+  const dir = await tempDir('leader-');
+  const script = join(dir, 'leader.mjs');
+  const mod = new URL('../lib/proc.mjs', import.meta.url).href;
+  await writeFile(script, `
+import { run, buildEnv } from ${JSON.stringify(mod)};
+const started = Date.now();
+const r = await run(${JSON.stringify(command)}, { cwd: '/', env: buildEnv(), logFile: ${JSON.stringify(join(dir, 'log'))}, timeoutMs: ${timeoutMs} });
+process.stdout.write(JSON.stringify({ code: r.code, ms: Date.now() - started, tail: r.tail }) + '\\n');
+`);
+  const child = spawn(process.execPath, [script], { detached: true, stdio: ['ignore', 'pipe', 'inherit'] });
+  let out = '';
+  child.stdout.on('data', (b) => { out += b; });
+  const exited = new Promise((resolve) => child.on('close', resolve));
+  try {
+    await Promise.race([exited, deadline(12_000, 'the leader process')]);
+    return JSON.parse(out);
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group already gone */ }
+  }
+}
+
+test('a step that exits but leaves a background process holding its output returns after a short grace', { timeout: 30_000 }, async () => {
+  const marker = 'sleep 20.4711';
+  const dir = await tmp();
+  try {
+    const started = Date.now();
+    const r = await Promise.race([
+      run(`(${marker} &); echo done`, { cwd: dir, env: buildEnv(), logFile: join(dir, 'log') }),
+      deadline(8_000, 'run'),
+    ]);
+    assert.equal(r.code, 0);
+    assert.ok(r.tail.includes('done'));
+    assert.ok(Date.now() - started < 6_000);
+  } finally {
+    await killMarked(marker);
+  }
+});
+
+test('a timed-out step returns promptly and its orphan (re-parented, holding stdout) is killed', { timeout: 30_000 }, async () => {
+  const marker = 'sleep 20.4712';
+  try {
+    const r = await runAsLeader(`(${marker} &); exit 0`, 300);
+    assert.equal(r.code, 124);
+    assert.ok(r.ms < 4_000, `took ${r.ms} ms`);
+    assert.equal(await stillRunning(marker), '');
+  } finally {
+    await killMarked(marker);
+  }
+});
+
+test('a descendant that ignores SIGTERM is SIGKILLed and the timeout still returns promptly', { timeout: 30_000 }, async () => {
+  const marker = 'sleep 20.4714';
+  try {
+    const r = await runAsLeader(`trap '' TERM; ${marker} & wait`, 300);
+    assert.equal(r.code, 124);
+    assert.ok(r.ms < 4_500, `took ${r.ms} ms`);
+    assert.equal(await stillRunning(marker), '');
+  } finally {
+    await killMarked(marker);
+  }
 });
