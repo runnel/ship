@@ -41,7 +41,35 @@ test('a conflicting merge is reported, not thrown', async () => {
   await addWorktree(mirror, wt, head);
   const r = await mergeInto(wt, await revParse(mirror, 'refs/heads/main'));
   assert.equal(r.ok, false);
+  assert.equal(r.conflict, true);
   await removeWorktree(mirror, wt);
+});
+
+test('a merge that fails without a conflict is not reported as one', async () => {
+  const { root, head, mirror } = await branchAndMain({ feat: { 'src/x.ts': 'x\n' }, main: { 'b.txt': 'b\n' } });
+  const wt = join(root, 'wt');
+  await addWorktree(mirror, wt, head);
+  const r = await mergeInto(wt, 'f'.repeat(40)); // not a commit
+  assert.equal(r.ok, false);
+  assert.equal(r.conflict, false);
+  await removeWorktree(mirror, wt);
+});
+
+test('a global commit.gpgsign=true does not derail the merge commit', async () => {
+  const { root, head, mirror } = await branchAndMain({ feat: { 'src/x.ts': 'x\n' }, main: { 'b.txt': 'b\n' } });
+  const wt = join(root, 'wt');
+  await addWorktree(mirror, wt, head);
+  const saved = { c: process.env.GIT_CONFIG_COUNT, k0: process.env.GIT_CONFIG_KEY_0, v0: process.env.GIT_CONFIG_VALUE_0, k1: process.env.GIT_CONFIG_KEY_1, v1: process.env.GIT_CONFIG_VALUE_1 };
+  Object.assign(process.env, { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'commit.gpgsign', GIT_CONFIG_VALUE_0: 'true', GIT_CONFIG_KEY_1: 'gpg.program', GIT_CONFIG_VALUE_1: 'false' });
+  try {
+    assert.deepEqual(await mergeInto(wt, await revParse(mirror, 'refs/heads/main')), { ok: true });
+  } finally {
+    for (const [k, v] of Object.entries({ GIT_CONFIG_COUNT: saved.c, GIT_CONFIG_KEY_0: saved.k0, GIT_CONFIG_VALUE_0: saved.v0, GIT_CONFIG_KEY_1: saved.k1, GIT_CONFIG_VALUE_1: saved.v1 })) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    await removeWorktree(mirror, wt);
+  }
 });
 
 test('ensureMirror fetches new commits on later calls', async () => {
