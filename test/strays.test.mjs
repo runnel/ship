@@ -1,8 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { capture } from '../lib/proc.mjs';
-import { setupCheck, spawnCheckLeader, tempDir } from './helpers.mjs';
+import { isGone, killQuietly, readPid, setupCheck, spawnCheckLeader, tempDir } from './helpers.mjs';
 
 const deadline = (ms, what) => new Promise((_, reject) => setTimeout(() => reject(new Error(`${what}: no result within ${ms} ms`)), ms).unref());
 
@@ -21,8 +20,9 @@ test('background processes left by a passing check are stopped when it ends, not
     assert.equal(code, 0, run.out.text);
     assert.equal((await s.statuses()).at(-1).state, 'success'); // the next step saw the process
     assert.match(run.out.text, /! 1 background process\(es\) .* stopped/);
-    assert.equal((await capture('pgrep', ['-f', 'sleep 62.2718']).catch(() => '')).trim(), '');
+    assert.equal(await isGone(await readPid(pidFile)), true, 'the background process is still running');
   } finally {
     run.kill();
+    killQuietly(await readPid(pidFile).catch(() => 0));
   }
 });

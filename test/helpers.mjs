@@ -125,3 +125,27 @@ process.stdout.write('RETURNED ' + code + '\\n');
   const kill = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group already gone */ } };
   return { child, out, exited, kill };
 }
+
+// Process checks by recorded pid: `pgrep -f <text>` is machine-wide, so two runs of the suite at
+// once (or ship checking this repository while the suite runs) could fail each other.
+export const isAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+};
+export const readPid = async (file) => Number((await readFile(file, 'utf8')).trim());
+// True once the process is gone (a killed orphan is reaped a moment later), false after `ms`.
+export async function isGone(pid, ms = 3000) {
+  const until = Date.now() + ms;
+  while (isAlive(pid)) {
+    if (Date.now() > until) return false;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return true;
+}
+export const killQuietly = (pid) => {
+  try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+};

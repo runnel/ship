@@ -6,7 +6,7 @@ import { access, chmod, mkdir, readFile, readdir, writeFile } from 'node:fs/prom
 import { join } from 'node:path';
 import { capture } from '../lib/proc.mjs';
 import { acquire, ownerInfo, readOwner } from '../lib/lock.mjs';
-import { setupCheck, spawnCheckLeader, tempDir } from './helpers.mjs';
+import { isGone, killQuietly, readPid, setupCheck, spawnCheckLeader, tempDir } from './helpers.mjs';
 
 const deadline = (ms, what) => new Promise((_, reject) => setTimeout(() => reject(new Error(`${what}: no result within ${ms} ms`)), ms).unref());
 const exists = (p) => access(p).then(() => true, () => false);
@@ -95,8 +95,9 @@ for (const target of ['process', 'group']) {
     const dir = await tempDir('interrupt-');
     const started = join(dir, 'started');
     const second = join(dir, 'second');
+    const pidFile = join(dir, 'pid');
     const s = await setupCheck({
-      steps: [`trap "exit 0" TERM INT; touch ${started}; sleep 3.1415 & wait`, `touch ${second}`],
+      steps: [`trap "exit 0" TERM INT; sleep 3.1415 & echo $! > ${pidFile}; touch ${started}; wait`, `touch ${second}`],
     });
     const run = await spawnCheckLeader(s, dir);
     const { child, out } = run;
@@ -119,9 +120,10 @@ for (const target of ['process', 'group']) {
       assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
       assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'lanes')), []);
       assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'checks')), []);
-      assert.equal((await capture('pgrep', ['-f', 'sleep 3.1415']).catch(() => '')).trim(), '');
+      assert.equal(await isGone(await readPid(pidFile)), true, 'the step\'s background process is still running');
     } finally {
       run.kill();
+      killQuietly(await readPid(pidFile).catch(() => 0));
     }
   });
 }
