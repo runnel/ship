@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Local CI gate (and, later, guarded Cloudflare Workers deploys) for solo developers",
   "type": "module",
+  "private": true,
   "bin": { "ship": "bin/ship.mjs" },
   "engines": { "node": ">=24" },
   "scripts": { "test": "node --test \"test/**/*.test.mjs\"" },

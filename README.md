@@ -14,11 +14,19 @@ cd ~/Code/ship && npm link          # puts `ship` on PATH
 
 Requires Node >= 24, git and an authenticated `gh`.
 
+ship keeps its own bare clone of the repository under `~/.ship/mirrors` and clones
+`https://github.com/<repo>.git` over HTTPS, whatever your local remote says. For a private
+repository git needs credentials for that: run `gh auth setup-git` once.
+
 ## Configure a repository
 
 Add `ship.config.mjs` at the repository root. The config is always read from the main branch,
-so a pull request cannot weaken its own gate. The default export may be an object, or a function
-`({ root }) => config` that can read files from the tree under check.
+so a pull request cannot weaken its own gate. The one exception is the pull request that adopts
+ship, when main has no config yet: it is checked with its own, and ship says so.
+
+The default export may be an object, or a function `({ root }) => config`. The config is evaluated
+from a temporary copy, so it cannot `import` files of the repository or its packages; read what
+you need through `root`, the path of the tree under check.
 
 ```js
 export default {
@@ -42,9 +50,17 @@ export default {
 
 A changed file that matches no group (and is not docs-only) runs every group, as does any change
 under `.github/` or to `ship.config.mjs`. Globs are anchored at the repository root: `*.md` is a
-root-level file only.
+root-level file only. A moved file counts as a deletion plus an addition, so both paths are
+classified.
 
-Then require the status on main:
+Steps run with a minimal environment: `HOME`, `PATH`, `SHELL`, `USER`, `TMPDIR` and `LANG` from
+your shell (`LC_ALL` is forced to a real locale), `CI=true`, `SHIP_CHANGED_FILES` (the changed
+paths, one per line) and the `env` of the check and the step. Nothing else your shell has exported
+reaches a step. Because `HOME` is passed, tools can still read your dotfiles, `~/.npmrc` for
+instance.
+
+Then require the status on main. This call **replaces the branch's whole protection**: read the
+current settings first (`gh api repos/acme/app/branches/main/protection`) and carry them over.
 
 ```bash
 gh api -X PUT repos/acme/app/branches/main/protection --input - <<'EOF'
@@ -60,16 +76,27 @@ ship check            # the PR of the current branch
 ship check --pr 42
 ```
 
+`ship check` checks the pull request head as GitHub has it, merged with main: push first, local
+commits are not checked. Pull requests that are not open, that come from a fork, or that target a
+branch other than the default one are refused (exit 2, no status). Exit codes: 0 success, 1
+failure or error, 2 refused.
+
 Output is one line per step; on failure the last lines of the failing step and the full log path
-under `~/.ship/logs/`. Two checks of the same commit started at the same time run once. Pull
-requests from forks are refused. Ctrl-C stops the running step, marks the status as errored and
-cleans up.
+under `~/.ship/logs/`. A step that outlives its `timeoutMin` is killed together with everything it
+started. Two checks of the same commit started at the same time run once. Ctrl-C stops the running
+step, marks the status as errored (never as success) and cleans up. Times in messages use the
+system time zone; `SHIP_TZ=UTC` (any IANA name) overrides it.
+
+Short-lived state (locks, worktrees) lives in a per-user directory `ship-<uid>` under the system
+temp directory, created with mode 0700.
 
 ## Leak guard (for this repository)
 
 `ship leak --staged | --msg <file> | --pre-push [remote] | --all | --history [--generic-only]` scans for
-shapes that must not be published, including commit author and committer identities. Enable with
-`git config core.hooksPath .githooks` and create `~/.config/ship/denylist`.
+shapes that must not be published, including commit author and committer identities. It fails
+closed: a git error or a binary file it cannot scan is a finding, not a pass. Enable with
+`git config core.hooksPath .githooks` and create `~/.config/ship/denylist`. Pull requests are
+judged by main's copy of the guard.
 
 ## Licence
 
