@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, symlink } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
+import { mkdir, readdir, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { runCheck } from '../lib/check.mjs';
-import { setupCheck as setup, CONFIG, git } from './helpers.mjs';
+import { setupCheck as setup, CONFIG, git, tempDir } from './helpers.mjs';
 
 test('a green check of the PR merged with main', async () => {
   const s = await setup();
@@ -51,9 +52,12 @@ test('a detached HEAD asks for --pr', async () => {
   assert.ok(s.lines.some((l) => l.includes('--pr')));
 });
 
-test('two checks of the same SHA at once run it only once', async () => {
-  const s = await setup({ steps: ['sleep 0.3'] });
-  const codes = await Promise.all([runCheck({ cwd: s.work, deps: s.deps }), runCheck({ cwd: s.work, deps: s.deps })]);
+test('two checks of the same SHA at once run it only once', { timeout: 60_000 }, async () => {
+  // Gated, not timed: the step runs until the second check has announced that it is waiting.
+  const marker = join(await tempDir(), 'second-is-waiting');
+  const s = await setup({ steps: [`for i in $(seq 1 400); do test -f ${marker} && exit 0; sleep 0.05; done; exit 1`] });
+  const deps = { ...s.deps, out: (l) => { s.lines.push(l); if (l.includes('already running')) writeFileSync(marker, ''); } };
+  const codes = await Promise.all([runCheck({ cwd: s.work, deps }), runCheck({ cwd: s.work, deps })]);
   assert.deepEqual(codes, [0, 0]);
   assert.equal((await s.statuses()).filter((x) => x.state === 'success').length, 1);
 });
@@ -116,4 +120,35 @@ test('a temp root that is a symlink is refused before anything is written', asyn
   await symlink(join(s.root, 'elsewhere'), join(s.root, 'linked-tmp'));
   await assert.rejects(() => runCheck({ cwd: s.work, deps: { ...s.deps, tmpRoot: join(s.root, 'linked-tmp') } }), /not a plain directory/);
   assert.equal((await s.statuses()).length, 0);
+});
+
+test('steps see a minimal environment: no secrets from the caller, but CI and the changed files', async () => {
+  const saved = process.env.SHIP_TEST_SECRET;
+  process.env.SHIP_TEST_SECRET = 'hunter2';
+  try {
+    const s = await setup({ steps: ['test -z "$SHIP_TEST_SECRET"', 'test "$CI" = true', 'echo "$SHIP_CHANGED_FILES" | grep -qx src/x.ts'] });
+    assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 0);
+  } finally {
+    if (saved === undefined) delete process.env.SHIP_TEST_SECRET;
+    else process.env.SHIP_TEST_SECRET = saved;
+  }
+});
+
+test('a PR that is not open is refused without a status', async () => {
+  const s = await setup({ prOverrides: { state: 'MERGED' } });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 2);
+  assert.equal((await s.statuses()).length, 0);
+  assert.ok(s.lines.some((l) => l.includes('merged')), s.lines.join('\n'));
+});
+
+test('after a green and after a red check no worktree or lock directory is left behind', async () => {
+  for (const steps of [['true'], ['exit 3']]) {
+    const s = await setup({ steps });
+    await runCheck({ cwd: s.work, deps: s.deps });
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'lanes')), []);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'locks')), []);
+    const checks = await readdir(join(s.deps.tmpRoot, 'checks'));
+    assert.ok(checks.length > 0 && checks.every((n) => n.endsWith('.json')), checks.join(','));
+  }
 });

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdir, readFile, writeFile, rm, symlink, unlink } from 'node:fs/promises';
+import { readFile, writeFile, rm, symlink, unlink } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -83,21 +83,21 @@ test('--staged refuses a commit identity that is not a noreply address', async (
   assert.equal(await runLeak(['--staged', '--generic-only'], { cwd: dir, out: () => {} }), 0);
 });
 
-async function walk(dir) {
-  const out = [];
-  for (const e of await readdir(dir, { withFileTypes: true })) {
-    if (e.name === '.git' || e.name === 'node_modules') continue;
-    const p = join(dir, e.name);
-    if (e.isDirectory()) out.push(...(await walk(p)));
-    else out.push(p);
-  }
-  return out;
-}
-
-test("this repository's own files pass the generic rules", async () => {
+// The published set is what git tracks: ignored files, editor leftovers and local notes are not it.
+test("this repository's own tracked files pass the generic rules", async (t) => {
   const root = fileURLToPath(new URL('..', import.meta.url));
+  let files;
+  try {
+    files = (await capture('git', ['-C', root, 'ls-files', '-z'])).split('\0').filter(Boolean);
+  } catch {
+    return t.skip('not a git checkout');
+  }
+  assert.ok(files.length > 10, 'expected a populated repository');
   const findings = [];
-  for (const f of await walk(root)) findings.push(...scanText(await readFile(f, 'utf8'), { source: f.slice(root.length) }));
+  for (const f of files) {
+    const text = await readFile(join(root, f), 'utf8').catch(() => null);
+    if (text !== null && !text.includes('\u0000')) findings.push(...scanText(text, { source: f }));
+  }
   assert.deepEqual(findings, []);
 });
 
