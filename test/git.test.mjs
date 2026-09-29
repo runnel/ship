@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, readFile } from 'node:fs/promises';
+import { access, readFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureMirror, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile } from '../lib/git.mjs';
+import { validateConfig } from '../lib/config.mjs';
+import { classify } from '../lib/classify.mjs';
 import { makeOrigin, commitFiles, git, tempDir } from './helpers.mjs';
 
 async function branchAndMain({ feat, main }) {
@@ -56,4 +58,34 @@ test('fetchCommit throws for an unknown commit', async () => {
   const o = await makeOrigin({ 'a.txt': 'a\n' });
   const mirror = await ensureMirror('t/r', { root: join(o.root, 'mirrors'), url: o.origin });
   await assert.rejects(() => fetchCommit(mirror, 'f'.repeat(40), 1), /not found/);
+});
+
+test('a rename lists both the old and the new path, so moving code into a docs folder is still checked', async () => {
+  const body = 'export const answer = 42;\n'.repeat(20);
+  const o = await makeOrigin({ 'src/index.ts': body, 'a.txt': 'a\n' });
+  await git(['checkout', '--quiet', '-b', 'feat'], o.work);
+  await mkdir(join(o.work, 'docs'), { recursive: true });
+  await git(['mv', 'src/index.ts', 'docs/index.md'], o.work);
+  await git(['commit', '--quiet', '-m', 'move'], o.work);
+  const head = (await git(['rev-parse', 'HEAD'], o.work)).trim();
+  await git(['push', '--quiet', 'origin', 'feat'], o.work);
+  const mirror = await ensureMirror('t/r', { root: join(o.root, 'mirrors'), url: o.origin });
+  const base = await revParse(mirror, 'refs/heads/main');
+  const files = await changedFiles(mirror, base, head);
+  assert.deepEqual(files, ['docs/index.md', 'src/index.ts']);
+
+  const config = validateConfig({ repo: 't/r', docsOnly: ['docs/**'], checks: [{ name: 'unit', paths: ['src/**'], steps: ['true'] }] });
+  const plan = classify(files, config);
+  assert.equal(plan.docsOnly, false);
+  assert.deepEqual(plan.groups, ['unit']);
+});
+
+test('changedFiles returns unquoted, NUL-separated names for non-ASCII paths', async () => {
+  const name = 'café notes.txt';
+  const o = await makeOrigin({ 'a.txt': 'a\n' });
+  await git(['checkout', '--quiet', '-b', 'feat'], o.work);
+  const head = await commitFiles(o.work, { [name]: 'x\n' }, 'add');
+  await git(['push', '--quiet', 'origin', 'feat'], o.work);
+  const mirror = await ensureMirror('t/r', { root: join(o.root, 'mirrors'), url: o.origin });
+  assert.deepEqual(await changedFiles(mirror, await revParse(mirror, 'refs/heads/main'), head), [name]);
 });
