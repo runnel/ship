@@ -21,3 +21,13 @@ test('--redeploy without a name is a usage error; the usage lists ship deploy', 
   assert.match(r.stdout, /names are required/);
   assert.match((await ship()).stdout, /ship deploy \[<deployable>…\] \[--dry-run\] \[--redeploy\]/);
 });
+
+test('ship status takes no arguments: an unknown flag or a name is named, its usage is printed, and it exits 2', { timeout: 30_000 }, async () => {
+  for (const arg of ['--nope', 'app']) {
+    const r = await ship('status', arg);
+    assert.equal(r.code, 2, r.stderr);
+    assert.match(r.stderr, new RegExp(`^✗ ship status: .*${arg}`));
+    assert.match(r.stdout, /^ship status {5,}live commit, pending changes, holds per deployable\n$/);
+  }
+  assert.match((await ship()).stdout, /ship status {5,}live commit/);
+});
