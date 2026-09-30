@@ -163,3 +163,12 @@ test('a config that fails to import does not post the system temp path', async (
   assert.ok(!last.description.includes(tmpdir()), last.description);
   assert.ok(last.description.includes('$TMPDIR/'), last.description);
 });
+
+test('a deployable importing a file outside its paths fails the check', async () => {
+  const configText = `export default { repo: 't/r', docsOnly: ['*.md'], checks: [{ name: 'unit', paths: ['src/**', 'lib/**'], steps: ['true'] }],
+    deployables: [{ name: 'w', worker: 'example-w', cwd: 'src', paths: ['src/**'], mode: 'direct' }],
+    credentials: { file: '/unused', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } } };\n`;
+  const s = await setup({ configText, featFiles: { 'src/x.ts': "import '../lib/y';\n", 'lib/y.ts': '' } });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1);
+  assert.match((await s.statuses()).at(-1).description, /deployable w imports lib\/y.ts/);
+});
