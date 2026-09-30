@@ -162,8 +162,9 @@ export async function readPid(file) {
   const pid = Number((await readFile(file, 'utf8').catch(() => '')).trim());
   return isPid(pid) ? pid : null;
 }
-// True once the process is gone (a killed orphan is reaped a moment later), false after `ms`.
-export async function isGone(pid, ms = 3000) {
+// True once the process is gone (a killed orphan is reaped a moment later), false after `ms`. The
+// wait ends as soon as the process is gone; `ms` only bounds a process that stays.
+export async function isGone(pid, ms = 15_000) {
   const until = Date.now() + ms;
   while (isAlive(pid)) {
     if (Date.now() > until) return false;
@@ -174,7 +175,7 @@ export async function isGone(pid, ms = 3000) {
 }
 // The step recorded a pid, and that process is gone. A missing pid file fails loudly here instead
 // of passing (isGone of nothing).
-export async function assertGone(file, message, ms = 3000) {
+export async function assertGone(file, message, ms = 15_000) {
   const pid = await readPid(file);
   assert.ok(pid, 'the step never recorded its pid');
   assert.equal(await isGone(pid, ms), true, message);

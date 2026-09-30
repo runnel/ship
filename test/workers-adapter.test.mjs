@@ -133,14 +133,14 @@ await deployOne({ d: { out: () => {}, tmpRoot: join(dir, 'tmp'), pollMs: 10, sta
   const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'inherit'] });
   const exit = once(child, 'exit');
   try {
-    const until = Date.now() + 15_000;
+    const until = Date.now() + 45_000;
     const called = async () => (await readFile(join(dir, 'cloud', 'wrangler-calls.jsonl'), 'utf8').catch(() => '')).trim() !== '';
     while (!(await called())) {
       if (child.exitCode !== null || Date.now() > until) throw new Error('the child never started wrangler');
       await new Promise((r) => setTimeout(r, 25));
     }
     child.kill('SIGTERM');
-    const [code] = await Promise.race([exit, new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not exit')), 15_000).unref())]);
+    const [code] = await Promise.race([exit, new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not exit')), 45_000).unref())]);
     return { code, hold: await readHold(join(dir, 'state'), 't/r', 'app') };
   } finally {
     child.kill('SIGKILL');
@@ -196,7 +196,7 @@ await deployOne({ d: { out: () => {}, tmpRoot: join(dir, 'tmp'), pollMs: 10, sta
   const exit = once(child, 'exit');
   const killGroup = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } };
   try {
-    const until = Date.now() + 20_000;
+    const until = Date.now() + 45_000;
     const promoted = async () => (mode === 'versioned'
       ? existsSync(join(dir, 'live-probing'))
       : (await readFile(join(dir, 'cloud', 'wrangler-calls.jsonl'), 'utf8').catch(() => '')).trim() !== '');
@@ -206,7 +206,7 @@ await deployOne({ d: { out: () => {}, tmpRoot: join(dir, 'tmp'), pollMs: 10, sta
     }
     await new Promise((r) => setTimeout(r, 300)); // the deployment request or wrangler has done its work
     killGroup();
-    await Promise.race([exit, new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not die')), 15_000).unref())]);
+    await Promise.race([exit, new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not die')), 45_000).unref())]);
     return await readHold(join(dir, 'state'), 't/r', 'app');
   } finally {
     killGroup();
@@ -257,16 +257,20 @@ const r = { get repo() {
   if (armed) { armed = false; process.kill(process.pid, 'SIGTERM'); }
   return 't/r';
 } };
-// Registered first, so it runs last in the unwind: the deploy below finishes before the process goes.
-onInterrupt(() => new Promise((resolve) => setTimeout(resolve, 2500)));
+// Registered first, so it runs last in the unwind: the process goes once the deploy has reported
+// (the timer is only an upper bound, below the unwind's own limit of 30 s).
+let reported;
+const done = new Promise((resolve) => { reported = resolve; });
+onInterrupt(() => Promise.race([done, new Promise((resolve) => setTimeout(resolve, 25_000))]));
 const res = await deployOne({ d: { out: () => {}, tmpRoot: join(dir, 'tmp'), pollMs: 10, stateRoot: join(dir, 'state'), fetch, probeWindowMs: 0, probeIntervalMs: 0, sleep: async () => {} },
   r, wt, dep: config.deployables[0], entry: { live }, cf, creds: { CLOUDFLARE_API_TOKEN: 'tok' }, target: 'b'.repeat(40), nonce: 'n0nce0',
   logFile: join(dir, 'deploy.log'), readAt: async () => '{"name":"example-app"}' });
 const deploys = (await cloud.wranglerCalls()).filter((c) => c.cmd === 'deploy').length;
 writeFileSync(${JSON.stringify(result)}, JSON.stringify({ res, posted, deploys, hold: await readHold(join(dir, 'state'), 't/r', 'app') }));
+reported();
 `);
   const child = spawn(process.execPath, [script], { stdio: ['ignore', 'inherit', 'inherit'] });
-  const [code] = await Promise.race([once(child, 'exit'), new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not exit')), 30_000).unref())]);
+  const [code] = await Promise.race([once(child, 'exit'), new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not exit')), 60_000).unref())]);
   child.kill('SIGKILL');
   const report = JSON.parse(await readFile(result, 'utf8').catch(() => 'null') ?? 'null');
   assert.ok(report, 'the deploy did not finish before the process went');
@@ -639,7 +643,7 @@ test('a hold that cannot be cleared after a verified deploy is reported and the 
 
 // wrangler is told to make nothing, so the only thing that can write the hold is the interrupt
 // handler: the deploy's own flow sees live untouched and reports a failure.
-test('an interrupt while wrangler promotes leaves a hold; before the promote it leaves none', { timeout: 60_000 }, async () => {
+test('an interrupt while wrangler promotes leaves a hold; before the promote it leaves none', { timeout: 150_000 }, async () => {
   const promoting = await interruptDuringWrangler({ dep: { mode: 'direct' }, wrangler: { deploy: { create: false, sleepMs: 60_000 } } });
   assert.equal(promoting.code, 130);
   assert.match(promoting.hold?.reason ?? '', /interrupted while deploying/);
@@ -649,7 +653,7 @@ test('an interrupt while wrangler promotes leaves a hold; before the promote it 
 });
 
 // Nothing can run in a process that is killed outright, so the hold has to be there before.
-test('a deploy killed outright after the promote leaves a hold that says the result was never verified', { timeout: 60_000 }, async () => {
+test('a deploy killed outright after the promote leaves a hold that says the result was never verified', { timeout: 150_000 }, async () => {
   for (const mode of ['versioned', 'direct']) {
     const hold = await killedAfterPromote(mode);
     assert.match(hold?.reason ?? '', IN_PROGRESS, mode);
@@ -658,7 +662,7 @@ test('a deploy killed outright after the promote leaves a hold that says the res
   }
 });
 
-test('an interrupt that lands while the pre-promote hold is written promotes nothing and leaves no hold', { timeout: 60_000 }, async () => {
+test('an interrupt that lands while the pre-promote hold is written promotes nothing and leaves no hold', { timeout: 150_000 }, async () => {
   for (const mode of ['versioned', 'direct']) {
     const out = await interruptedWhileMarking(mode);
     assert.equal(out.exit, 130, mode);

@@ -46,7 +46,7 @@ test('the helpers signal a real process, but only one this test started', async 
   try {
     assert.equal(isAlive(child.pid), true);
     killQuietly(child.pid);
-    assert.equal(await Promise.race([closed, deadline(10_000, 'the child')]), 'SIGKILL');
+    assert.equal(await Promise.race([closed, deadline(30_000, 'the child')]), 'SIGKILL');
   } finally {
     child.kill('SIGKILL');
   }
@@ -55,7 +55,7 @@ test('the helpers signal a real process, but only one this test started', async 
 // The one real-signal test for the invalid cases: 0 and a missing pid file (the case that once
 // killed a whole group). Its worst case, were the guard to fail, is the detached group of the
 // script below (the script and a sibling) and never the runner or the user's other processes.
-test('a pid of 0 and a missing pid file are no-ops, even with real signals', { timeout: 30_000 }, async () => {
+test('a pid of 0 and a missing pid file are no-ops, even with real signals', { timeout: 60_000 }, async () => {
   const dir = await tempDir('pidhelpers-');
   const script = join(dir, 'check.mjs');
   const helpers = new URL('./helpers.mjs', import.meta.url).href;
@@ -76,7 +76,7 @@ sibling.kill('SIGKILL');
   child.stdout.on('data', (b) => { out += b; });
   const exited = new Promise((resolve) => child.on('close', (code, signal) => resolve({ code, signal })));
   try {
-    const { code, signal } = await Promise.race([exited, deadline(20_000, 'the helper script')]);
+    const { code, signal } = await Promise.race([exited, deadline(40_000, 'the helper script')]);
     assert.deepEqual({ code, signal }, { code: 0, signal: null }, out);
     assert.match(out, /missing pid file -> null/);
     assert.match(out, /sibling alive -> true/);

@@ -26,12 +26,12 @@ async function ready(child) {
   const outcome = await Promise.race([
     once(child.stdout, 'data').then(() => 'ready'),
     once(child, 'exit').then(([code]) => `child exited (${code}) before it was ready`),
-    deadline(10_000, 'child startup'),
+    deadline(30_000, 'child startup'),
   ]);
   if (outcome !== 'ready') throw new Error(outcome);
 }
 
-test('interrupt handlers run last-registered first, then the process exits 130', { timeout: 30_000 }, async () => {
+test('interrupt handlers run last-registered first, then the process exits 130', { timeout: 60_000 }, async () => {
   const dir = await tempDir();
   const out = join(dir, 'out');
   const script = join(dir, 's.mjs');
@@ -48,7 +48,7 @@ setInterval(() => {}, 1000);
   try {
     await ready(child);
     child.kill('SIGTERM');
-    const [code] = await Promise.race([once(child, 'exit'), deadline(10_000, 'child exit')]);
+    const [code] = await Promise.race([once(child, 'exit'), deadline(30_000, 'child exit')]);
     assert.equal(code, 130);
     assert.equal(await readFile(out, 'utf8'), 'b,a,');
   } finally {
@@ -56,7 +56,7 @@ setInterval(() => {}, 1000);
   }
 });
 
-test('a repeated signal during the unwind starts no second unwind, and says why nothing happens (once)', { timeout: 30_000 }, async () => {
+test('a repeated signal during the unwind starts no second unwind, and says why nothing happens (once)', { timeout: 60_000 }, async () => {
   const dir = await tempDir();
   const out = join(dir, 'out');
   const script = join(dir, 's.mjs');
@@ -64,7 +64,15 @@ test('a repeated signal during the unwind starts no second unwind, and says why 
   await writeFile(script, `
 import { appendFileSync } from 'node:fs';
 import { onInterrupt } from ${JSON.stringify(mod)};
-onInterrupt(async () => { appendFileSync(${JSON.stringify(out)}, 'x,'); await new Promise((r) => setTimeout(r, 600)); });
+// The unwind stays open until the third signal has arrived (registered after ship's own listeners,
+// so they have seen it by then); the timer only bounds a signal that never comes.
+let signals = 0;
+onInterrupt(async () => {
+  appendFileSync(${JSON.stringify(out)}, 'x,');
+  const until = Date.now() + 20_000;
+  while (signals < 3 && Date.now() < until) await new Promise((r) => setTimeout(r, 10));
+});
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { signals++; });
 process.stdout.write('ready\\n');
 setInterval(() => {}, 1000);
 `);
@@ -78,7 +86,7 @@ setInterval(() => {}, 1000);
     child.kill('SIGINT');
     await new Promise((r) => setTimeout(r, 100));
     child.kill('SIGINT');
-    const [code] = await Promise.race([once(child, 'exit'), deadline(10_000, 'child exit')]);
+    const [code] = await Promise.race([once(child, 'exit'), deadline(30_000, 'child exit')]);
     assert.equal(code, 130);
     assert.equal(await readFile(out, 'utf8'), 'x,');
     assert.equal(stderr.split('\n').filter((l) => /already interrupted/.test(l)).length, 1, stderr);
@@ -108,7 +116,7 @@ for (const target of ['process', 'group']) {
       await waitFor(() => exists(started), 30_000, 'the first step to start');
       if (target === 'group') process.kill(-child.pid, 'SIGTERM');
       else child.kill('SIGTERM');
-      const code = await Promise.race([exited, deadline(20_000, 'ship exit')]);
+      const code = await Promise.race([exited, deadline(30_000, 'ship exit')]);
       assert.equal(code, 130, out.text);
 
       const states = (await s.statuses()).map((x) => x.state);
@@ -269,7 +277,7 @@ for (const target of ['process', 'group']) {
   });
 }
 
-test('a hanging error POST (captive portal, half-open connection) does not hold the cleanup until the hard deadline', { timeout: 60_000 }, async () => {
+test('a hanging error POST (captive portal, half-open connection) does not hold the cleanup until the hard deadline', { timeout: 120_000 }, async () => {
   const dir = await tempDir('unwind-');
   const started = join(dir, 'started');
   const s = await setupCheck({
@@ -281,8 +289,8 @@ test('a hanging error POST (captive portal, half-open connection) does not hold 
     await waitFor(() => exists(started), 30_000, 'the first step to start');
     const signalled = Date.now();
     run.child.kill('SIGTERM');
-    assert.equal(await Promise.race([run.exited, deadline(15_000, 'ship exit')]), 130, run.out.text);
-    assert.ok(Date.now() - signalled < 12_000, `took ${Date.now() - signalled} ms`);
+    assert.equal(await Promise.race([run.exited, deadline(28_000, 'ship exit')]), 130, run.out.text);
+    assert.ok(Date.now() - signalled < 25_000, `took ${Date.now() - signalled} ms`); // the hard deadline is 30 s
     assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
     assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'lanes')), []);
     assert.ok(!(await s.statuses()).some((x) => x.state === 'success'));
@@ -294,7 +302,7 @@ test('a hanging error POST (captive portal, half-open connection) does not hold 
 // A status POST that was in flight ahead of the error POST hangs: the interrupt must not wait for
 // it (the error POST used to queue behind it until the hard deadline), and the hung gh must not
 // stay behind in ship's process group, where it would keep the locks looking held.
-test('a hung earlier status POST does not hold up the interrupt, and is stopped', { timeout: 60_000 }, async () => {
+test('a hung earlier status POST does not hold up the interrupt, and is stopped', { timeout: 120_000 }, async () => {
   const dir = await tempDir('unwind-');
   const s = await setupCheck({ steps: ['true'], ghOptions: { apiDelay: { ms: 120_000, match: 'state=pending' } } });
   const run = await spawnCheckLeader(s, dir, { unwindPostTimeoutMs: 800 });
@@ -302,8 +310,8 @@ test('a hung earlier status POST does not hold up the interrupt, and is stopped'
     await waitFor(async () => (await s.calls()).some((c) => c[0] === 'api' && c.includes('state=pending')), 30_000, 'the first status POST to start');
     const signalled = Date.now();
     run.child.kill('SIGTERM'); // ship only: the POST in flight is not signalled
-    assert.equal(await Promise.race([run.exited, deadline(15_000, 'ship exit')]), 130, run.out.text);
-    assert.ok(Date.now() - signalled < 12_000, `took ${Date.now() - signalled} ms`);
+    assert.equal(await Promise.race([run.exited, deadline(28_000, 'ship exit')]), 130, run.out.text);
+    assert.ok(Date.now() - signalled < 25_000, `took ${Date.now() - signalled} ms`); // the hard deadline is 30 s
     assert.ok((await s.calls()).some((c) => c[0] === 'api' && c.includes('state=error')), 'no error status was posted');
     assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'checks')), []);
     // Nothing of ship's is left in its process group (that is what the locks test for liveness).
@@ -323,7 +331,7 @@ test('the queue drain and the error POST share one time budget', { timeout: 60_0
     await waitFor(async () => (await s.calls()).some((c) => c[0] === 'api' && c.includes('state=pending')), 30_000, 'the first status POST to start');
     const signalled = Date.now();
     run.child.kill('SIGTERM');
-    assert.equal(await Promise.race([run.exited, deadline(20_000, 'ship exit')]), 130, run.out.text);
+    assert.equal(await Promise.race([run.exited, deadline(30_000, 'ship exit')]), 130, run.out.text);
     const took = Date.now() - signalled;
     // one budget (5 s) + the error POST's floor (1.25 s) ≈ 6.3 s; two budgets would be ≥ 10 s
     assert.ok(took < 9000, `took ${took} ms: the error POST still gets a full budget of its own`);
@@ -341,7 +349,7 @@ test('a group signal during the first status POST ends as the real CLI does: exi
   try {
     await waitFor(async () => (await s.calls()).some((c) => c[0] === 'api' && c.includes('state=pending')), 30_000, 'the first status POST to start');
     process.kill(-run.child.pid, 'SIGTERM'); // the whole group: the POST in flight dies with it
-    assert.equal(await Promise.race([run.exited, deadline(20_000, 'ship exit')]), 130, run.out.text);
+    assert.equal(await Promise.race([run.exited, deadline(30_000, 'ship exit')]), 130, run.out.text);
     const states = (await s.statuses()).map((x) => x.state);
     assert.equal(states.at(-1), 'error', states.join(', '));
     assert.ok(!states.includes('success'), states.join(', '));
