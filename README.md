@@ -97,11 +97,14 @@ to move it; that splits sessions that do not share the variable.
 ## Leak guard (for this repository)
 
 `ship leak --staged | --msg <file> | --pre-push [remote] | --all | --history [--generic-only]` scans for
-shapes that must not be published, including commit author and committer identities. The author
-name of a commit GitHub made (committer `GitHub <noreply@github.com>`, author a
-`users.noreply.github.com` address) comes from the account's public profile and is not matched
-against the denylist; the rest of that commit is scanned as usual. It fails closed: a git error or
-a binary file it cannot scan is a finding, not a pass. Enable with
+shapes that must not be published, including commit author and committer identities. For the
+commits GitHub creates itself (a squash or merge commit from the web UI or `gh pr merge`), GitHub
+fills the author line from the account. When the committer is `GitHub <noreply@github.com>` and the
+author address is a `users.noreply.github.com` one, that author line (name and noreply address) is
+not matched against the denylist; the rest of the commit, and the generic rules on that line, apply
+as usual. Both identity lines are self-asserted, so this is a narrow exemption, not proof of
+origin. It fails closed: a git error or a binary file it cannot scan is a finding, not a pass.
+Enable with
 `git config core.hooksPath .githooks` and create `~/.config/ship/denylist`. Pull requests are
 judged by main's copy of the guard.
 

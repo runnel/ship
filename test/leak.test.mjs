@@ -295,9 +295,9 @@ test('findings about a file name never print the name, nor does any other findin
 });
 
 // --- commits made by GitHub -------------------------------------------------------------------
-// GitHub fills the author name of the commits it makes (web merges, `gh pr merge`) from the
-// account profile, which is public. Line 1 of such a commit is not matched against the denylist;
-// its message and patch are scanned as usual, and line 1 still faces the generic rules.
+// GitHub fills the author line (name and noreply address) of the commits it creates (web merges,
+// `gh pr merge`) from the account, which is public. Line 1 of such a commit is not matched against
+// the denylist; its message and patch are scanned as usual, and line 1 still faces the generic rules.
 
 const GITHUB_COMMITTER = { name: 'GitHub', email: 'noreply' + AT + 'github.com' };
 const ACCOUNT_AUTHOR = { name: 'Zelda Example', email: '1+zelda' + AT + 'users.noreply.github.com' };
