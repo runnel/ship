@@ -114,3 +114,20 @@ test('an imported file that the deployable ignores, or the repo treats as docs-o
     { from: 'app/src/a.ts', to: 'app/notes/n.ts' },
   ]);
 });
+
+test('sources the deploy plan does not watch are not scanned: an ignored test may import its own helper', async () => {
+  const root = await tree({
+    'web/src/a.ts': `import './b';`,
+    'web/src/b.ts': '',
+    'web/test/a.test.ts': `import './helpers';\nimport '../../elsewhere/x';`,
+    'web/test/helpers.ts': '',
+    'web/notes/n.ts': `import './m';`,
+    'web/notes/m.ts': '',
+    'elsewhere/x.ts': '',
+  });
+  const web = { cwd: 'web', paths: ['web/**'], ignore: ['web/test/**'] };
+  assert.deepEqual(await importsOutside(root, web, ['web/notes/**']), []);
+  // the watched code reaching into them is still caught
+  const reaching = await tree({ 'web/src/a.ts': `import '../test/helpers';`, 'web/test/helpers.ts': '' });
+  assert.deepEqual(await importsOutside(reaching, web), [{ from: 'web/src/a.ts', to: 'web/test/helpers.ts' }]);
+});

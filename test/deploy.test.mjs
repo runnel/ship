@@ -101,6 +101,13 @@ test('an import of a file the deployable ignores, or that is docs-only, blocks i
   assert.match(docs.lines.join('\n'), /✗ app: imports files outside its paths: app\/src\/a.ts → app\/notes\/n.ts/);
 });
 
+test('files the deployable ignores may import each other: only watched code reaching into them blocks', async () => {
+  const s = await setupDeploy({ options: { appIgnore: "['app/test/**']" }, seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }),
+    change: { 'app/test/a.test.ts': "import './helpers';\n", 'app/test/helpers.ts': '1' } });
+  assert.equal(await s.deploy(), 0, s.lines.join('\n'));
+  assert.match(s.lines.join('\n'), /✓ app: already live/);
+});
+
 test('--redeploy deploys a live deployable again; it needs names', async () => {
   const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }) });
   await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);

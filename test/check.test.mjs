@@ -190,6 +190,11 @@ test('the import check also treats an ignored or docs-only import as outside', a
   assert.match((await lastStatus(docs)).description, /deployable w imports docs\/y.ts \(from src\/x.ts\)/);
 });
 
+test('an ignored test that imports its own helper passes the import check', async () => {
+  const s = await setup({ configText: importConfig(['src/**'], { extra: ", ignore: ['src/test/**']" }), featFiles: { 'src/test/a.test.ts': "import './helpers';\n", 'src/test/helpers.ts': '' } });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 0, s.lines.join('\n'));
+});
+
 test('a violation that is already on main does not fail the pull request that widens the paths', async () => {
   const s = await setup({ configText: importConfig(['src/**']), mainFiles: MAIN_VIOLATES, featFiles: { 'ship.config.mjs': importConfig(['src/**', 'lib/**']) } });
   assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 0, s.lines.join('\n'));
