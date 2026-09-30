@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { localTime, duration, scrubPaths } from '../lib/report.mjs';
+import { localTime, duration, scrubPaths, timeOr } from '../lib/report.mjs';
 
 test('localTime formats an instant in the given zone, across daylight saving', () => {
   assert.match(localTime('2026-09-29T11:32:00Z', { timeZone: 'Asia/Tokyo' }), /20:32/);
@@ -19,6 +19,12 @@ test('localTime defaults to SHIP_TZ, then to the system zone', () => {
     else process.env.SHIP_TZ = saved;
   }
   assert.match(localTime('2026-09-29T11:32:00Z'), /^\d\d\/\d\d, \d\d:\d\d$/);
+});
+
+test('timeOr shows a time, and the fallback for a record that has none or a damaged one', () => {
+  assert.match(timeOr('2026-09-29T11:32:00Z'), /^\d\d\/\d\d, \d\d:\d\d$/);
+  for (const bad of [undefined, null, '', 'not a time', 42]) assert.equal(timeOr(bad), '?');
+  assert.equal(timeOr('not a time', null), null);
 });
 
 test('duration formats seconds and minutes', () => {
