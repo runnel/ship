@@ -261,8 +261,10 @@ A versioned deploy uploads a version and promotes it; it never applies the setti
 Durable Object migrations, `logpush`, tail consumers and `observability` against the live commit's
 config. The owner applies such a change once, outside ship, and then `ship deploy` carries on. For
 the state keys: `wrangler triggers deploy` in the deployable's directory. For the config keys:
-`wrangler deploy --message "sha:<full main sha> <name> owner"` from a clean checkout of main; the
-`sha:` stamp keeps the live commit known, so the next `ship deploy` sees what is still pending.
+`wrangler deploy --message "sha:<full main sha> <name> owner"` from a clean checkout of main, after
+running the repository's `deploySetup` and the deployable's `install` and `build` there as ship would
+(wrangler deploys what has been built, with the `envFiles` in place for the build). The `sha:` stamp
+keeps the live commit known, so the next `ship deploy` sees what is still pending.
 
 ### Exit codes and state
 
