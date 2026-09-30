@@ -213,6 +213,66 @@ await deployOne({ d: { out: () => {}, tmpRoot: join(dir, 'tmp'), pollMs: 10, sta
   }
 }
 
+// A deploy in a child process that receives SIGTERM while its pre-promote hold is being written:
+// the first read of `r.repo` after the last interrupt check is that write. Resolves to what the
+// child reported: the outcome, whether a deployment was requested, and the hold it left.
+async function interruptedWhileMarking(mode) {
+  const dir = await tempDir('marking-');
+  const href = (p) => JSON.stringify(new URL(p, import.meta.url).href);
+  const script = join(dir, 'child.mjs');
+  const result = join(dir, 'result.json');
+  await writeFile(script, `
+import { chmod, copyFile, mkdir, writeFile } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { validateConfig } from ${href('../lib/config.mjs')};
+import { cloudflare } from ${href('../lib/cloudflare.mjs')};
+import { resolveLive } from ${href('../lib/live.mjs')};
+import { onInterrupt } from ${href('../lib/interrupt.mjs')};
+import { readHold } from ${href('../lib/state.mjs')};
+import { deployOne } from ${href('../lib/adapters/workers.mjs')};
+import { fakeCloud } from ${href('./fake-cloud.mjs')};
+
+const dir = ${JSON.stringify(dir)};
+const OLD = 'a'.repeat(40);
+const cloud = await fakeCloud({ dir: join(dir, 'cloud'), hosts: { 'https://app.example.com': 'example-app' },
+  workers: { 'example-app': { versions: [{ message: 'sha:' + OLD + ' old' }], deployments: [{ versionId: null, message: 'sha:' + OLD + ' old' }] } } });
+let posted = false;
+const fetch = (url, init = {}) => {
+  if (init.method === 'POST') posted = true;
+  return cloud.fetch(url, init);
+};
+const config = validateConfig({ repo: 't/r', checks: [{ name: 'u', paths: ['**'], steps: ['true'] }], credentials: { file: '/x', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } },
+  deployables: [{ name: 'app', worker: 'example-app', cwd: 'app', paths: ['app/**'], wrangler: 'tools/wrangler', probes: [{ path: '/', status: 200 }], liveHost: 'https://app.example.com', mode: ${JSON.stringify(mode)} }] });
+const wt = join(dir, 'wt');
+await mkdir(join(wt, 'app'), { recursive: true });
+await mkdir(join(wt, 'tools'), { recursive: true });
+await copyFile(cloud.bin, join(wt, 'tools', 'wrangler'));
+await chmod(join(wt, 'tools', 'wrangler'), 0o755);
+await writeFile(join(wt, 'app', 'wrangler.json'), '{"name":"example-app"}');
+const cf = cloudflare({ token: 'tok', accountId: 'acc', fetchImpl: fetch });
+const live = resolveLive({ deployments: await cf.deployments('example-app'), versions: await cf.versions('example-app') });
+let armed = true;
+const r = { get repo() {
+  if (armed) { armed = false; process.kill(process.pid, 'SIGTERM'); }
+  return 't/r';
+} };
+// Registered first, so it runs last in the unwind: the deploy below finishes before the process goes.
+onInterrupt(() => new Promise((resolve) => setTimeout(resolve, 2500)));
+const res = await deployOne({ d: { out: () => {}, tmpRoot: join(dir, 'tmp'), pollMs: 10, stateRoot: join(dir, 'state'), fetch, probeWindowMs: 0, probeIntervalMs: 0, sleep: async () => {} },
+  r, wt, dep: config.deployables[0], entry: { live }, cf, creds: { CLOUDFLARE_API_TOKEN: 'tok' }, target: 'b'.repeat(40), nonce: 'n0nce0',
+  logFile: join(dir, 'deploy.log'), readAt: async () => '{"name":"example-app"}' });
+const deploys = (await cloud.wranglerCalls()).filter((c) => c.cmd === 'deploy').length;
+writeFileSync(${JSON.stringify(result)}, JSON.stringify({ res, posted, deploys, hold: await readHold(join(dir, 'state'), 't/r', 'app') }));
+`);
+  const child = spawn(process.execPath, [script], { stdio: ['ignore', 'inherit', 'inherit'] });
+  const [code] = await Promise.race([once(child, 'exit'), new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not exit')), 30_000).unref())]);
+  child.kill('SIGKILL');
+  const report = JSON.parse(await readFile(result, 'utf8').catch(() => 'null') ?? 'null');
+  assert.ok(report, 'the deploy did not finish before the process went');
+  return { exit: code, ...report };
+}
+
 test('deployMessage starts with the sha and stays short', () => {
   assert.equal(deployMessage({ sha: NEW, name: 'app', nonce: 'n0nce0', note: '#7 #8' }), `sha:${NEW} app run:n0nce0 #7 #8`);
   assert.ok(deployMessage({ sha: NEW, name: 'app', nonce: 'x', note: 'y'.repeat(500) }).length <= 200);
@@ -598,6 +658,18 @@ test('a deploy killed outright after the promote leaves a hold that says the res
   }
 });
 
+test('an interrupt that lands while the pre-promote hold is written promotes nothing and leaves no hold', { timeout: 60_000 }, async () => {
+  for (const mode of ['versioned', 'direct']) {
+    const out = await interruptedWhileMarking(mode);
+    assert.equal(out.exit, 130, mode);
+    assert.equal(out.res.outcome, 'failed', `${mode}: ${JSON.stringify(out.res)}`);
+    assert.match(out.res.detail, /^interrupted before promoting; live untouched$/, mode);
+    assert.equal(out.posted, false, `${mode}: no deployment was requested`);
+    assert.equal(out.deploys, 0, `${mode}: wrangler deploy was not run`);
+    assert.equal(out.hold, null, `${mode}: our own hold is taken back`);
+  }
+});
+
 test('direct: wrangler deploy with the message, then live probes', async () => {
   const { cloud, ctx } = await fixture({ dep: TICK });
   const res = await deployOne(ctx);
@@ -648,6 +720,15 @@ test('direct: wrangler exiting 0 without a deploy record and nothing of ours liv
   const res = await deployOne(ctx);
   assert.equal(res.outcome, 'failed');
   assert.match(res.detail, /wrangler deploy exited 0 without a deploy record; live is aaaaaaa/);
+});
+
+test('direct: wrangler killed by its timeout may still have deployed, so a hold stays', async () => {
+  const { ctx, cloud, stateRoot } = await fixture({ dep: TICK, patch: { timeoutMin: 0.02 }, wrangler: { deploy: { create: false, sleepMs: 60_000 } } });
+  const res = await deployOne(ctx);
+  assert.equal(res.outcome, 'stuck');
+  assert.match(res.detail, /^wrangler deploy timed out; whether our code went live is unknown — hold set; ship status, then the owner decides \(ship unhold tick\)$/);
+  assert.match((await readHold(stateRoot, 't/r', 'tick')).reason, /wrangler deploy timed out; whether our code went live is unknown/);
+  assert.equal(cloud.live('example-tick'), (await cloud.state('example-tick')).deployments[0].versions[0].version_id, 'nothing was deployed');
 });
 
 test('the build gets the deployable env and no credentials', async () => {
