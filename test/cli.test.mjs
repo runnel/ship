@@ -18,8 +18,43 @@ test('an unknown flag of ship deploy is named, its usage is printed, and it exit
 test('--redeploy without a name is a usage error; the usage lists ship deploy', { timeout: 30_000 }, async () => {
   const r = await ship('deploy', '--redeploy');
   assert.equal(r.code, 2, r.stderr);
-  assert.match(r.stdout, /names are required/);
+  assert.match(r.stderr, /^✗ ship deploy: --redeploy needs deployable names\n$/);
+  assert.match(r.stdout, /^ship deploy \[<deployable>…\] \[--dry-run\] \[--redeploy\] {3,}deploy what changed/);
   assert.match((await ship()).stdout, /ship deploy \[<deployable>…\] \[--dry-run\] \[--redeploy\]/);
+});
+
+// Every usage error reads the same: the problem on stderr, the command's usage line on stdout, exit 2.
+const usageError = async (args, problem, usage, { lines = 1 } = {}) => {
+  const r = await ship(...args);
+  assert.equal(r.code, 2, `ship ${args.join(' ')}: ${r.stderr}`);
+  assert.match(r.stderr, new RegExp(`^✗ ship ${problem}.*\n$`), `ship ${args.join(' ')}`);
+  assert.match(r.stdout, usage, `ship ${args.join(' ')}`);
+  if (lines) assert.equal(r.stdout.trimEnd().split('\n').length, lines, 'the usage of that command only');
+};
+
+test('ship check: a bad flag or an extra argument is a usage error, exit 2', { timeout: 30_000 }, async () => {
+  const usage = /^ship check \[--pr <number>\] {3,}check a pull request/;
+  await usageError(['check', '--nope'], 'check: .*--nope', usage);
+  await usageError(['check', '42'], 'check: .*42', usage);
+  await usageError(['check', '--pr'], 'check: .*--pr', usage);
+});
+
+test('missing arguments and malformed values are usage errors in the same style', { timeout: 60_000 }, async () => {
+  const adopt = /^ship adopt --at <sha> /;
+  await usageError(['adopt'], 'adopt: missing --at <sha>', adopt);
+  await usageError(['adopt', '--all'], 'adopt: missing --at <sha>', adopt);
+  await usageError(['adopt', '--at', 'abcdef1'], 'adopt: missing deployable names \\(or --all\\)', adopt);
+  await usageError(['adopt', '--at', 'zz', '--all'], 'adopt: --at zz: give a commit sha', adopt);
+  await usageError(['adopt', '--at', 'abcdef1', '--all', 'app'], 'adopt: give deployable names or --all, not both', adopt);
+  await usageError(['adopt', '--plan', '--all'], 'adopt: --plan takes no other argument', adopt);
+  const rollback = /^ship rollback <deployable> /;
+  await usageError(['rollback'], 'rollback: missing deployable name', rollback);
+  await usageError(['rollback', 'app', '--to', 'zzz'], 'rollback: --to zzz: give a version id', rollback);
+  await usageError(['rollback', 'app', '--revert-secrets'], 'rollback: --revert-secrets needs --to <version>', rollback);
+  await usageError(['unhold'], 'unhold: missing deployable name', /^ship unhold <deployable> /);
+  await usageError(['unhold', '../x'], 'unhold: "../x" is not a deployable name', /^ship unhold <deployable> /);
+  await usageError(['migrations', 'ack'], 'migrations ack: missing migration file names', /^ship migrations ack <file>… /);
+  await usageError(['frobnicate'], 'frobnicate: unknown command', /^usage:\n {2}ship check /, { lines: 0 });
 });
 
 test('ship status takes no arguments: an unknown flag or a name is named, its usage is printed, and it exits 2', { timeout: 30_000 }, async () => {

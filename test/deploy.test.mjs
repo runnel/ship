@@ -4,6 +4,7 @@ import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { commitFiles, git, makeOrigin } from './helpers.mjs';
 import { addAcks, writeHold } from '../lib/state.mjs';
+import { UsageError } from '../lib/shared.mjs';
 import { at, setupDeploy } from './deploy-fixture.mjs';
 
 test('nothing pending: already live, no build, exit 0', async () => {
@@ -91,14 +92,15 @@ test('an import outside paths blocks that deployable only', async () => {
 test('--redeploy deploys a live deployable again; it needs names', async () => {
   const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }) });
   await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
-  assert.equal(await s.deploy([], false, true), 2);
+  await assert.rejects(s.deploy([], false, true), (e) => e instanceof UsageError && e.message === '--redeploy needs deployable names');
   assert.equal(await s.deploy(['tick'], false, true), 0, s.lines.join('\n'));
   assert.deepEqual((await s.cloud.wranglerCalls()).map((c) => c.cmd), ['deploy']);
 });
 
 test('an unknown deployable name is a usage error', async () => {
   const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }) });
-  assert.equal(await s.deploy(['nope']), 2);
+  await assert.rejects(s.deploy(['nope']), (e) => e instanceof UsageError && e.message === 'unknown deployable: nope (known: app, tick)');
+  assert.deepEqual(await s.cloud.wranglerCalls(), []);
 });
 
 test('requires: a pending deployable of another repo stops the deploy', async () => {

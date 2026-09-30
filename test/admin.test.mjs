@@ -7,10 +7,13 @@ import { join } from 'node:path';
 import { readAcks, readHold, writeHold } from '../lib/state.mjs';
 import { runAck, runAdopt, runRollback, runUnhold } from '../lib/admin.mjs';
 import { runDeploy } from '../lib/deploy.mjs';
+import { UsageError } from '../lib/shared.mjs';
 import { at, setupDeploy } from './deploy-fixture.mjs';
 import { commitFiles, git, tempDir } from './helpers.mjs';
 
 const posts = (cloud) => cloud.apiCalls.filter((c) => c.method === 'POST').map((c) => c.body.annotations['workers/message']);
+// The message of the usage error a command refuses with (the CLI prints it and exits 2).
+const usageOf = (promise) => promise.then(() => null, (e) => { if (e instanceof UsageError) return e.message; throw e; });
 
 test('adopt records the current versions and seeds the ack ledger', async () => {
   const s = await setupDeploy({ seed: () => ({ 'example-app': { versions: [{ message: 'by hand' }], deployments: [{ versionId: null }] }, 'example-tick': { versions: [{}], deployments: [{ versionId: null }] } }) });
@@ -25,7 +28,7 @@ test('adopt records the current versions and seeds the ack ledger', async () => 
 test('adopt refuses a commit that is not on main, and needs --all or names', async () => {
   const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }) });
   assert.equal(await runAdopt({ cwd: s.work, at: 'f'.repeat(40), all: true, deps: s.deps }), 2);
-  assert.equal(await runAdopt({ cwd: s.work, at: s.first, deps: s.deps }), 2);
+  assert.match(await usageOf(runAdopt({ cwd: s.work, at: s.first, deps: s.deps })), /^missing deployable names \(or --all\)$/);
 });
 
 test('adopt --plan suggests the main commit at upload time', async () => {
@@ -75,6 +78,7 @@ test('unhold and migrations ack', async () => {
   assert.equal(await runUnhold({ cwd: s.work, name: 'app', deps: s.deps }), 0);
   assert.equal(await readHold(s.deps.stateRoot, 't/r', 'app'), null);
   assert.equal(await runAck({ cwd: s.work, files: ['nope.sql'], deps: s.deps }), 2);
+  assert.match(await usageOf(runAck({ cwd: s.work, files: [], deps: s.deps })), /^missing migration file names$/);
   assert.equal(await runAck({ cwd: s.work, files: ['001.sql'], deps: s.deps }), 0);
   assert.deepEqual([...(await readAcks(s.deps.stateRoot, 't/r'))], ['db/001.sql']);
 });
@@ -122,12 +126,11 @@ test('adopt reports a failing Worker by name and still adopts the others', async
 
 test('adopt checks its arguments before touching anything', async () => {
   const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }) });
-  assert.equal(await runAdopt({ cwd: s.work, at: 'main', all: true, deps: s.deps }), 2);
-  assert.match(s.lines.join('\n'), /--at main: give a commit sha/);
-  assert.equal(await runAdopt({ cwd: s.work, at: s.first, names: ['nope'], deps: s.deps }), 2);
-  assert.match(s.lines.join('\n'), /unknown deployable: nope \(known: app, tick\)/);
-  assert.equal(await runAdopt({ cwd: s.work, at: s.first, names: ['app'], all: true, deps: s.deps }), 2);
-  assert.equal(await runAdopt({ cwd: s.work, plan: true, names: ['app'], deps: s.deps }), 2);
+  assert.match(await usageOf(runAdopt({ cwd: s.work, at: 'main', all: true, deps: s.deps })), /^--at main: give a commit sha/);
+  assert.match(await usageOf(runAdopt({ cwd: s.work, at: s.first, names: ['nope', 'nah', 'app'], deps: s.deps })), /^unknown deployable: nope, nah \(known: app, tick\)$/);
+  assert.match(await usageOf(runAdopt({ cwd: s.work, all: true, deps: s.deps })), /^missing --at <sha>$/);
+  assert.match(await usageOf(runAdopt({ cwd: s.work, at: s.first, names: ['app'], all: true, deps: s.deps })), /^give deployable names or --all, not both$/);
+  assert.match(await usageOf(runAdopt({ cwd: s.work, plan: true, names: ['app'], deps: s.deps })), /^--plan takes no other argument$/);
   assert.deepEqual(posts(s.cloud), []);
   assert.deepEqual([...(await readAcks(s.deps.stateRoot, 't/r'))], []);
 });
@@ -152,12 +155,14 @@ test('rollback with no earlier version with a known commit says so and changes n
 
 test('rollback --to checks the version before it holds anything', async () => {
   const s = await setupDeploy({ change: { 'app/src/a.ts': '2' }, seed: twoVersions });
-  assert.equal(await runRollback({ cwd: s.work, name: 'app', to: 'zzzzzz', deps: s.deps }), 2);
+  assert.match(await usageOf(runRollback({ cwd: s.work, name: 'app', to: 'zzzzzz', deps: s.deps })), /^--to zzzzzz: give a version id/);
+  assert.match(await usageOf(runRollback({ cwd: s.work, name: 'app', revertSecrets: true, deps: s.deps })), /^--revert-secrets needs --to <version>$/);
+  assert.match(await usageOf(runRollback({ cwd: s.work, deps: s.deps })), /^missing deployable name$/);
   assert.equal(await runRollback({ cwd: s.work, name: 'app', to: '000000', deps: s.deps }), 2);
   assert.match(s.lines.join('\n'), /--to 000000: no such version/);
   assert.equal(await runRollback({ cwd: s.work, name: 'app', to: await versionPrefix(s.cloud, 'example-app', 1), deps: s.deps }), 1);
   assert.match(s.lines.join('\n'), /is already live/);
-  assert.equal(await runRollback({ cwd: s.work, name: 'nope', deps: s.deps }), 2);
+  assert.match(await usageOf(runRollback({ cwd: s.work, name: 'nope', deps: s.deps })), /^unknown deployable: nope \(known: app, tick\)$/);
   assert.equal(await readHold(s.deps.stateRoot, 't/r', 'app'), null);
   assert.deepEqual(posts(s.cloud), []);
 });
@@ -205,7 +210,8 @@ test('unhold names what is held when the name is not, and survives a damaged tim
   await writeHold(s.deps.stateRoot, 't/r', 'tick', { reason: 'odd', at: 'not a time' });
   assert.equal(await runUnhold({ cwd: s.work, name: 'app', deps: s.deps }), 0);
   assert.match(s.lines.join('\n'), /· app: no hold \(held: tick\)/);
-  assert.equal(await runUnhold({ cwd: s.work, name: '../x', deps: s.deps }), 2);
+  assert.match(await usageOf(runUnhold({ cwd: s.work, name: '../x', deps: s.deps })), /^"\.\.\/x" is not a deployable name$/);
+  assert.match(await usageOf(runUnhold({ cwd: s.work, deps: s.deps })), /^missing deployable name$/);
   assert.equal(await runUnhold({ cwd: s.work, name: 'tick', deps: s.deps }), 0);
   assert.match(s.lines.join('\n'), /✓ tick: hold cleared \(was: odd\)/);
   assert.equal(await readHold(s.deps.stateRoot, 't/r', 'tick'), null);
