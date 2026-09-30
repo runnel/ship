@@ -749,3 +749,80 @@ test('a sha256 repository: line numbers hold, and a commit GitHub made keeps its
     assert.deepEqual(r.lines, [`✗ commit ${tip.slice(0, 7)}:5: denylist`], `${mode}: ${r.printed}`);
   }
 });
+
+// --- where the guard is started ---------------------------------------------------------------
+// From a subdirectory, git reads less than the repository: `ls-files` lists that directory alone,
+// and with diff.relative set, `diff` shows only its changes (and `log -p` would, unless told not to).
+// A manual run from there must still read the whole repository.
+
+async function repoWithSubdir() {
+  const dir = await scratchRepo({ 'top.txt': LEAKY });
+  await mkdir(join(dir, 'sub'));
+  await writeAll(dir, { 'sub/s.txt': 'clean\n' });
+  const tip = await commitAll(dir);
+  return { dir, sub: join(dir, 'sub'), tip };
+}
+
+test('--all and --staged read the whole repository when run from a subdirectory', async () => {
+  const { dir, sub } = await repoWithSubdir();
+  const all = collect();
+  assert.equal(await runLeak(['--all', '--generic-only'], { cwd: sub, out: all.out }), 1, all.lines.join('\n'));
+  assert.ok(all.lines.includes('✗ top.txt:1: e-mail address'), all.lines.join('\n'));
+
+  await writeAll(dir, { 'other.txt': LEAKY, 'sub/new.txt': LEAKY });
+  await git(dir, 'add', '-A');
+  for (const relative of ['false', 'true']) { // diff.relative would narrow `git diff --cached` too
+    await git(dir, 'config', 'diff.relative', relative);
+    const staged = collect();
+    assert.equal(await runLeak(['--staged', '--generic-only'], { cwd: sub, out: staged.out }), 1, `diff.relative=${relative}: ${staged.lines.join('\n')}`);
+    assert.deepEqual(staged.lines, ['✗ other.txt:1: e-mail address', '✗ sub/new.txt:1: e-mail address'], `diff.relative=${relative}`);
+  }
+});
+
+test('a tree that a ref names is read whole when it is pushed from a subdirectory', async () => {
+  const { dir, sub } = await repoWithSubdir();
+  const tree = (await git(dir, 'rev-parse', 'HEAD^{tree}')).trim();
+  await git(dir, 'update-ref', 'refs/trees/t', tree);
+  const c = collect();
+  const stdin = Readable.from([`refs/trees/t ${tree} refs/trees/t ${zeros(tree)}\n`]);
+  assert.equal(await runLeak(['--pre-push', 'origin', '--generic-only'], { cwd: sub, out: c.out, stdin }), 1, c.lines.join('\n'));
+  assert.deepEqual(c.lines, ['✗ top.txt:1: e-mail address']);
+});
+
+// Git resolves a relative GIT_DIR or GIT_WORK_TREE against the directory it starts in. Started
+// from inner/sub, these name inner; resolved from inner's top level, they would name outer.
+test('a relative GIT_DIR and GIT_WORK_TREE name the same repository from the top level', async () => {
+  const outer = await scratchRepo({ 'a.txt': 'clean\n' });
+  await commitAll(outer);
+  const inner = join(outer, 'inner');
+  await capture('git', ['init', '--quiet', '--initial-branch=main', inner]);
+  for (const [key, value] of [['user.name', 'x'], ['user.email', NOREPLY], ['commit.gpgsign', 'false']]) await git(inner, 'config', key, value);
+  await mkdir(join(inner, 'sub'));
+  await writeAll(inner, { 'top.txt': LEAKY, 'sub/s.txt': 'clean\n' });
+  await commitAll(inner);
+  const saved = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE };
+  Object.assign(process.env, { GIT_DIR: '../.git', GIT_WORK_TREE: '..' });
+  try {
+    const c = collect();
+    assert.equal(await runLeak(['--all', '--generic-only'], { cwd: join(inner, 'sub'), out: c.out }), 1, c.lines.join('\n'));
+    assert.ok(c.lines.includes('✗ top.txt:1: e-mail address'), c.lines.join('\n'));
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('a bare repository: the commit modes read it, --all and --staged refuse instead of passing', async () => {
+  const { dir, tip } = await repoWithSubdir();
+  const bare = join(await tempDir('bare-'), 'repo.git');
+  await capture('git', ['clone', '--quiet', '--bare', dir, bare]);
+  await expectLeakIn(bare, tip, commitModes(tip).filter((m) => m.mode !== '--all'));
+  // no work tree, so no index: an empty file list must not pass for a clean one
+  for (const mode of ['--all', '--staged']) {
+    const c = collect();
+    assert.equal(await runLeak([mode, '--generic-only'], { cwd: bare, out: c.out }), 1, mode);
+    assert.ok(c.lines.some((l) => l.includes('cannot verify')), `${mode}: ${c.lines.join('\n')}`);
+  }
+});
