@@ -293,3 +293,101 @@ test('findings about a file name never print the name, nor does any other findin
     else process.env.SHIP_DENYLIST = saved;
   }
 });
+
+// --- commits made by GitHub -------------------------------------------------------------------
+// GitHub fills the author line (name and noreply address) of the commits it creates (web merges,
+// `gh pr merge`) from the account, which is public. Line 1 of such a commit is not matched against
+// the denylist; its message and patch are scanned as usual, and line 1 still faces the generic rules.
+
+const GITHUB_COMMITTER = { name: 'GitHub', email: 'noreply' + AT + 'github.com' };
+const ACCOUNT_AUTHOR = { name: 'Zelda Example', email: '1+zelda' + AT + 'users.noreply.github.com' };
+
+async function commitAs(dir, author, committer, message, body = 'clean\n') {
+  await writeAll(dir, { 'n.txt': body });
+  await git(dir, 'add', '-A');
+  const env = {
+    ...process.env,
+    GIT_AUTHOR_NAME: author.name, GIT_AUTHOR_EMAIL: author.email,
+    GIT_COMMITTER_NAME: committer.name, GIT_COMMITTER_EMAIL: committer.email,
+  };
+  await capture('git', ['-C', dir, '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '-m', message], { env });
+}
+
+// Runs the guard with a throwaway denylist; never the user's own.
+async function leakWithDenylist(dir, mode, terms = ['zelda']) {
+  const list = join(await tempDir(), 'denylist');
+  await writeFile(list, `${terms.join('\n')}\n`);
+  const saved = process.env.SHIP_DENYLIST;
+  process.env.SHIP_DENYLIST = list;
+  try {
+    const c = collect();
+    const code = await runLeak([mode], { cwd: dir, out: c.out });
+    return { code, lines: c.lines, printed: c.lines.join('\n') };
+  } finally {
+    if (saved === undefined) delete process.env.SHIP_DENYLIST;
+    else process.env.SHIP_DENYLIST = saved;
+  }
+}
+
+test('a commit GitHub made: the account name on its author line is not matched against the denylist', async () => {
+  for (const mode of ['--all', '--history']) {
+    const dir = await scratchRepo({});
+    await commitAs(dir, ACCOUNT_AUTHOR, GITHUB_COMMITTER, 'squash merge');
+    const r = await leakWithDenylist(dir, mode);
+    assert.equal(r.code, 0, `${mode}: ${r.printed}`);
+    assert.deepEqual(r.lines, ['✓ leak guard: clean']);
+  }
+});
+
+test('the same author line on a commit made locally is still a denylist finding on line 1', async () => {
+  const dir = await scratchRepo({});
+  await commitAs(dir, ACCOUNT_AUTHOR, { name: 'dev', email: '1+dev' + AT + 'users.noreply.github.com' }, 'local commit');
+  const r = await leakWithDenylist(dir, '--all');
+  assert.equal(r.code, 1, r.printed);
+  assert.ok(r.lines.some((l) => /^✗ commit [0-9a-f]{7}:1: denylist$/.test(l)), r.printed);
+});
+
+test("a committer that only resembles GitHub's does not earn the exemption", async () => {
+  for (const committer of [
+    { name: 'GitHub', email: '1+dev' + AT + 'users.noreply.github.com' },
+    { name: 'GitHub Actions', email: GITHUB_COMMITTER.email },
+    { name: 'dev', email: GITHUB_COMMITTER.email },
+  ]) {
+    const dir = await scratchRepo({});
+    await commitAs(dir, ACCOUNT_AUTHOR, committer, 'borrowed committer');
+    const r = await leakWithDenylist(dir, '--all');
+    assert.equal(r.code, 1, `${committer.name} <${committer.email}>: ${r.printed}`);
+    assert.ok(r.lines.some((l) => /^✗ commit [0-9a-f]{7}:1: denylist$/.test(l)), r.printed);
+  }
+});
+
+test("an author address that is not a GitHub account's noreply address does not earn it either", async () => {
+  const dir = await scratchRepo({});
+  await commitAs(dir, { name: 'Zelda Example', email: 'zelda' + AT + 'example.com' }, GITHUB_COMMITTER, 'squash merge');
+  const r = await leakWithDenylist(dir, '--all');
+  assert.equal(r.code, 1, r.printed);
+  assert.ok(r.lines.some((l) => /^✗ commit [0-9a-f]{7}:1: denylist$/.test(l)), r.printed);
+});
+
+test('a commit GitHub made is still scanned for its message and its patch', async () => {
+  const inMessage = await scratchRepo({});
+  await commitAs(inMessage, ACCOUNT_AUTHOR, GITHUB_COMMITTER, 'merge the zelda change');
+  const m = await leakWithDenylist(inMessage, '--all');
+  assert.equal(m.code, 1, m.printed);
+  assert.ok(m.lines.some((l) => /^✗ commit [0-9a-f]{7}:3: denylist$/.test(l)), m.printed);
+
+  const inPatch = await scratchRepo({});
+  await commitAs(inPatch, ACCOUNT_AUTHOR, GITHUB_COMMITTER, 'squash merge', 'notes about zelda\n');
+  const p = await leakWithDenylist(inPatch, '--history');
+  assert.equal(p.code, 1, p.printed);
+  assert.ok(p.lines.some((l) => /^✗ commit [0-9a-f]{7}:\d+: denylist$/.test(l) && !/:1: denylist$/.test(l)), p.printed);
+});
+
+test("a generic-rule finding on a GitHub-made commit's author line is still reported", async () => {
+  const dir = await scratchRepo({});
+  await commitAs(dir, { name: USERS + 'alice/x', email: ACCOUNT_AUTHOR.email }, GITHUB_COMMITTER, 'squash merge');
+  const r = await leakWithDenylist(dir, '--all');
+  assert.equal(r.code, 1, r.printed);
+  assert.ok(r.lines.some((l) => /^✗ commit [0-9a-f]{7}:1: absolute user path$/.test(l)), r.printed);
+  assert.ok(!r.lines.some((l) => /:1: denylist$/.test(l)), r.printed);
+});
