@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, writeFile, rm, symlink, unlink } from 'node:fs/promises';
+import { readFile, writeFile, rm, symlink, unlink, mkdir } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -467,5 +467,65 @@ test("a commit message cannot forge a record of its own, nor earn a GitHub-made 
     // the forged author line is line 6 of the real commit's message, not line 1 of a commit "fffffff"
     assert.ok(r.lines.includes(`✗ commit ${tip.slice(0, 7)}:6: denylist`), `${mode}: ${r.printed}`);
     assert.ok(r.lines.every((l) => !l.startsWith('✗ commit ') || l.startsWith(`✗ commit ${tip.slice(0, 7)}:`)), `${mode}: ${r.printed}`);
+  }
+});
+
+// --- where the guard is started ---------------------------------------------------------------
+// From a subdirectory, git reads less than the repository: `ls-files` lists that directory alone,
+// and with diff.relative set, `diff` and `log -p` show only its changes. A manual run from there
+// must still read the whole repository.
+
+async function repoWithSubdir() {
+  const dir = await scratchRepo({ 'top.txt': LEAKY });
+  await mkdir(join(dir, 'sub'));
+  await writeAll(dir, { 'sub/s.txt': 'clean\n' });
+  const tip = await commitAll(dir);
+  return { dir, sub: join(dir, 'sub'), tip };
+}
+
+test('--all and --staged read the whole repository when run from a subdirectory', async () => {
+  const { dir, sub } = await repoWithSubdir();
+  const all = collect();
+  assert.equal(await runLeak(['--all', '--generic-only'], { cwd: sub, out: all.out }), 1, all.lines.join('\n'));
+  assert.ok(all.lines.includes('✗ top.txt:1: e-mail address'), all.lines.join('\n'));
+
+  await writeAll(dir, { 'other.txt': LEAKY, 'sub/new.txt': LEAKY });
+  await git(dir, 'add', '-A');
+  const staged = collect();
+  assert.equal(await runLeak(['--staged', '--generic-only'], { cwd: sub, out: staged.out }), 1, staged.lines.join('\n'));
+  assert.deepEqual(staged.lines, ['✗ other.txt:1: e-mail address', '✗ sub/new.txt:1: e-mail address']);
+});
+
+test('diff.relative does not narrow a scan run from a subdirectory', async () => {
+  const { dir, sub, tip } = await repoWithSubdir();
+  await git(dir, 'config', 'diff.relative', 'true');
+  for (const { mode, args, stdin } of commitModes(tip).filter((m) => m.mode !== '--all')) {
+    const c = collect();
+    const printed = () => `${mode}: ${c.lines.join('\n')}`;
+    assert.equal(await runLeak([...args, '--generic-only'], { cwd: sub, out: c.out, stdin: stdin?.() }), 1, printed());
+    assert.ok(c.lines.some((l) => new RegExp(`^✗ commit ${tip.slice(0, 7)}:\\d+: e-mail address$`).test(l)), printed());
+  }
+  await writeAll(dir, { 'other.txt': LEAKY });
+  await git(dir, 'add', '-A');
+  const c = collect();
+  assert.equal(await runLeak(['--staged', '--generic-only'], { cwd: sub, out: c.out }), 1, c.lines.join('\n'));
+  assert.deepEqual(c.lines, ['✗ other.txt:1: e-mail address']);
+});
+
+test('a bare repository: the commit modes read it, --all and --staged refuse instead of passing', async () => {
+  const { dir, tip } = await repoWithSubdir();
+  const bare = join(await tempDir('bare-'), 'repo.git');
+  await capture('git', ['clone', '--quiet', '--bare', dir, bare]);
+  for (const { mode, args, stdin } of commitModes(tip).filter((m) => m.mode !== '--all')) {
+    const c = collect();
+    const printed = () => `${mode}: ${c.lines.join('\n')}`;
+    assert.equal(await runLeak([...args, '--generic-only'], { cwd: bare, out: c.out, stdin: stdin?.() }), 1, printed());
+    assert.ok(c.lines.some((l) => new RegExp(`^✗ commit ${tip.slice(0, 7)}:\\d+: e-mail address$`).test(l)), printed());
+  }
+  // no work tree, so no index: an empty file list must not pass for a clean one
+  for (const mode of ['--all', '--staged']) {
+    const c = collect();
+    assert.equal(await runLeak([mode, '--generic-only'], { cwd: bare, out: c.out }), 1, mode);
+    assert.ok(c.lines.some((l) => l.includes('cannot verify')), `${mode}: ${c.lines.join('\n')}`);
   }
 });
