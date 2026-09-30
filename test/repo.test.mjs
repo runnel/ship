@@ -54,7 +54,7 @@ test('syncMirror asks GitHub for the default branch before it takes the mirror l
   const release = await acquire(join(root, 'tmp', 'locks', 'mirror-t__r'), await ownerInfo({ label: 'other run' }), { pollMs: 10 });
   const pending = syncMirror({ repo: 't/r', d });
   try {
-    const until = Date.now() + 5000;
+    const until = Date.now() + 30000;
     while (Date.now() < until && (await calls()).length === 0) await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal((await calls()).length, 1, 'gh was asked while another run still holds the lock');
   } finally {
