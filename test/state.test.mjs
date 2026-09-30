@@ -27,6 +27,40 @@ test('an unreadable hold file still holds', async () => {
   assert.match((await readHold(root, 'acme/app', 'app')).reason, /unreadable hold file/);
 });
 
+test('a hold file that is not a hold object still holds, and clearing it says it existed', async () => {
+  const root = await tempDir('state-');
+  const dir = join(root, 'holds', 'acme__app');
+  await mkdir(dir, { recursive: true });
+  for (const body of ['null', '{}', '[]', '{"reason":7}']) {
+    await writeFile(join(dir, 'app.json'), body);
+    assert.match((await readHold(root, 'acme/app', 'app')).reason, /unreadable hold file/, body);
+    assert.match((await listHolds(root, 'acme/app')).app.reason, /unreadable hold file/, body);
+  }
+  assert.equal(await clearHold(root, 'acme/app', 'app'), true);
+  assert.equal(await readHold(root, 'acme/app', 'app'), null);
+});
+
+test('a directory in place of a hold file still holds; nothing unreadable maps to no hold', async () => {
+  const root = await tempDir('state-');
+  await mkdir(join(root, 'holds', 'acme__app', 'app.json'), { recursive: true });
+  assert.match((await readHold(root, 'acme/app', 'app')).reason, /unreadable hold file/);
+  const holds = await listHolds(root, 'acme/app');
+  assert.deepEqual(Object.keys(holds), ['app']);
+  assert.match(holds.app.reason, /unreadable hold file/);
+  await assert.rejects(clearHold(root, 'acme/app', 'app'));
+});
+
+test('an unreadable holds directory or ack ledger is an error, not an empty state', async () => {
+  const root = await tempDir('state-');
+  await mkdir(join(root, 'holds'), { recursive: true });
+  await writeFile(join(root, 'holds', 'acme__app'), 'not a directory');
+  await assert.rejects(listHolds(root, 'acme/app'), { code: 'ENOTDIR' });
+  assert.match((await readHold(root, 'acme/app', 'app')).reason, /unreadable hold file/);
+  await mkdir(join(root, 'acks', 'acme__app'), { recursive: true });
+  await assert.rejects(readAcks(root, 'acme/app'), { code: 'EISDIR' });
+  await assert.rejects(addAcks(root, 'acme/app', ['db/001.sql']), { code: 'EISDIR' });
+});
+
 test('acks: added once, per repo', async () => {
   const root = await tempDir('state-');
   assert.deepEqual(await addAcks(root, 'acme/app', ['db/001.sql', 'db/002.sql']), ['db/001.sql', 'db/002.sql']);
