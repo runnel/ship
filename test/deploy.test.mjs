@@ -89,6 +89,18 @@ test('an import outside paths blocks that deployable only', async () => {
   assert.deepEqual(await s.cloud.wranglerCalls(), []);
 });
 
+test('an import of a file the deployable ignores, or that is docs-only, blocks it: such a change would never make it pending', async () => {
+  const ignored = await setupDeploy({ options: { appIgnore: "['app/gen/**']" }, seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }),
+    change: { 'app/src/a.ts': "import '../gen/g';\n", 'app/gen/g.ts': '1' } });
+  assert.equal(await ignored.deploy(), 1);
+  assert.match(ignored.lines.join('\n'), /✗ app: imports files outside its paths: app\/src\/a.ts → app\/gen\/g.ts/);
+  assert.deepEqual(await ignored.cloud.wranglerCalls(), []);
+  const docs = await setupDeploy({ options: { docsOnly: "['app/notes/**']" }, seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }),
+    change: { 'app/src/a.ts': "import '../notes/n';\n", 'app/notes/n.ts': '1' } });
+  assert.equal(await docs.deploy(), 1);
+  assert.match(docs.lines.join('\n'), /✗ app: imports files outside its paths: app\/src\/a.ts → app\/notes\/n.ts/);
+});
+
 test('--redeploy deploys a live deployable again; it needs names', async () => {
   const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }) });
   await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);

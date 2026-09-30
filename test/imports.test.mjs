@@ -96,3 +96,21 @@ test('every index file form resolves, and .cts is a plain source suffix', async 
     ['app/a/index.mts', 'app/b/index.cts', 'app/c/index.jsx', 'app/d/index.cjs', 'app/e.cts'],
   );
 });
+
+test('an imported file that the deployable ignores, or the repo treats as docs-only, is outside', async () => {
+  const root = await tree({
+    'app/src/a.ts': `import './gen/g';\nimport '../notes/n';\nimport './kept';`,
+    'app/src/gen/g.ts': `import '../../elsewhere';`,
+    'app/notes/n.ts': '',
+    'app/src/kept.ts': '',
+    'app/elsewhere.ts': '',
+  });
+  const app = { cwd: 'app', paths: ['app/**'] };
+  assert.deepEqual(await importsOutside(root, app), []);
+  assert.deepEqual(await importsOutside(root, { ...app, ignore: ['app/src/gen/**'] }), [{ from: 'app/src/a.ts', to: 'app/src/gen/g.ts' }]);
+  assert.deepEqual(await importsOutside(root, app, ['app/notes/**']), [{ from: 'app/src/a.ts', to: 'app/notes/n.ts' }]);
+  assert.deepEqual(await importsOutside(root, { ...app, ignore: ['app/src/gen/**'] }, ['app/notes/**']), [
+    { from: 'app/src/a.ts', to: 'app/src/gen/g.ts' },
+    { from: 'app/src/a.ts', to: 'app/notes/n.ts' },
+  ]);
+});
