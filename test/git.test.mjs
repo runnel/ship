@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { access, readFile, mkdir, readdir, utimes } from 'node:fs/promises';
 import { join } from 'node:path';
-import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile } from '../lib/git.mjs';
+import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile, isAncestor, listTree, commitsTouching, subject } from '../lib/git.mjs';
 import { validateConfig } from '../lib/config.mjs';
 import { classify } from '../lib/classify.mjs';
 import { makeOrigin, commitFiles, git, tempDir } from './helpers.mjs';
@@ -162,4 +162,20 @@ test('an ensureMirror sweeps the stale staging directory of a clone that was kil
   await utimes(join(root, 'other__repo.git.new-old'), twoHoursAgo, twoHoursAgo);
   await ensureMirror('t/r', { root, url: o.origin });
   assert.deepEqual((await readdir(root)).sort(), ['other__repo.git.new-old', 't__r.git', 't__r.git.new-fresh']);
+});
+
+test('isAncestor, listTree, commitsTouching, subject', async () => {
+  const { origin, work, root } = await makeOrigin({ 'app/a.ts': '1', 'db/001.sql': '' });
+  const first = (await git(['rev-parse', 'HEAD'], work)).trim();
+  await commitFiles(work, { 'app/a.ts': '2' }, 'app change (#11)');
+  await commitFiles(work, { 'docs/x.md': 'x' }, 'docs only (#12)');
+  const head = await commitFiles(work, { 'db/002.sql': '' }, 'add migration (#13)');
+  await git(['push', '--quiet', 'origin', 'main'], work);
+  const mirror = await ensureMirror('t/r', { root: join(root, 'm'), url: origin });
+  assert.equal(await isAncestor(mirror, first, head), true);
+  assert.equal(await isAncestor(mirror, head, first), false);
+  assert.deepEqual((await listTree(mirror, head)).sort(), ['app/a.ts', 'db/001.sql', 'db/002.sql', 'docs/x.md']);
+  assert.deepEqual((await commitsTouching(mirror, first, head, ['app/**', 'db/*.sql'])).map((c) => c.subject), ['add migration (#13)', 'app change (#11)']);
+  assert.equal(await subject(mirror, head), 'add migration (#13)');
+  assert.equal(await subject(mirror, 'f'.repeat(40)), null);
 });
