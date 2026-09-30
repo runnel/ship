@@ -493,20 +493,27 @@ async function mergeSide(dir, resolve) {
 test('text that a merge commit adds itself (an "evil merge") is scanned by --history and --pre-push', async () => {
   const dir = await scratchRepo({ 'a.txt': 'one\ntwo\n' });
   await commitAll(dir, 'root');
-  const merge = await mergeSide(dir, () => writeAll(dir, { 'a.txt': 'one\n' + LEAKY, 'new.txt': LEAKY }));
-  for (const { mode, args, stdin } of commitModes(merge).filter((m) => m.mode !== '--all')) {
+  const merge = await mergeSide(dir, () => writeAll(dir, {
+    'a.txt': 'one\n' + LEAKY, // a line the merge changed
+    'new.txt': LEAKY, // a file the merge added
+    'late.txt': 'x'.repeat(9000) + '\nok\0 ' + LEAKY, // text to git, but a combined diff cuts the line at the NUL
+  }));
+  const m = merge.slice(0, 7);
+  for (const { mode, args, stdin } of commitModes(merge).filter((x) => x.mode !== '--all')) {
     const c = collect();
     const code = await runLeak([...args, '--generic-only'], { cwd: dir, out: c.out, stdin: stdin?.() });
     const printed = c.lines.join('\n');
     assert.equal(code, 1, `${mode}: ${printed}`);
-    // the line the merge changed in a.txt, and the file it added; each merge is read once
-    assert.equal(commitFindings(c.lines, merge, 'e-mail address').length, 2, `${mode}: ${printed}`);
+    assert.deepEqual(c.lines.toSorted(), [
+      `✗ merge ${m} a.txt:2: e-mail address`,
+      `✗ merge ${m} late.txt:0: binary file — not scannable`,
+      `✗ merge ${m} new.txt:1: e-mail address`,
+    ], `${mode}: ${printed}`);
   }
 });
 
-test('a binary file that a merge commit adds itself is a finding (a combined diff says only "Binary files differ")', async () => {
+test('a binary file that a merge commit adds itself is a finding, and one it deletes is not', async () => {
   const dir = await scratchRepo({ 'a.txt': 'clean\n' });
-  await git(dir, 'config', 'color.ui', 'always'); // a coloured "diff --cc" header would hide which file it is
   await writeFile(join(dir, 'old.bin'), Buffer.from('old\0bin\n'));
   const root = await commitAll(dir, 'root');
   const merge = await mergeSide(dir, async () => {
@@ -522,9 +529,19 @@ test('a binary file that a merge commit adds itself is a finding (a combined dif
   };
   const r = await push([]);
   assert.equal(r.code, 1, r.printed);
-  assert.deepEqual(r.lines, commitFindings(r.lines, merge, 'binary file — not scannable'), r.printed);
-  assert.equal(r.lines.length, 1, r.printed);
+  assert.deepEqual(r.lines, [`✗ merge ${merge.slice(0, 7)} new.bin:0: binary file — not scannable`], r.printed);
   assert.equal((await push(['new.bin'])).code, 0);
+});
+
+test('--history and --all leave a stash alone: local work that a push does not send', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await commitAll(dir, 'one');
+  await writeAll(dir, { 'a.txt': LEAKY }); // an unstaged edit, then stashed
+  await git(dir, 'stash', '--quiet');
+  for (const mode of ['--history', '--all']) {
+    const c = collect();
+    assert.equal(await runLeak([mode, '--generic-only'], { cwd: dir, out: c.out }), 0, `${mode}: ${c.lines.join('\n')}`);
+  }
 });
 
 test('an annotated tag is scanned: its tagger line and its message', async () => {
@@ -642,6 +659,21 @@ test('grafts hide nothing: every commit a push sends is scanned', async () => {
     { mode: '--pre-push (remote at "one")', args: ['--pre-push', 'origin'], stdin: pushFrom(base) },
     { mode: '--pre-push (new branch)', args: ['--pre-push', 'origin'], stdin: pushFrom(zeros(tip)) },
   ]);
+});
+
+test('diff.srcPrefix and diff.dstPrefix hide nothing: a binary file at dev/null is still a finding', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await commitAll(dir, 'one');
+  await git(dir, 'config', 'diff.dstPrefix', '/'); // "b/dev/null" would read "/dev/null", as for a deleted file
+  await mkdir(join(dir, 'dev'));
+  await writeFile(join(dir, 'dev', 'null'), Buffer.from('bin\0ary ' + LEAKY));
+  const tip = await commitAll(dir, 'two');
+  for (const { mode, args, stdin } of commitModes(tip).filter((m) => m.mode !== '--all')) {
+    const c = collect();
+    const code = await runLeak([...args, '--generic-only'], { cwd: dir, out: c.out, stdin: stdin?.() });
+    assert.equal(code, 1, `${mode}: ${c.lines.join('\n')}`);
+    assert.equal(commitFindings(c.lines, tip, 'binary file — not scannable').length, 1, `${mode}: ${c.lines.join('\n')}`);
+  }
 });
 
 test("log.showRoot=false hides nothing: the root commit's patch is scanned", async () => {
