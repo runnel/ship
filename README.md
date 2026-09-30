@@ -79,16 +79,20 @@ ship check --pr 42
 `ship check` checks the pull request head as GitHub has it, merged with main: push first, local
 commits are not checked. Pull requests that are not open, that come from a fork, or that target a
 branch other than the default one are refused (exit 2, no status). Exit codes: 0 success, 1
-failure or error, 2 refused.
+failure or error, 2 refused, 130 interrupted.
 
 Output is one line per step; on failure the last lines of the failing step and the full log path
 under `~/.ship/logs/`. A step that outlives its `timeoutMin` is killed together with everything it
-started. Two checks of the same commit started at the same time run once. Ctrl-C stops the running
+started. Background processes a step leaves running (a build worker, a dev server) stay available to
+the later steps and are stopped when the check ends, with a line saying so. A daemon that detaches
+itself (`setsid`, `pg_ctl start`) escapes that: stop it from a `trap` in the script that starts it. Two checks of the same commit started at the same time run once. Ctrl-C stops the running
 step, marks the status as errored (never as success) and cleans up. Times in messages use the
 system time zone; `SHIP_TZ=UTC` (any IANA name) overrides it.
 
-Short-lived state (locks, worktrees) lives in a per-user directory `ship-<uid>` under the system
-temp directory, created with mode 0700.
+Short-lived state (locks, lanes, worktrees) lives in a per-user directory created with mode 0700:
+on macOS always `/private/tmp/ship-<uid>`, whatever `$TMPDIR` says (so every session of yours shares
+one set of lanes and locks), elsewhere `ship-<uid>` under the system temp directory. Set `SHIP_TMP`
+to move it; that splits sessions that do not share the variable.
 
 ## Leak guard (for this repository)
 

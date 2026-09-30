@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { readFile, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
-import { buildEnv, run, capture } from '../lib/proc.mjs';
-import { tempDir } from './helpers.mjs';
+import { buildEnv, run, capture, ownsItsGroup } from '../lib/proc.mjs';
+import { assertGone, killQuietly, readPid, tempDir } from './helpers.mjs';
 
 const tmp = () => tempDir('proc-');
 
@@ -36,13 +36,17 @@ test('run captures stderr', async () => {
 
 test('a command past its timeout is killed with its descendants and returns 124', async () => {
   const dir = await tmp();
+  const pidFile = join(dir, 'pid');
   const started = Date.now();
-  const r = await run('sleep 31.4159 & wait', { cwd: dir, env: buildEnv(), logFile: join(dir, 'log'), timeoutMs: 300 });
-  assert.equal(r.code, 124);
-  assert.ok(Date.now() - started < 4000);
-  assert.match(r.tail.at(-1), /timed out/);
-  const left = await capture('pgrep', ['-f', 'sleep 31.4159']).catch(() => '');
-  assert.equal(left.trim(), '');
+  try {
+    const r = await run(`sleep 31.4159 & echo $! > ${pidFile}; wait`, { cwd: dir, env: buildEnv(), logFile: join(dir, 'log'), timeoutMs: 300 });
+    assert.equal(r.code, 124);
+    assert.ok(Date.now() - started < 4000);
+    assert.match(r.tail.at(-1), /timed out/);
+    await assertGone(pidFile, 'the descendant is still running');
+  } finally {
+    killQuietly(await readPid(pidFile));
+  }
 });
 
 test('capture returns stdout and throws on failure', async () => {
@@ -53,13 +57,9 @@ test('capture returns stdout and throws on failure', async () => {
 // --- a step whose descendants keep its output open ---------------------------------------------
 
 const deadline = (ms, what) => new Promise((_, reject) => setTimeout(() => reject(new Error(`${what} did not return within ${ms} ms`)), ms).unref());
-const stillRunning = async (marker) => (await capture('pgrep', ['-f', marker]).catch(() => '')).trim();
-const killMarked = (marker) => capture('pkill', ['-f', marker]).catch(() => {});
-
 // ship runs as the leader of its own process group (bin/ship.mjs); this reproduces that setup so
 // that run() may stop orphans by group membership. A hard deadline kills the whole group.
-async function runAsLeader(command, timeoutMs) {
-  const dir = await tempDir('leader-');
+async function runAsLeader(command, timeoutMs, dir) {
   const script = join(dir, 'leader.mjs');
   const mod = new URL('../lib/proc.mjs', import.meta.url).href;
   await writeFile(script, `
@@ -81,42 +81,54 @@ process.stdout.write(JSON.stringify({ code: r.code, ms: Date.now() - started, ta
 }
 
 test('a step that exits but leaves a background process holding its output returns after a short grace', { timeout: 30_000 }, async () => {
-  const marker = 'sleep 20.4711';
   const dir = await tmp();
+  const pidFile = join(dir, 'pid');
   try {
     const started = Date.now();
     const r = await Promise.race([
-      run(`(${marker} &); echo done`, { cwd: dir, env: buildEnv(), logFile: join(dir, 'log') }),
+      run(`(sleep 20.4711 & echo $! > ${pidFile}); echo done`, { cwd: dir, env: buildEnv(), logFile: join(dir, 'log') }),
       deadline(8_000, 'run'),
     ]);
     assert.equal(r.code, 0);
     assert.ok(r.tail.includes('done'));
     assert.ok(Date.now() - started < 6_000);
   } finally {
-    await killMarked(marker);
+    killQuietly(await readPid(pidFile)); // this process is not a group leader: it does not stop orphans
   }
 });
 
 test('a timed-out step returns promptly and its orphan (re-parented, holding stdout) is killed', { timeout: 30_000 }, async () => {
-  const marker = 'sleep 20.4712';
+  const dir = await tempDir('leader-');
+  const pidFile = join(dir, 'pid');
   try {
-    const r = await runAsLeader(`(${marker} &); exit 0`, 300);
+    const r = await runAsLeader(`(sleep 20.4712 & echo $! > ${pidFile}); exit 0`, 300, dir);
     assert.equal(r.code, 124);
     assert.ok(r.ms < 4_000, `took ${r.ms} ms`);
-    assert.equal(await stillRunning(marker), '');
+    await assertGone(pidFile, 'the orphan is still running');
   } finally {
-    await killMarked(marker);
+    killQuietly(await readPid(pidFile));
   }
 });
 
 test('a descendant that ignores SIGTERM is SIGKILLed and the timeout still returns promptly', { timeout: 30_000 }, async () => {
-  const marker = 'sleep 20.4714';
+  const dir = await tempDir('leader-');
+  const pidFile = join(dir, 'pid');
   try {
-    const r = await runAsLeader(`trap '' TERM; ${marker} & wait`, 300);
+    const r = await runAsLeader(`trap '' TERM; sleep 20.4714 & echo $! > ${pidFile}; wait`, 300, dir);
     assert.equal(r.code, 124);
     assert.ok(r.ms < 4_500, `took ${r.ms} ms`);
-    assert.equal(await stillRunning(marker), '');
+    await assertGone(pidFile, 'the descendant is still running');
   } finally {
-    await killMarked(marker);
+    killQuietly(await readPid(pidFile));
   }
+});
+
+test('a process group is ship\'s own only when ship leads it and has no controlling terminal', () => {
+  assert.equal(ownsItsGroup({ pid: 10, pgid: '10', tty: '??' }), true); // macOS, after setsid
+  assert.equal(ownsItsGroup({ pid: 10, pgid: 10, tty: '?' }), true); // Linux, after setsid
+  assert.equal(ownsItsGroup({ pid: 10, pgid: '10', tty: 'ttys003' }), false); // a shell job: `ship check | tee log`
+  assert.equal(ownsItsGroup({ pid: 10, pgid: '10', tty: 'pts/3' }), false);
+  assert.equal(ownsItsGroup({ pid: 10, pgid: '4', tty: '??' }), false); // not the leader
+  assert.equal(ownsItsGroup({ pid: 10, pgid: '10', tty: '' }), false); // unknown is not ours
+  assert.equal(ownsItsGroup({ pid: 10, pgid: undefined, tty: '??' }), false);
 });

@@ -147,3 +147,22 @@ test('a directory without an owner is waited for until it is older than the grac
   assert.equal((await readOwner(dir)).label, 'late');
   await release();
 });
+
+test('acquire stops waiting when told to abort, instead of waiting for a live holder forever', { timeout: 30_000 }, async () => {
+  const dir = await lockDir();
+  const release = await acquire(dir, await ownerInfo({ label: 'holder' }));
+  let abort = false;
+  setTimeout(() => { abort = true; }, 100);
+  const waiter = acquire(dir, await ownerInfo({ label: 'waiter' }), { pollMs: 10, isAborted: () => abort });
+  try {
+    const outcome = await Promise.race([
+      waiter.then(() => 'acquired', (e) => (e.aborted ? 'aborted' : `failed: ${e.message}`)),
+      new Promise((r) => setTimeout(() => r('still waiting'), 3_000).unref()),
+    ]);
+    assert.equal(outcome, 'aborted');
+    assert.equal((await readOwner(dir)).label, 'holder'); // the holder's lock is untouched
+  } finally {
+    await release(); // a waiter that ignored the abort gets the lock now ...
+    await waiter.then((r) => r(), () => {}); // ... and hands it back, so nothing keeps polling
+  }
+});

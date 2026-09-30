@@ -2,10 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { access, readFile, readdir, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { capture } from '../lib/proc.mjs';
-import { setupCheck, tempDir } from './helpers.mjs';
+import { acquire, ownerInfo, readOwner } from '../lib/lock.mjs';
+import { assertGone, killQuietly, readPid, setupCheck, spawnCheckLeader, tempDir } from './helpers.mjs';
 
 const deadline = (ms, what) => new Promise((_, reject) => setTimeout(() => reject(new Error(`${what}: no result within ${ms} ms`)), ms).unref());
 const exists = (p) => access(p).then(() => true, () => false);
@@ -55,7 +56,7 @@ setInterval(() => {}, 1000);
   }
 });
 
-test('a second signal during the unwind does not start a second unwind', { timeout: 30_000 }, async () => {
+test('a repeated signal during the unwind starts no second unwind, and says why nothing happens (once)', { timeout: 30_000 }, async () => {
   const dir = await tempDir();
   const out = join(dir, 'out');
   const script = join(dir, 's.mjs');
@@ -63,19 +64,25 @@ test('a second signal during the unwind does not start a second unwind', { timeo
   await writeFile(script, `
 import { appendFileSync } from 'node:fs';
 import { onInterrupt } from ${JSON.stringify(mod)};
-onInterrupt(async () => { appendFileSync(${JSON.stringify(out)}, 'x,'); await new Promise((r) => setTimeout(r, 400)); });
+onInterrupt(async () => { appendFileSync(${JSON.stringify(out)}, 'x,'); await new Promise((r) => setTimeout(r, 600)); });
 process.stdout.write('ready\\n');
 setInterval(() => {}, 1000);
 `);
-  const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'inherit'] });
+  const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '';
+  child.stderr.on('data', (b) => { stderr += b; });
   try {
     await ready(child);
     child.kill('SIGTERM');
     await new Promise((r) => setTimeout(r, 100));
     child.kill('SIGINT');
+    await new Promise((r) => setTimeout(r, 100));
+    child.kill('SIGINT');
     const [code] = await Promise.race([once(child, 'exit'), deadline(10_000, 'child exit')]);
     assert.equal(code, 130);
     assert.equal(await readFile(out, 'utf8'), 'x,');
+    assert.equal(stderr.split('\n').filter((l) => /already interrupted/.test(l)).length, 1, stderr);
+    assert.match(stderr, /at most 30 s/);
   } finally {
     child.kill('SIGKILL');
   }
@@ -88,45 +95,238 @@ for (const target of ['process', 'group']) {
     const dir = await tempDir('interrupt-');
     const started = join(dir, 'started');
     const second = join(dir, 'second');
+    const pidFile = join(dir, 'pid');
     const s = await setupCheck({
-      steps: [`trap "exit 0" TERM INT; touch ${started}; sleep 3.1415 & wait`, `touch ${second}`],
+      // The background process ignores TERM and INT and lives far longer than any wait of this test,
+      // so only ship stopping it (its own SIGKILL) can make it disappear; the group signal cannot.
+      steps: [`trap "exit 0" TERM INT; (trap '' TERM INT; exec sleep 31.4159) & echo $! > ${pidFile}; touch ${started}; wait`, `touch ${second}`],
     });
-    const script = join(dir, 'check.mjs');
-    const mod = new URL('../lib/check.mjs', import.meta.url).href;
-    await writeFile(script, `
-import { runCheck } from ${JSON.stringify(mod)};
-const a = JSON.parse(process.argv[2]);
-const deps = { gh: a.gh, remoteUrl: () => a.origin, mirrorRoot: a.mirrorRoot, tmpRoot: a.tmpRoot, logRoot: a.logRoot, pollMs: 10, out: (l) => process.stdout.write(l + '\\n') };
-const code = await runCheck({ cwd: a.cwd, deps });
-process.stdout.write('RETURNED ' + code + '\\n');
-`);
-    const arg = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot });
-    // A group leader, like bin/ship.mjs makes it; the wrapper forwards signals to the whole group.
-    const child = spawn(process.execPath, [script, arg], { detached: true, stdio: ['ignore', 'pipe', 'inherit'] });
-    let stdout = '';
-    child.stdout.on('data', (b) => { stdout += b; });
-    const exited = new Promise((resolve) => child.on('close', (code) => resolve(code)));
+    const run = await spawnCheckLeader(s, dir);
+    const { child, out } = run;
+    const exited = run.exited;
     try {
       await waitFor(() => exists(started), 30_000, 'the first step to start');
       if (target === 'group') process.kill(-child.pid, 'SIGTERM');
       else child.kill('SIGTERM');
       const code = await Promise.race([exited, deadline(20_000, 'ship exit')]);
-      assert.equal(code, 130, stdout);
+      assert.equal(code, 130, out.text);
 
       const states = (await s.statuses()).map((x) => x.state);
       assert.ok(states.length >= 2, states.join(','));
       assert.ok(!states.includes('success'), `posted ${states.join(', ')}`);
       assert.equal(states.at(-1), 'error', states.join(', '));
-      assert.ok(!stdout.includes('local-ci success'), stdout);
+      assert.ok(!out.text.includes('local-ci success'), out.text);
       assert.equal(await exists(second), false, 'a new step was started after the interrupt');
 
       // The worktree and both locks are gone; nothing that outlives ship is left running.
       assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
       assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'lanes')), []);
       assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'checks')), []);
-      assert.equal((await capture('pgrep', ['-f', 'sleep 3.1415']).catch(() => '')).trim(), '');
+      await assertGone(pidFile, 'the step\'s background process is still running');
     } finally {
-      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group already gone */ }
+      run.kill();
+      killQuietly(await readPid(pidFile));
     }
   });
 }
+
+// --- cleanup shared between the flow and the unwind ------------------------------------------
+
+// A `git` in front of the real one that takes its time over `worktree remove`, like a worktree the
+// size of node_modules does.
+async function slowWorktreeRemoval(dir) {
+  const real = (await capture('/bin/sh', ['-c', 'command -v git'])).trim();
+  const bin = join(dir, 'slowbin');
+  await mkdir(bin);
+  await writeFile(join(bin, 'git'), `#!/bin/sh\ncase "$*" in *"worktree remove"*) sleep 1.5;; esac\nexec ${real} "$@"\n`);
+  await chmod(join(bin, 'git'), 0o755);
+  return bin;
+}
+
+test('after an interrupt ship does not exit before the worktree removal has finished', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const started = join(dir, 'started');
+  const s = await setupCheck({ steps: [`trap "exit 0" TERM INT; touch ${started}; sleep 3.1415 & wait`] });
+  const bin = await slowWorktreeRemoval(dir);
+  const run = await spawnCheckLeader(s, dir, { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+  try {
+    await waitFor(() => exists(started), 30_000, 'the first step to start');
+    run.child.kill('SIGTERM');
+    assert.equal(await Promise.race([run.exited, deadline(30_000, 'ship exit')]), 130, run.out.text);
+    // The removal is still running in the background if ship left early.
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'lanes')), []);
+    assert.equal((await s.statuses()).at(-1).state, 'error');
+  } finally {
+    run.kill();
+  }
+});
+
+test('a signal while the first status is being posted still ends in error, posted after it', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const s = await setupCheck({ steps: ['true'], ghOptions: { apiDelay: { ms: 1200, match: 'state=pending' } } });
+  const run = await spawnCheckLeader(s, dir);
+  try {
+    await waitFor(async () => (await s.calls()).some((c) => c[0] === 'api' && c.includes('state=pending')), 30_000, 'the first status POST to start');
+    run.child.kill('SIGTERM'); // ship only: the POST in flight is not signalled
+    assert.equal(await Promise.race([run.exited, deadline(30_000, 'ship exit')]), 130, run.out.text);
+    const states = (await s.statuses()).map((x) => x.state);
+    assert.equal(states.at(-1), 'error', states.join(', '));
+    assert.ok(!states.includes('success'), states.join(', '));
+    const calls = (await s.calls()).map((c) => `${c[0]}:${c.find((a) => String(a).startsWith('state=')) ?? ''}`);
+    assert.ok(calls.indexOf('done:state=pending') >= 0 && calls.indexOf('done:state=pending') < calls.indexOf('api:state=error'), calls.join(' '));
+  } finally {
+    run.kill();
+  }
+});
+
+test('an interrupt while waiting for the lane ends in error and leaves the holder alone', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const s = await setupCheck({ steps: ['true'] });
+  const laneDir = join(s.deps.tmpRoot, 'lanes', 'light');
+  const holder = await acquire(laneDir, await ownerInfo({ label: 'holder' }), { pollMs: 10 });
+  const run = await spawnCheckLeader(s, dir);
+  try {
+    await waitFor(() => run.out.text.includes('waiting for the light lane'), 30_000, 'the lane wait');
+    run.child.kill('SIGTERM');
+    assert.equal(await Promise.race([run.exited, deadline(30_000, 'ship exit')]), 130, run.out.text);
+    assert.deepEqual((await s.statuses()).map((x) => x.state), ['pending', 'error']); // never "running"
+    assert.equal((await readOwner(laneDir)).label, 'holder');
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'checks')), []);
+  } finally {
+    run.kill();
+    await holder();
+  }
+});
+
+// --- the error POST fails (offline, GitHub 5xx, expired gh auth) ------------------------------
+// Exactly when Ctrl-C is likely to be pressed. The unwind must still remove the worktree and free
+// the lane: each of its steps stands on its own.
+
+test('an interrupt during a step still removes the worktree when the error POST fails', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const started = join(dir, 'started');
+  const s = await setupCheck({
+    steps: [`trap "exit 0" TERM INT; touch ${started}; sleep 3.1415 & wait`],
+    ghOptions: { apiFail: { match: 'state=error' } },
+  });
+  const bin = await slowWorktreeRemoval(dir);
+  const run = await spawnCheckLeader(s, dir, { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+  try {
+    await waitFor(() => exists(started), 30_000, 'the first step to start');
+    run.child.kill('SIGTERM');
+    assert.equal(await Promise.race([run.exited, deadline(30_000, 'ship exit')]), 130, run.out.text);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'lanes')), []);
+    assert.ok(!(await s.statuses()).some((x) => x.state === 'success'));
+  } finally {
+    run.kill();
+  }
+});
+
+test('an interrupt while waiting for the lane still removes the worktree when the error POST fails', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const s = await setupCheck({ steps: ['true'], ghOptions: { apiFail: { match: 'state=error' } } });
+  const laneDir = join(s.deps.tmpRoot, 'lanes', 'light');
+  const holder = await acquire(laneDir, await ownerInfo({ label: 'holder' }), { pollMs: 10 });
+  // The production poll interval: the flow sleeps in acquire, and only the unwind can remove the tree.
+  const run = await spawnCheckLeader(s, dir, { pollMs: 5000 });
+  try {
+    await waitFor(() => run.out.text.includes('waiting for the light lane'), 30_000, 'the lane wait');
+    run.child.kill('SIGTERM');
+    assert.equal(await Promise.race([run.exited, deadline(30_000, 'ship exit')]), 130, run.out.text);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'checks')), []);
+    assert.equal((await readOwner(laneDir)).label, 'holder');
+  } finally {
+    run.kill();
+    await holder();
+  }
+});
+
+// A step that shuts down gracefully by starting a cleanup process: it starts it after the interrupt
+// has taken its snapshot of the group, so only a later sweep can stop it.
+for (const target of ['process', 'group']) {
+  test(`a process a step starts while it shuts down does not outlive an interrupted check (signal to the ${target})`, { timeout: 60_000 }, async () => {
+    const dir = await tempDir('late-');
+    const started = join(dir, 'started');
+    const latePid = join(dir, 'late-pid');
+    const s = await setupCheck({
+      steps: [`trap 'sleep 0.3; sleep 44.1 >/dev/null 2>&1 & echo $! > ${latePid}; exit 0' TERM INT; touch ${started}; sleep 31.4159 >/dev/null 2>&1 & wait`],
+    });
+    const run = await spawnCheckLeader(s, dir);
+    try {
+      await waitFor(() => exists(started), 30_000, 'the step to start');
+      if (target === 'group') process.kill(-run.child.pid, 'SIGTERM');
+      else run.child.kill('SIGTERM');
+      assert.equal(await Promise.race([run.exited, deadline(30_000, 'ship exit')]), 130, run.out.text);
+      await assertGone(latePid, 'a process the step started while shutting down is still running');
+    } finally {
+      run.kill();
+      killQuietly(await readPid(latePid));
+    }
+  });
+}
+
+test('a hanging error POST (captive portal, half-open connection) does not hold the cleanup until the hard deadline', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const started = join(dir, 'started');
+  const s = await setupCheck({
+    steps: [`trap "exit 0" TERM INT; touch ${started}; sleep 31.4159 & wait`],
+    ghOptions: { apiDelay: { ms: 120_000, match: 'state=error' } }, // the error POST never answers
+  });
+  const run = await spawnCheckLeader(s, dir, { unwindPostTimeoutMs: 800 });
+  try {
+    await waitFor(() => exists(started), 30_000, 'the first step to start');
+    const signalled = Date.now();
+    run.child.kill('SIGTERM');
+    assert.equal(await Promise.race([run.exited, deadline(15_000, 'ship exit')]), 130, run.out.text);
+    assert.ok(Date.now() - signalled < 12_000, `took ${Date.now() - signalled} ms`);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'lanes')), []);
+    assert.ok(!(await s.statuses()).some((x) => x.state === 'success'));
+  } finally {
+    run.kill();
+  }
+});
+
+// A status POST that was in flight ahead of the error POST hangs: the interrupt must not wait for
+// it (the error POST used to queue behind it until the hard deadline), and the hung gh must not
+// stay behind in ship's process group, where it would keep the locks looking held.
+test('a hung earlier status POST does not hold up the interrupt, and is stopped', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const s = await setupCheck({ steps: ['true'], ghOptions: { apiDelay: { ms: 120_000, match: 'state=pending' } } });
+  const run = await spawnCheckLeader(s, dir, { unwindPostTimeoutMs: 800 });
+  try {
+    await waitFor(async () => (await s.calls()).some((c) => c[0] === 'api' && c.includes('state=pending')), 30_000, 'the first status POST to start');
+    const signalled = Date.now();
+    run.child.kill('SIGTERM'); // ship only: the POST in flight is not signalled
+    assert.equal(await Promise.race([run.exited, deadline(15_000, 'ship exit')]), 130, run.out.text);
+    assert.ok(Date.now() - signalled < 12_000, `took ${Date.now() - signalled} ms`);
+    assert.ok((await s.calls()).some((c) => c[0] === 'api' && c.includes('state=error')), 'no error status was posted');
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'checks')), []);
+    // Nothing of ship's is left in its process group (that is what the locks test for liveness).
+    assert.equal((await capture('pgrep', ['-g', String(run.child.pid)]).catch(() => '')).trim(), '', 'the hung gh is still running');
+  } finally {
+    run.kill();
+  }
+});
+
+// The real CLI turns an interrupt that makes a call fail into exit 130 (lib/cli.mjs); the harness
+// must do the same, or it would report a product bug that is not there.
+test('a group signal during the first status POST ends as the real CLI does: exit 130, error posted', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const s = await setupCheck({ steps: ['true'], ghOptions: { apiDelay: { ms: 1500, match: 'state=pending' } } });
+  const run = await spawnCheckLeader(s, dir);
+  try {
+    await waitFor(async () => (await s.calls()).some((c) => c[0] === 'api' && c.includes('state=pending')), 30_000, 'the first status POST to start');
+    process.kill(-run.child.pid, 'SIGTERM'); // the whole group: the POST in flight dies with it
+    assert.equal(await Promise.race([run.exited, deadline(20_000, 'ship exit')]), 130, run.out.text);
+    const states = (await s.statuses()).map((x) => x.state);
+    assert.equal(states.at(-1), 'error', states.join(', '));
+    assert.ok(!states.includes('success'), states.join(', '));
+  } finally {
+    run.kill();
+  }
+});
