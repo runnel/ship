@@ -97,8 +97,11 @@ to move it; that splits sessions that do not share the variable.
 ## Leak guard (for this repository)
 
 `ship leak --staged | --msg <file> | --pre-push [remote] | --all | --history [--generic-only]` scans for
-shapes that must not be published, including commit author and committer identities. It fails
-closed: a git error or a binary file it cannot scan is a finding, not a pass. Enable with
+shapes that must not be published, including commit author and committer identities. The author
+name of a commit GitHub made (committer `GitHub <noreply@github.com>`, author a
+`users.noreply.github.com` address) comes from the account's public profile and is not matched
+against the denylist; the rest of that commit is scanned as usual. It fails closed: a git error or
+a binary file it cannot scan is a finding, not a pass. Enable with
 `git config core.hooksPath .githooks` and create `~/.config/ship/denylist`. Pull requests are
 judged by main's copy of the guard.
 
