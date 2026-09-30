@@ -4,7 +4,7 @@ import { readFile, writeFile, rm, symlink, unlink } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { scanText, loadDenylist, runLeak } from '../lib/leak.mjs';
+import { scanText, loadDenylist, runLeak, parseCommitLog } from '../lib/leak.mjs';
 import { capture } from '../lib/proc.mjs';
 import { tempDir } from './helpers.mjs';
 
@@ -313,15 +313,15 @@ async function commitAs(dir, author, committer, message, body = 'clean\n') {
   await capture('git', ['-C', dir, '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '-m', message], { env });
 }
 
-// Runs the guard with a throwaway denylist; never the user's own.
-async function leakWithDenylist(dir, mode, terms = ['zelda']) {
+// Runs the guard with a throwaway denylist; never the user's own. `mode` is a flag or an argument list.
+async function leakWithDenylist(dir, mode, terms = ['zelda'], stdin) {
   const list = join(await tempDir(), 'denylist');
   await writeFile(list, `${terms.join('\n')}\n`);
   const saved = process.env.SHIP_DENYLIST;
   process.env.SHIP_DENYLIST = list;
   try {
     const c = collect();
-    const code = await runLeak([mode], { cwd: dir, out: c.out });
+    const code = await runLeak([mode].flat(), { cwd: dir, out: c.out, stdin });
     return { code, lines: c.lines, printed: c.lines.join('\n') };
   } finally {
     if (saved === undefined) delete process.env.SHIP_DENYLIST;
@@ -390,4 +390,82 @@ test("a generic-rule finding on a GitHub-made commit's author line is still repo
   assert.equal(r.code, 1, r.printed);
   assert.ok(r.lines.some((l) => /^✗ commit [0-9a-f]{7}:1: absolute user path$/.test(l)), r.printed);
   assert.ok(!r.lines.some((l) => /:1: denylist$/.test(l)), r.printed);
+});
+
+// --- record boundaries in `git log` output ----------------------------------------------------
+// --all, --history and --pre-push read many commits from one `git log`. Text inside a commit (its
+// message, or a file in its patch) must not end that commit's record early: what follows would be
+// hidden from the scan, or read as another commit with an identity of the text's choosing.
+
+const FIXED_MARK = '\x1eSHIPCOMMIT '; // a record separator without a per-run token
+
+async function commitWithMessageFile(dir, message) {
+  const file = join(await tempDir(), 'message');
+  await writeFile(file, message);
+  await git(dir, 'add', '-A');
+  await git(dir, 'commit', '--quiet', '--allow-empty', '-F', file);
+  return (await git(dir, 'rev-parse', 'HEAD')).trim();
+}
+
+// Every mode that reads commits, pushing `tip` to a remote that has none of them.
+const commitModes = (tip) => [
+  { mode: '--all', args: ['--all'] },
+  { mode: '--history', args: ['--history'] },
+  { mode: '--pre-push', args: ['--pre-push', 'origin'], stdin: () => Readable.from([`refs/heads/main ${tip} refs/heads/main ${'0'.repeat(40)}\n`]) },
+];
+
+test('a git log that does not split into the commits rev-list names is refused, not guessed at', () => {
+  const mark = '\x1eM ';
+  const [a, b, c] = ['a', 'b', 'c'].map((x) => x.repeat(40));
+  const rec = (sha, text) => `${mark}${sha}\n${text}`;
+  assert.deepEqual(parseCommitLog(rec(a, 'one\n') + rec(b, 'two\n'), mark, [a, b]), [{ sha: a, text: 'one\n' }, { sha: b, text: 'two\n' }]);
+  assert.deepEqual(parseCommitLog('', mark, []), []);
+  for (const [why, raw, shas] of [
+    ['unknown commit', rec(a, 'one\n') + rec(c, 'forged\n'), [a]],
+    ['repeated commit', rec(a, 'one\n') + rec(a, 'forged\n'), [a]],
+    ['missing commit', rec(a, 'one\n'), [a, b]],
+    ['text before the first record', 'stray\n' + rec(a, 'one\n'), [a]],
+    ['record without a line break', `${mark}${a}`, [a]],
+  ]) assert.throws(() => parseCommitLog(raw, mark, shas), /does not split/, why);
+});
+
+test('a record separator in a commit message hides nothing from the commits it is in', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  const tip = await commitWithMessageFile(dir, `subject\n\n${FIXED_MARK}${LEAKY}`);
+  for (const { mode, args, stdin } of commitModes(tip)) {
+    const c = collect();
+    const code = await runLeak([...args, '--generic-only'], { cwd: dir, out: c.out, stdin: stdin?.() });
+    const printed = c.lines.join('\n');
+    assert.equal(code, 1, `${mode}: ${printed}`);
+    // line 1 author, 2 committer, 3 subject, 4 blank, 5 the separator and the address
+    assert.ok(c.lines.includes(`✗ commit ${tip.slice(0, 7)}:5: e-mail address`), `${mode}: ${printed}`);
+  }
+});
+
+test('a record separator in a committed file hides nothing from --history and --pre-push', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await commitAll(dir, 'one');
+  await writeAll(dir, { 'b.txt': `${FIXED_MARK}${LEAKY}` });
+  const tip = await commitAll(dir, 'two');
+  for (const { mode, args, stdin } of commitModes(tip).filter((m) => m.mode !== '--all')) {
+    const c = collect();
+    const code = await runLeak([...args, '--generic-only'], { cwd: dir, out: c.out, stdin: stdin?.() });
+    const printed = c.lines.join('\n');
+    assert.equal(code, 1, `${mode}: ${printed}`);
+    assert.ok(c.lines.some((l) => new RegExp(`^✗ commit ${tip.slice(0, 7)}:\\d+: e-mail address$`).test(l)), `${mode}: ${printed}`);
+  }
+});
+
+test("a commit message cannot forge a record of its own, nor earn a GitHub-made commit's exemption", async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  const ident = ({ name, email }) => `${name} <${email}>`;
+  const forged = ['f'.repeat(40), ident(ACCOUNT_AUTHOR), ident(GITHUB_COMMITTER), '', 'forged body'].join('\n');
+  const tip = await commitWithMessageFile(dir, `subject\n\n${FIXED_MARK}${forged}\n`);
+  for (const { mode, args, stdin } of commitModes(tip)) {
+    const r = await leakWithDenylist(dir, args, ['zelda'], stdin?.());
+    assert.equal(r.code, 1, `${mode}: ${r.printed}`);
+    // the forged author line is line 6 of the real commit's message, not line 1 of a commit "fffffff"
+    assert.ok(r.lines.includes(`✗ commit ${tip.slice(0, 7)}:6: denylist`), `${mode}: ${r.printed}`);
+    assert.ok(r.lines.every((l) => !l.startsWith('✗ commit ') || l.startsWith(`✗ commit ${tip.slice(0, 7)}:`)), `${mode}: ${r.printed}`);
+  }
 });

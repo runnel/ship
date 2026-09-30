@@ -103,8 +103,8 @@ fills the author line from the account. When the committer is `GitHub <noreply@g
 author address is a `users.noreply.github.com` one, that author line (name and noreply address) is
 not matched against the denylist; the rest of the commit, and the generic rules on that line, apply
 as usual. Both identity lines are self-asserted, so this is a narrow exemption, not proof of
-origin. It fails closed: a git error or a binary file it cannot scan is a finding, not a pass.
-Enable with
+origin. It fails closed: a git error, a binary file it cannot scan, or a `git log` that does not
+split into exactly the commits `git rev-list` names is a finding, not a pass. Enable with
 `git config core.hooksPath .githooks` and create `~/.config/ship/denylist`. Pull requests are
 judged by main's copy of the guard.
 
