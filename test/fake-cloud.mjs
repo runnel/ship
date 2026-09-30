@@ -48,7 +48,7 @@ if (b.sleepMs) await new Promise((r) => setTimeout(r, b.sleepMs));
 if (b.exit) { process.stderr.write('fake wrangler: failing as told\\n'); process.exit(b.exit); }
 const done = { version: 1, worker_name: worker, worker_tag: 'tag-' + worker, version_id: id };
 if (b.create !== false && cmd === 'versions upload') record({ type: 'version-upload', ...done, preview_url: 'https://' + id.slice(0, 8) + '-' + worker + '.example.workers.dev' });
-if (b.create !== false && cmd === 'deploy') record({ type: 'deploy', ...done, targets: [] });
+if (b.create !== false && b.noRecord !== true && cmd === 'deploy') record({ type: 'deploy', ...done, targets: [] });
 `;
 
 export async function fakeCloud({ dir, workers = {}, hosts = {}, probe = () => 200, wrangler = {}, clockStart = Date.UTC(2026, 0, 1) }) {

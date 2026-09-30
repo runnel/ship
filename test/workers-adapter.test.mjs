@@ -68,6 +68,17 @@ const loseRollbackAnswer = (inner) => async (url, init = {}) => {
   return res;
 };
 
+// Every read of Cloudflare after the promote fails: ship cannot check what it just did.
+const failReadsAfterPromote = (inner) => {
+  let promoted = false;
+  return async (url, init = {}) => {
+    if (promoted && (init.method ?? 'GET') === 'GET') throw new Error('socket hang up');
+    const res = await inner(url, init);
+    if (init.method === 'POST') promoted = true;
+    return res;
+  };
+};
+
 // A deploy in a child process that gets SIGTERM once wrangler is running. Resolves to the hold the
 // interrupted process left behind (null: none) and its exit code.
 async function interruptDuringWrangler({ dep, wrangler }) {
@@ -171,6 +182,33 @@ test('a config that cannot be read or parsed names its file and stops before any
   await failsWith({ configFile: null }, /no wrangler\.json \/ wrangler\.jsonc \/ wrangler\.toml in app/);
 });
 
+test('a config that names another Worker than the deployable is refused before any build or upload', async () => {
+  const other = await failsWith({ targetConfig: '{"name":"example-other"}' }, /^app\/wrangler\.json: name "example-other" is not this deployable's worker "example-app"/);
+  assert.deepEqual(await other.cloud.wranglerCalls(), []);
+  assert.equal(await exists(join(other.wt, 'app', '.next')), false);
+  // wrangler deploys to the config's name: the Worker that name belongs to must not be touched
+  const typo = await fixture({ dep: TICK, targetConfig: '{"name":"example-tik"}' });
+  const res = await deployOne(typo.ctx);
+  assert.equal(res.outcome, 'failed');
+  assert.match(res.detail, /^workers\/tick\/wrangler\.json: name "example-tik" is not this deployable's worker "example-tick"/);
+  assert.deepEqual(await typo.cloud.wranglerCalls(), []);
+  assert.equal((await typo.cloud.state('example-tick')).deployments.length, 1);
+  await failsWith({ configFile: 'wrangler.toml', targetConfig: 'name = "example-other"\nmain = "src/index.ts"\n' }, /^app\/wrangler\.toml: name "example-other" is not/);
+});
+
+test('a config without a top-level name is refused: wrangler would pick a name of its own', async () => {
+  await failsWith({ targetConfig: '{"vars":{"name":"example-app"}}' }, /^app\/wrangler\.json: no top-level "name"/);
+  await failsWith({ configFile: 'wrangler.toml', targetConfig: '[vars]\nname = "example-app"\n' }, /^app\/wrangler\.toml: no top-level "name"/);
+});
+
+test('the config name may be written as jsonc or toml', async () => {
+  // a dry run goes through the config checks and the build, and stops before wrangler
+  const jsonc = await fixture({ configFile: 'wrangler.jsonc', targetConfig: '{ // the Worker\n "name": "example-app", }' });
+  assert.equal((await deployOne({ ...jsonc.ctx, dryRun: true })).outcome, 'dry-run', jsonc.lines.join('\n'));
+  const toml = await fixture({ configFile: 'wrangler.toml', targetConfig: 'main = "src/index.ts"\nname = "example-app" # the Worker\n[vars]\nname = "other"\n', liveConfig: 'name = "example-app"\n' });
+  assert.equal((await deployOne({ ...toml.ctx, dryRun: true })).outcome, 'dry-run', toml.lines.join('\n'));
+});
+
 test('versioned: a failing preview probe leaves live untouched', async () => {
   const { cloud } = await failsWith({ probe: (p) => (p.preview ? 500 : healthy(p)) }, /preview probes failed .*secret put/);
   assert.deepEqual(posts(cloud), []);
@@ -256,6 +294,26 @@ test('a failed rollback keeps the hold and says what is live', async () => {
   assert.ok(await readHold(stateRoot, 't/r', 'app'));
 });
 
+test('the auto-rollback re-reads the deployment first: another version live means no rollback', async () => {
+  const other = 'c'.repeat(40);
+  let injected = false;
+  const { cloud, ctx, stateRoot } = await fixture({ probe: (p) => {
+    if (p.preview) return healthy(p);
+    if (!injected) {
+      injected = true;
+      const v = p.cloud.addVersion('example-app', { message: `sha:${other} other` });
+      p.cloud.addDeployment('example-app', v.id, { message: `sha:${other} other` });
+    }
+    return 500;
+  } });
+  const res = await deployOne(ctx);
+  assert.equal(res.outcome, 'stuck');
+  assert.match(res.detail, /live probes failed .*Not rolling back: version [0-9a-f]{8} is live, not ours .*hold in place/);
+  assert.equal(posts(cloud).length, 1, 'only our own promote; no rollback deployment');
+  assert.ok(await readHold(stateRoot, 't/r', 'app'));
+  assert.equal(cloud.live('example-app'), (await cloud.state('example-app')).versions.at(-1).id);
+});
+
 test('a rollback whose answer is lost is checked against what is live', async () => {
   let oldId;
   const { cloud, ctx, stateRoot } = await fixture({ fetchWrap: loseRollbackAnswer, probe: (p) => (p.preview || p.versionId === oldId ? healthy(p) : 500) });
@@ -325,6 +383,15 @@ test('a live marker that never shows is a warning, not a rollback', async () => 
   assert.equal(cloud.live('example-app'), res.versionId);
 });
 
+test('a live marker file that is missing or empty after the build stops before any upload', async () => {
+  const missing = await failsWith({ patch: { liveMarker: { path: '/login', file: '.next/NOT_THERE' } } }, /live marker: app\/\.next\/NOT_THERE is missing after the build/);
+  assert.deepEqual(await missing.cloud.wranglerCalls(), []);
+  assert.deepEqual(posts(missing.cloud), []);
+  const empty = await failsWith({ patch: { build: `${BUILD}; echo '  ' > .next/BUILD_ID` } }, /live marker: app\/\.next\/BUILD_ID is empty/);
+  assert.deepEqual(await empty.cloud.wranglerCalls(), []);
+  assert.equal(await exists(join(empty.wt, 'app', '.env.local')), false);
+});
+
 test('warmup paths are fetched on the preview and on the live host before the probes', async () => {
   const seen = [];
   const { ctx, lines } = await fixture({ patch: { warmup: ['/warm'] }, probe: (p) => { seen.push(`${p.preview ? 'preview' : 'live'} ${p.path}`); return healthy(p); } });
@@ -335,10 +402,10 @@ test('warmup paths are fetched on the preview and on the live host before the pr
 });
 
 test('an error after the promote becomes a hold, never an exception', async () => {
-  const { ctx, stateRoot } = await fixture({ patch: { liveMarker: { path: '/login', file: '.next/NOT_THERE' } } });
+  const { ctx, stateRoot } = await fixture({ fetchWrap: failReadsAfterPromote });
   const res = await deployOne(ctx);
   assert.equal(res.outcome, 'stuck');
-  assert.match(res.detail, /ship error after the deploy/);
+  assert.match(res.detail, /ship error after the deploy.*socket hang up/);
   assert.match((await readHold(stateRoot, 't/r', 'app')).reason, /ship error after the deploy/);
 });
 
@@ -353,7 +420,7 @@ test('a hold that cannot be written is reported, not thrown; the rollback still 
   assert.doesNotMatch(rolled.detail, /Hold set/);
   assert.equal(rollback.cloud.live('example-app'), oldId);
 
-  const broken = await fixture({ patch: { liveMarker: { path: '/login', file: '.next/NOT_THERE' } } });
+  const broken = await fixture({ fetchWrap: failReadsAfterPromote });
   await writeFile(broken.stateRoot, 'a file where the state directory should be');
   const stuck = await deployOne(broken.ctx);
   assert.equal(stuck.outcome, 'stuck');
@@ -395,6 +462,35 @@ test('direct: wrangler failing after the code went live holds; failing before it
   assert.equal(await readHold(early.stateRoot, 't/r', 'tick'), null);
 });
 
+test('direct --redeploy: wrangler failing before it uploads anything is not a hold, though live already is the target', async () => {
+  const fx = await fixture({ dep: TICK, wrangler: { deploy: { create: false, exit: 1 } } });
+  const version = fx.cloud.addVersion('example-tick', { message: `sha:${NEW} same code` });
+  fx.cloud.addDeployment('example-tick', version.id, { message: `sha:${NEW} same code` });
+  const entry = { live: resolveLive({ deployments: await fx.ctx.cf.deployments('example-tick'), versions: await fx.ctx.cf.versions('example-tick') }) };
+  assert.equal(entry.live.sha, NEW);
+  const res = await deployOne({ ...fx.ctx, entry });
+  assert.equal(res.outcome, 'failed');
+  assert.match(res.detail, /wrangler deploy exited 1; live is bbbbbbb/);
+  assert.equal(await readHold(fx.stateRoot, 't/r', 'tick'), null);
+});
+
+test('direct: wrangler exiting 0 without a deploy record while our code is live continues to the live probes', async () => {
+  const { cloud, ctx, lines, stateRoot } = await fixture({ dep: TICK, wrangler: { deploy: { noRecord: true } } });
+  const res = await deployOne(ctx);
+  assert.equal(res.outcome, 'deployed', `${res.detail}\n${lines.join('\n')}`);
+  assert.equal(res.versionId, cloud.live('example-tick'));
+  assert.match(lines.join('\n'), /! tick: wrangler wrote no deploy record, but version [0-9a-f]{8} with our commit is live — verifying it/);
+  assert.match(lines.join('\n'), /✓ tick: live probes/);
+  assert.equal(await readHold(stateRoot, 't/r', 'tick'), null);
+});
+
+test('direct: wrangler exiting 0 without a deploy record and nothing of ours live is a failure', async () => {
+  const { ctx } = await fixture({ dep: TICK, wrangler: { deploy: { create: false } } });
+  const res = await deployOne(ctx);
+  assert.equal(res.outcome, 'failed');
+  assert.match(res.detail, /wrangler deploy exited 0 without a deploy record; live is aaaaaaa/);
+});
+
 test('the build gets the deployable env and no credentials', async () => {
   const check = 'test "$STAGE" = prod && test -z "$CLOUDFLARE_API_TOKEN" && test -z "$CLOUDFLARE_ACCOUNT_ID"';
   const { ctx, lines } = await fixture({ patch: { env: { STAGE: 'prod' }, build: `${check} && ${BUILD}` } });
@@ -423,6 +519,18 @@ test('a failing build, a missing or empty bundle, a failing preDeploy and a miss
 test('a bundle with a foreign match fails; env files are removed anyway', async () => {
   const { wt } = await failsWith({ patch: { build: BUILD.replace('good', 'evil') } }, /bundle check: https:\/\/evil.db.example/);
   assert.equal(await exists(join(wt, 'app', '.env.local')), false);
+});
+
+test('env files are copied after install and before build, and removed when install fails', async () => {
+  // install fails if the file is already there; build needs it (BUILD starts with test -f .env.local)
+  const { ctx, lines, wt } = await fixture({ patch: { install: 'test ! -e .env.local && echo clean > .install-saw-no-env' } });
+  assert.equal((await deployOne(ctx)).outcome, 'deployed', lines.join('\n'));
+  assert.equal(await readFile(join(wt, 'app', '.install-saw-no-env'), 'utf8'), 'clean\n');
+  assert.equal(await exists(join(wt, 'app', '.env.local')), false);
+  const broken = await failsWith({ patch: { install: 'exit 5' } }, /build failed: exit 5/);
+  assert.equal(await exists(join(broken.wt, 'app', '.env.local')), false);
+  assert.equal(await exists(join(broken.wt, 'app', '.next')), false);
+  assert.deepEqual(await broken.cloud.wranglerCalls(), []);
 });
 
 test('dry run builds and stops before wrangler', async () => {

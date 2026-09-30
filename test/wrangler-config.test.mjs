@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CONFIG_KEYS, WRANGLER_FILES, changedSettings, expectedState, nonVersionedSettings } from '../lib/wrangler-config.mjs';
+import { CONFIG_KEYS, WRANGLER_FILES, changedSettings, expectedState, nonVersionedSettings, workerName } from '../lib/wrangler-config.mjs';
 
 test('jsonc: comments and trailing commas are fine; only non-versioned keys count', () => {
   const a = `{ // app\n "name": "example-app", "vars": { "A": "1" }, "triggers": { "crons": ["0 * * * *"] }, }`;
@@ -86,4 +86,17 @@ test('expectedState: dotted and quoted top-level keys in toml', () => {
 
 test("WRANGLER_FILES follows wrangler's own lookup order", () => {
   assert.deepEqual(WRANGLER_FILES, ['wrangler.json', 'wrangler.jsonc', 'wrangler.toml']);
+});
+
+test('workerName: the top-level name of a json, jsonc or toml config; null when there is none', () => {
+  assert.equal(workerName(`{ "name": "example-app" }`, 'wrangler.json'), 'example-app');
+  assert.equal(workerName(`{ // the Worker\n "vars": { "name": "not-this" }, "name": "example-app", }`, 'wrangler.jsonc'), 'example-app');
+  assert.equal(workerName(`{ "vars": { "name": "not-this" } }`, 'wrangler.json'), null);
+  assert.equal(workerName(`{ "name": 7 }`, 'wrangler.json'), null);
+  assert.equal(workerName(`main = "src/index.ts"\nname = "example-tick" # the Worker\n[vars]\nname = "not-this"\n`, 'wrangler.toml'), 'example-tick');
+  assert.equal(workerName(`name = 'example-tick'\n`, 'wrangler.toml'), 'example-tick');
+  assert.equal(workerName(`"name" = "example-tick"\n`, 'wrangler.toml'), 'example-tick');
+  assert.equal(workerName(`[vars]\nname = "not-this"\n[[d1_databases]]\nname = "not-this-either"\n`, 'wrangler.toml'), null);
+  assert.equal(workerName(`routes = [\n  "name = \\"not-this\\""\n]\nname = "example-tick"\n`, 'wrangler.toml'), 'example-tick');
+  assert.equal(workerName(`compatibility_date = "2026-01-01"\n`, 'wrangler.toml'), null);
 });
