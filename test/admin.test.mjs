@@ -332,28 +332,24 @@ const fetch = async (url, init = {}) => {
   }
   return res;
 };
-// Registered first, so it runs last in the unwind: the process goes once the command has reported
-// (the timer is only an upper bound, below the unwind's own limit of 30 s).
-let reported;
-const done = new Promise((r) => { reported = r; });
-onInterrupt(() => Promise.race([done, new Promise((r) => setTimeout(r, 25_000))]));
+// Registered first, so it runs last in the unwind: the command below finishes before the process goes.
+onInterrupt(() => new Promise((r) => setTimeout(r, 2500)));
 const deps = { ...s.deps, fetch };
 const to = (await s.cloud.state('example-app')).versions[0].id.slice(0, 8);
 const code = ${command === 'adopt'
     ? "await runAdopt({ cwd: s.work, at: s.head, names: ['app'], deps })"
     : "await runRollback({ cwd: s.work, name: 'app', to, deps })"};
 writeFileSync(${JSON.stringify(result)}, JSON.stringify({ code, posted, lines: s.lines, hold: await readHold(s.deps.stateRoot, 't/r', 'app') }));
-reported();
 `);
   const child = spawn(process.execPath, [script], { stdio: ['ignore', 'inherit', 'inherit'] });
-  const [code] = await Promise.race([once(child, 'exit'), new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not exit')), 60_000).unref())]);
+  const [code] = await Promise.race([once(child, 'exit'), new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not exit')), 30_000).unref())]);
   child.kill('SIGKILL');
   const report = JSON.parse(await readFile(result, 'utf8').catch(() => 'null') ?? 'null');
   assert.ok(report, 'the command did not finish before the process went');
   return { exit: code, ...report };
 }
 
-test('adopt and rollback --to promote nothing once ship is interrupted', { timeout: 150_000 }, async () => {
+test('adopt and rollback --to promote nothing once ship is interrupted', { timeout: 60_000 }, async () => {
   const adopt = await afterInterrupt('adopt');
   assert.equal(adopt.exit, 130);
   assert.equal(adopt.posted, false, adopt.lines.join('\n'));

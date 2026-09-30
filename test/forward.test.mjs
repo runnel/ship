@@ -20,9 +20,9 @@ test('a target that is already gone is not an error', () => {
   assert.doesNotThrow(() => forward('SIGTERM'));
 });
 
-test('the wrapper still starts ship and passes its exit code on', { timeout: 150_000 }, async () => {
+test('the wrapper still starts ship and passes its exit code on', { timeout: 30_000 }, async () => {
   const bin = fileURLToPath(new URL('../bin/ship.mjs', import.meta.url));
-  const ok = await promisify(execFile)(process.execPath, [bin], { timeout: 60_000 });
+  const ok = await promisify(execFile)(process.execPath, [bin], { timeout: 20_000 });
   assert.match(ok.stdout, /^usage:/);
-  await assert.rejects(() => promisify(execFile)(process.execPath, [bin, 'nope'], { timeout: 60_000 }), (e) => e.code === 2);
+  await assert.rejects(() => promisify(execFile)(process.execPath, [bin, 'nope'], { timeout: 20_000 }), (e) => e.code === 2);
 });

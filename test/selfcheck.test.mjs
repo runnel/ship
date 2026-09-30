@@ -21,7 +21,7 @@ test("ship's own config validates", () => {
 
 // A pull request must not weaken its own gate: the leak step judges the tree with the guard that
 // is on main, so a PR that gutters lib/leak.mjs and adds a leak is still caught.
-test("the self-check's leak step runs main's guard, not the tree's own", { timeout: 120_000 }, async () => {
+test("the self-check's leak step runs main's guard, not the tree's own", { timeout: 60_000 }, async () => {
   const step = validateConfig(config).checks.flatMap((k) => k.steps).find((s) => s.run.includes('leak --all')).run;
   const dir = await tempDir('selfcheck-');
   await capture('git', ['init', '--quiet', '--initial-branch=main', dir]);
@@ -37,7 +37,7 @@ test("the self-check's leak step runs main's guard, not the tree's own", { timeo
 
   const denylist = join(await tempDir(), 'denylist');
   await writeFile(denylist, 'zebra\n');
-  const r = await run(step, { cwd: dir, env: buildEnv({ SHIP_DENYLIST: denylist }), logFile: join(dir, '..', 'selfcheck.log'), timeoutMs: 90_000 });
+  const r = await run(step, { cwd: dir, env: buildEnv({ SHIP_DENYLIST: denylist }), logFile: join(dir, '..', 'selfcheck.log'), timeoutMs: 45_000 });
   assert.notEqual(r.code, 0, r.tail.join('\n'));
   assert.ok(r.tail.some((l) => l.includes('e-mail address')), r.tail.join('\n'));
   assert.ok(!r.tail.some((l) => l.includes('gutted guard')), r.tail.join('\n'));

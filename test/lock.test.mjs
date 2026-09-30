@@ -23,8 +23,8 @@ test('a live holder is waited for', async () => {
   const dir = await lockDir();
   const release = await acquire(dir, await ownerInfo({ label: 'first' }));
   let waits = 0;
-  // The holder lets go only once the waiter has been seen waiting.
-  const second = acquire(dir, await ownerInfo({ label: 'second' }), { pollMs: 20, onWait: () => { if (waits++ === 0) setTimeout(() => release(), 50); } });
+  const second = acquire(dir, await ownerInfo({ label: 'second' }), { pollMs: 20, onWait: () => { waits++; } });
+  setTimeout(() => release(), 120);
   const release2 = await second;
   assert.ok(waits > 0);
   assert.equal((await readOwner(dir)).label, 'second');
@@ -47,13 +47,13 @@ test('isStale: this process is alive; a reused pid is stale; a dead group is sta
   assert.equal(await isStale(DEAD), true);
 });
 
-test('processStartTime does not depend on the caller time zone or locale', { timeout: 90_000 }, async () => {
+test('processStartTime does not depend on the caller time zone or locale', { timeout: 30_000 }, async () => {
   const before = await processStartTime(process.pid);
   assert.ok(before);
   const mod = new URL('../lib/lock.mjs', import.meta.url).href;
   const code = `import { processStartTime } from ${JSON.stringify(mod)}; process.stdout.write(String(await processStartTime(${process.pid})));`;
   for (const env of [{ TZ: 'Asia/Tokyo' }, { TZ: 'America/New_York', LC_ALL: 'de_DE.UTF-8' }]) {
-    const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', code], { env: { ...process.env, ...env }, timeout: 60_000 });
+    const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', code], { env: { ...process.env, ...env }, timeout: 20_000 });
     assert.equal(stdout, before, JSON.stringify(env));
   }
 });
@@ -148,7 +148,7 @@ test('a directory without an owner is waited for until it is older than the grac
   await release();
 });
 
-test('acquire stops waiting when told to abort, instead of waiting for a live holder forever', { timeout: 60_000 }, async () => {
+test('acquire stops waiting when told to abort, instead of waiting for a live holder forever', { timeout: 30_000 }, async () => {
   const dir = await lockDir();
   const release = await acquire(dir, await ownerInfo({ label: 'holder' }));
   let abort = false;
@@ -157,7 +157,7 @@ test('acquire stops waiting when told to abort, instead of waiting for a live ho
   try {
     const outcome = await Promise.race([
       waiter.then(() => 'acquired', (e) => (e.aborted ? 'aborted' : `failed: ${e.message}`)),
-      new Promise((r) => setTimeout(() => r('still waiting'), 20_000).unref()),
+      new Promise((r) => setTimeout(() => r('still waiting'), 3_000).unref()),
     ]);
     assert.equal(outcome, 'aborted');
     assert.equal((await readOwner(dir)).label, 'holder'); // the holder's lock is untouched

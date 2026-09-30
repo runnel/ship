@@ -41,7 +41,7 @@ test('a command past its timeout is killed with its descendants and returns 124'
   try {
     const r = await run(`sleep 31.4159 & echo $! > ${pidFile}; wait`, { cwd: dir, env: buildEnv(), logFile: join(dir, 'log'), timeoutMs: 300 });
     assert.equal(r.code, 124);
-    assert.ok(Date.now() - started < 20_000); // the descendant sleeps 31 s: the timeout must not wait for it
+    assert.ok(Date.now() - started < 4000);
     assert.match(r.tail.at(-1), /timed out/);
     await assertGone(pidFile, 'the descendant is still running');
   } finally {
@@ -73,50 +73,50 @@ process.stdout.write(JSON.stringify({ code: r.code, ms: Date.now() - started, ta
   child.stdout.on('data', (b) => { out += b; });
   const exited = new Promise((resolve) => child.on('close', resolve));
   try {
-    await Promise.race([exited, deadline(25_000, 'the leader process')]);
+    await Promise.race([exited, deadline(12_000, 'the leader process')]);
     return JSON.parse(out);
   } finally {
     try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group already gone */ }
   }
 }
 
-test('a step that exits but leaves a background process holding its output returns after a short grace', { timeout: 60_000 }, async () => {
+test('a step that exits but leaves a background process holding its output returns after a short grace', { timeout: 30_000 }, async () => {
   const dir = await tmp();
   const pidFile = join(dir, 'pid');
   try {
     const started = Date.now();
     const r = await Promise.race([
       run(`(sleep 20.4711 & echo $! > ${pidFile}); echo done`, { cwd: dir, env: buildEnv(), logFile: join(dir, 'log') }),
-      deadline(18_000, 'run'),
+      deadline(8_000, 'run'),
     ]);
     assert.equal(r.code, 0);
     assert.ok(r.tail.includes('done'));
-    assert.ok(Date.now() - started < 15_000); // the orphan sleeps 20 s: run() must not wait for it
+    assert.ok(Date.now() - started < 6_000);
   } finally {
     killQuietly(await readPid(pidFile)); // this process is not a group leader: it does not stop orphans
   }
 });
 
-test('a timed-out step returns promptly and its orphan (re-parented, holding stdout) is killed', { timeout: 60_000 }, async () => {
+test('a timed-out step returns promptly and its orphan (re-parented, holding stdout) is killed', { timeout: 30_000 }, async () => {
   const dir = await tempDir('leader-');
   const pidFile = join(dir, 'pid');
   try {
     const r = await runAsLeader(`(sleep 20.4712 & echo $! > ${pidFile}); exit 0`, 300, dir);
     assert.equal(r.code, 124);
-    assert.ok(r.ms < 15_000, `took ${r.ms} ms`); // the orphan sleeps 20 s
+    assert.ok(r.ms < 4_000, `took ${r.ms} ms`);
     await assertGone(pidFile, 'the orphan is still running');
   } finally {
     killQuietly(await readPid(pidFile));
   }
 });
 
-test('a descendant that ignores SIGTERM is SIGKILLed and the timeout still returns promptly', { timeout: 60_000 }, async () => {
+test('a descendant that ignores SIGTERM is SIGKILLed and the timeout still returns promptly', { timeout: 30_000 }, async () => {
   const dir = await tempDir('leader-');
   const pidFile = join(dir, 'pid');
   try {
     const r = await runAsLeader(`trap '' TERM; sleep 20.4714 & echo $! > ${pidFile}; wait`, 300, dir);
     assert.equal(r.code, 124);
-    assert.ok(r.ms < 15_000, `took ${r.ms} ms`); // the descendant sleeps 20 s
+    assert.ok(r.ms < 4_500, `took ${r.ms} ms`);
     await assertGone(pidFile, 'the descendant is still running');
   } finally {
     killQuietly(await readPid(pidFile));

@@ -5,17 +5,17 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 const BIN = fileURLToPath(new URL('../bin/ship.mjs', import.meta.url));
-const ship = (...args) => promisify(execFile)(process.execPath, [BIN, ...args], { timeout: 60_000 })
+const ship = (...args) => promisify(execFile)(process.execPath, [BIN, ...args], { timeout: 20_000 })
   .then((r) => ({ code: 0, ...r }), (e) => ({ code: e.code, stdout: e.stdout, stderr: e.stderr }));
 
-test('an unknown flag of ship deploy is named, its usage is printed, and it exits 2', { timeout: 90_000 }, async () => {
+test('an unknown flag of ship deploy is named, its usage is printed, and it exits 2', { timeout: 30_000 }, async () => {
   const r = await ship('deploy', '--nope');
   assert.equal(r.code, 2, r.stderr);
   assert.match(r.stderr, /^✗ ship deploy: .*--nope/);
   assert.match(r.stdout, /^ship deploy \[<deployable>…\] \[--dry-run\] \[--redeploy\] {3,}deploy what changed on main since it went live\n$/);
 });
 
-test('--redeploy without a name is a usage error; the usage lists ship deploy', { timeout: 90_000 }, async () => {
+test('--redeploy without a name is a usage error; the usage lists ship deploy', { timeout: 30_000 }, async () => {
   const r = await ship('deploy', '--redeploy');
   assert.equal(r.code, 2, r.stderr);
   assert.match(r.stderr, /^✗ ship deploy: --redeploy needs deployable names\n$/);
@@ -32,14 +32,14 @@ const usageError = async (args, problem, usage, { lines = 1 } = {}) => {
   if (lines) assert.equal(r.stdout.trimEnd().split('\n').length, lines, 'the usage of that command only');
 };
 
-test('ship check: a bad flag or an extra argument is a usage error, exit 2', { timeout: 90_000 }, async () => {
+test('ship check: a bad flag or an extra argument is a usage error, exit 2', { timeout: 30_000 }, async () => {
   const usage = /^ship check \[--pr <number>\] {3,}check a pull request/;
   await usageError(['check', '--nope'], 'check: .*--nope', usage);
   await usageError(['check', '42'], 'check: .*42', usage);
   await usageError(['check', '--pr'], 'check: .*--pr', usage);
 });
 
-test('missing arguments and malformed values are usage errors in the same style', { timeout: 180_000 }, async () => {
+test('missing arguments and malformed values are usage errors in the same style', { timeout: 60_000 }, async () => {
   const adopt = /^ship adopt --at <sha> /;
   await usageError(['adopt'], 'adopt: missing --at <sha>', adopt);
   await usageError(['adopt', '--all'], 'adopt: missing --at <sha>', adopt);
@@ -57,7 +57,7 @@ test('missing arguments and malformed values are usage errors in the same style'
   await usageError(['frobnicate'], 'frobnicate: unknown command', /^usage:\n {2}ship check /, { lines: 0 });
 });
 
-test('ship status takes no arguments: an unknown flag or a name is named, its usage is printed, and it exits 2', { timeout: 90_000 }, async () => {
+test('ship status takes no arguments: an unknown flag or a name is named, its usage is printed, and it exits 2', { timeout: 30_000 }, async () => {
   for (const arg of ['--nope', 'app']) {
     const r = await ship('status', arg);
     assert.equal(r.code, 2, r.stderr);
@@ -67,7 +67,7 @@ test('ship status takes no arguments: an unknown flag or a name is named, its us
   assert.match((await ship()).stdout, /ship status {5,}live commit/);
 });
 
-test('an unknown flag of ship adopt or ship rollback is named, its usage is printed, and it exits 2', { timeout: 90_000 }, async () => {
+test('an unknown flag of ship adopt or ship rollback is named, its usage is printed, and it exits 2', { timeout: 30_000 }, async () => {
   const adopt = await ship('adopt', '--nope');
   assert.equal(adopt.code, 2, adopt.stderr);
   assert.match(adopt.stderr, /^✗ ship adopt: .*--nope/);
@@ -78,7 +78,7 @@ test('an unknown flag of ship adopt or ship rollback is named, its usage is prin
   assert.match(rollback.stdout, /^ship rollback <deployable> \[--to <version> \[--revert-secrets\]\] {2,}show the rollback target/);
 });
 
-test('ship unhold and ship migrations reject what they cannot take with exit 2', { timeout: 90_000 }, async () => {
+test('ship unhold and ship migrations reject what they cannot take with exit 2', { timeout: 30_000 }, async () => {
   const unhold = await ship('unhold', '--nope');
   assert.equal(unhold.code, 2, unhold.stderr);
   assert.match(unhold.stderr, /^✗ ship unhold: .*--nope/);
@@ -95,7 +95,7 @@ test('ship unhold and ship migrations reject what they cannot take with exit 2',
   assert.match(flag.stderr, /^✗ ship migrations ack: .*--nope/);
 });
 
-test('the usage lists every command with its description in one column', { timeout: 90_000 }, async () => {
+test('the usage lists every command with its description in one column', { timeout: 30_000 }, async () => {
   const rows = (await ship()).stdout.split('\n').filter((l) => l.startsWith('  ship '));
   assert.equal(rows.length, 8);
   assert.equal(new Set(rows.map((l) => l.match(/^ {2}ship .*? {2,}/)[0].length)).size, 1, rows.join('\n'));
