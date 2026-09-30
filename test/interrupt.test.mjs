@@ -313,6 +313,25 @@ test('a hung earlier status POST does not hold up the interrupt, and is stopped'
   }
 });
 
+// The wait for a hung status POST and the error POST share one time budget: a double hang must not
+// take twice as long, which would eat into the time left for removing the worktree.
+test('the queue drain and the error POST share one time budget', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('unwind-');
+  const s = await setupCheck({ steps: ['true'], ghOptions: { apiDelay: { ms: 120_000, match: 'state=' } } }); // every POST hangs
+  const run = await spawnCheckLeader(s, dir, { unwindPostTimeoutMs: 5000 });
+  try {
+    await waitFor(async () => (await s.calls()).some((c) => c[0] === 'api' && c.includes('state=pending')), 30_000, 'the first status POST to start');
+    const signalled = Date.now();
+    run.child.kill('SIGTERM');
+    assert.equal(await Promise.race([run.exited, deadline(20_000, 'ship exit')]), 130, run.out.text);
+    const took = Date.now() - signalled;
+    // one budget (5 s) + the error POST's floor (1.25 s) ≈ 6.3 s; two budgets would be ≥ 10 s
+    assert.ok(took < 9000, `took ${took} ms: the error POST still gets a full budget of its own`);
+  } finally {
+    run.kill();
+  }
+});
+
 // The real CLI turns an interrupt that makes a call fail into exit 130 (lib/cli.mjs); the harness
 // must do the same, or it would report a product bug that is not there.
 test('a group signal during the first status POST ends as the real CLI does: exit 130, error posted', { timeout: 60_000 }, async () => {

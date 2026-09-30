@@ -163,3 +163,84 @@ test('a config that fails to import does not post the system temp path', async (
   assert.ok(!last.description.includes(tmpdir()), last.description);
   assert.ok(last.description.includes('$TMPDIR/'), last.description);
 });
+
+test('a deployable importing a file outside its paths fails the check', async () => {
+  const configText = `export default { repo: 't/r', docsOnly: ['*.md'], checks: [{ name: 'unit', paths: ['src/**', 'lib/**'], steps: ['true'] }],
+    deployables: [{ name: 'w', worker: 'example-w', cwd: 'src', paths: ['src/**'], mode: 'direct' }],
+    credentials: { file: '/unused', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } } };\n`;
+  const s = await setup({ configText, featFiles: { 'src/x.ts': "import '../lib/y';\n", 'lib/y.ts': '' } });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1);
+  assert.match((await s.statuses()).at(-1).description, /deployable w imports lib\/y.ts/);
+});
+
+// One direct deployable `w` in src/; `paths` and `extra` (more deployable keys) vary.
+const importConfig = (paths, { extra = '', docsOnly = "['*.md']" } = {}) => `export default { repo: 't/r', docsOnly: ${docsOnly},
+  checks: [{ name: 'unit', paths: ['src/**', 'lib/**', 'docs/**'], steps: ['true'] }],
+  deployables: [{ name: 'w', worker: 'example-w', cwd: 'src', paths: ${JSON.stringify(paths)}, mode: 'direct'${extra} }],
+  credentials: { file: '/unused', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } } };\n`;
+const MAIN_VIOLATES = { 'src/x.ts': "import '../lib/y';\n", 'lib/y.ts': '' };
+const lastStatus = async (s) => (await s.statuses()).at(-1);
+
+test('the import check also treats an ignored or docs-only import as outside', async () => {
+  const ignored = await setup({ configText: importConfig(['src/**'], { extra: ", ignore: ['src/gen/**']" }), featFiles: { 'src/x.ts': "import './gen/z';\n", 'src/gen/z.ts': '' } });
+  assert.equal(await runCheck({ cwd: ignored.work, deps: ignored.deps }), 1);
+  assert.match((await lastStatus(ignored)).description, /deployable w imports src\/gen\/z.ts \(from src\/x.ts\)/);
+  const docs = await setup({ configText: importConfig(['src/**', 'docs/**'], { docsOnly: "['docs/**']" }), featFiles: { 'src/x.ts': "import '../docs/y';\n", 'docs/y.ts': '' } });
+  assert.equal(await runCheck({ cwd: docs.work, deps: docs.deps }), 1);
+  assert.match((await lastStatus(docs)).description, /deployable w imports docs\/y.ts \(from src\/x.ts\)/);
+});
+
+test('an ignored test that imports its own helper passes the import check', async () => {
+  const s = await setup({ configText: importConfig(['src/**'], { extra: ", ignore: ['src/test/**']" }), featFiles: { 'src/test/a.test.ts': "import './helpers';\n", 'src/test/helpers.ts': '' } });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 0, s.lines.join('\n'));
+});
+
+test('a violation that is already on main does not fail the pull request that widens the paths', async () => {
+  const s = await setup({ configText: importConfig(['src/**']), mainFiles: MAIN_VIOLATES, featFiles: { 'ship.config.mjs': importConfig(['src/**', 'lib/**']) } });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 0, s.lines.join('\n'));
+  assert.equal((await lastStatus(s)).state, 'success');
+});
+
+test('a pull request that leaves the paths alone still fails on the violation on main', async () => {
+  const s = await setup({ configText: importConfig(['src/**']), mainFiles: MAIN_VIOLATES, featFiles: { 'docs/notes.txt': 'n\n' } });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1);
+  assert.match((await lastStatus(s)).description, /deployable w imports lib\/y.ts \(from src\/x.ts\)/);
+});
+
+test('widening the paths for one import does not excuse a new violation', async () => {
+  const s = await setup({ configText: importConfig(['src/**']), mainFiles: MAIN_VIOLATES,
+    featFiles: { 'ship.config.mjs': importConfig(['src/**', 'lib/y.ts']), 'src/z.ts': "import '../lib/w';\n", 'lib/w.ts': '' } });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1);
+  assert.match((await lastStatus(s)).description, /deployable w imports lib\/w.ts \(from src\/z.ts\)/);
+  assert.doesNotMatch((await lastStatus(s)).description, /lib\/y.ts/);
+});
+
+test('a config in the pull request that cannot be loaded leaves main\'s verdict as it is', async () => {
+  const s = await setup({ configText: importConfig(['src/**']), mainFiles: MAIN_VIOLATES, featFiles: { 'ship.config.mjs': 'export default {\n' } });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1);
+  assert.match((await lastStatus(s)).description, /deployable w imports lib\/y.ts/);
+});
+
+test('the pull request\'s own config runs outside ship\'s process and without its environment', async () => {
+  process.env.SHIP_TEST_CALLER_SECRET = 'must-not-leak';
+  try {
+    // It widens the paths only when it cannot see the caller's variable, and marks the process it runs in.
+    const widening = importConfig(['src/**', 'lib/**']).replace('export default', "globalThis.__shipPullRequestConfigRan = true;\nconst paths = process.env.SHIP_TEST_CALLER_SECRET ? ['src/**'] : ['src/**', 'lib/**'];\nexport default")
+      .replace('paths: ["src/**","lib/**"]', 'paths');
+    const s = await setup({ configText: importConfig(['src/**']), mainFiles: MAIN_VIOLATES, featFiles: { 'ship.config.mjs': widening } });
+    assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 0, s.lines.join('\n'));
+    assert.equal(globalThis.__shipPullRequestConfigRan, undefined);
+  } finally {
+    delete process.env.SHIP_TEST_CALLER_SECRET;
+  }
+});
+
+test('a pull request config that ignores SIGTERM cannot hang the check: it is killed and main\'s verdict stands', { timeout: 60_000 }, async () => {
+  // A busy loop with a SIGTERM handler installed: the signal is never acted on, only SIGKILL ends it.
+  const hostile = "process.on('SIGTERM', () => {});\nfor (;;) {}\nexport default {};\n";
+  const s = await setup({ configText: importConfig(['src/**']), mainFiles: MAIN_VIOLATES, featFiles: { 'ship.config.mjs': hostile } });
+  const started = Date.now();
+  assert.equal(await runCheck({ cwd: s.work, deps: { ...s.deps, treeConfigTimeoutMs: 1500 } }), 1);
+  assert.ok(Date.now() - started < 30_000, `took ${Date.now() - started} ms`);
+  assert.match((await lastStatus(s)).description, /deployable w imports lib\/y.ts/);
+});

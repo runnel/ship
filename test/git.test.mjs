@@ -2,9 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { access, readFile, mkdir, readdir, utimes } from 'node:fs/promises';
 import { join } from 'node:path';
-import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile } from '../lib/git.mjs';
+import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile, isAncestor, listTree, commitsTouching, subject, lastCommitBefore } from '../lib/git.mjs';
 import { validateConfig } from '../lib/config.mjs';
 import { classify } from '../lib/classify.mjs';
+import { capture } from '../lib/proc.mjs';
 import { makeOrigin, commitFiles, git, tempDir } from './helpers.mjs';
 
 async function branchAndMain({ feat, main }) {
@@ -162,4 +163,63 @@ test('an ensureMirror sweeps the stale staging directory of a clone that was kil
   await utimes(join(root, 'other__repo.git.new-old'), twoHoursAgo, twoHoursAgo);
   await ensureMirror('t/r', { root, url: o.origin });
   assert.deepEqual((await readdir(root)).sort(), ['other__repo.git.new-old', 't__r.git', 't__r.git.new-fresh']);
+});
+
+test('isAncestor, listTree, commitsTouching, subject', async () => {
+  const { origin, work, root } = await makeOrigin({ 'app/a.ts': '1', 'db/001.sql': '' });
+  const first = (await git(['rev-parse', 'HEAD'], work)).trim();
+  await commitFiles(work, { 'app/a.ts': '2' }, 'app change (#11)');
+  await commitFiles(work, { 'docs/x.md': 'x' }, 'docs only (#12)');
+  const head = await commitFiles(work, { 'db/002.sql': '' }, 'add migration (#13)');
+  await git(['push', '--quiet', 'origin', 'main'], work);
+  const mirror = await ensureMirror('t/r', { root: join(root, 'm'), url: origin });
+  assert.equal(await isAncestor(mirror, first, head), true);
+  assert.equal(await isAncestor(mirror, head, first), false);
+  assert.deepEqual((await listTree(mirror, head)).sort(), ['app/a.ts', 'db/001.sql', 'db/002.sql', 'docs/x.md']);
+  assert.deepEqual((await commitsTouching(mirror, first, head, ['app/**', 'db/*.sql'])).map((c) => c.subject), ['add migration (#13)', 'app change (#11)']);
+  assert.equal(await subject(mirror, head), 'add migration (#13)');
+  assert.equal(await subject(mirror, 'f'.repeat(40)), null);
+});
+
+// A repository on main whose commits carry the dates given; `commit` moves the current branch.
+async function datedRepo() {
+  const dir = await tempDir('dated-');
+  await git(['init', '--quiet', '--initial-branch=main', dir]);
+  const env = (iso) => ({ ...process.env, GIT_AUTHOR_DATE: iso, GIT_COMMITTER_DATE: iso, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@localhost', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@localhost' });
+  const head = async () => (await git(['rev-parse', 'HEAD'], dir)).trim();
+  return {
+    gitDir: join(dir, '.git'),
+    head,
+    switchTo: (branch, create = false) => git(['checkout', '--quiet', ...(create ? ['-b'] : []), branch], dir),
+    async commit(file, iso) {
+      await commitFiles(dir, { [file]: 'x\n' }, file);
+      await capture('git', ['commit', '--quiet', '--amend', '--no-edit'], { cwd: dir, env: env(iso) });
+      return head();
+    },
+    async merge(branch, iso) {
+      await capture('git', ['merge', '--quiet', '--no-ff', '-m', `merge ${branch}`, branch], { cwd: dir, env: env(iso) });
+      return head();
+    },
+  };
+}
+
+test('lastCommitBefore answers the newest commit made before a moment, or null', async () => {
+  const repo = await datedRepo();
+  const one = await repo.commit('one.txt', '2026-01-01T00:00:10Z');
+  const two = await repo.commit('two.txt', '2026-01-01T00:00:20Z');
+  assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:05.000Z'), null);
+  assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:15.123456Z'), one);
+  assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:30.000Z'), two);
+});
+
+test('lastCommitBefore follows the first parents: a side commit merged later is not what main held', async () => {
+  const repo = await datedRepo();
+  const main1 = await repo.commit('main1.txt', '2026-01-01T00:00:10Z');
+  await repo.switchTo('feat', true);
+  const feat1 = await repo.commit('feat1.txt', '2026-01-01T00:00:20Z');
+  await repo.switchTo('main');
+  const merged = await repo.merge('feat', '2026-01-01T00:00:40Z');
+  assert.notEqual(feat1, main1);
+  assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:30Z'), main1);
+  assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:50Z'), merged);
 });

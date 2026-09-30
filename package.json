@@ -1,7 +1,7 @@
 {
   "name": "ship-local-ci",
   "version": "0.1.0",
-  "description": "Local CI gate (and, later, guarded Cloudflare Workers deploys) for solo developers",
+  "description": "Local CI gate and guarded Cloudflare Workers deploys for solo developers",
   "type": "module",
   "private": true,
   "bin": { "ship": "bin/ship.mjs" },

@@ -21,3 +21,4 @@ This repository is **public**. Before anything else:
   before the binary it allows, and a false positive that is already in history can only be cleared
   by the owner bypassing the branch protection.
 - Zero runtime dependencies. Node >= 24. `npm test` runs everything.
+- Deploy tests run against `test/fake-cloud.mjs`; tests never reach the network.
