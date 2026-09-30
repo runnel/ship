@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import { commitFiles, git, makeOrigin } from './helpers.mjs';
 import { addAcks, writeHold } from '../lib/state.mjs';
 import { at, setupDeploy } from './deploy-fixture.mjs';
@@ -117,4 +119,51 @@ test('requires: a pending deployable of another repo stops the deploy', async ()
   assert.equal(await s.deploy(), 1);
   assert.match(s.lines.join('\n'), /requires t\/api app: pending/);
   assert.deepEqual(await s.cloud.wranglerCalls(), []);
+});
+
+// The nth read of a Worker's deployments fails. For a versioned deployable the 1st is the plan and
+// the 2nd the re-read just before the promote, so nothing of ours is live when it fails.
+function failDeploymentsRead(s, worker, nth, error) {
+  const inner = s.deps.fetch;
+  let seen = 0;
+  s.deps.fetch = async (url, init = {}) => {
+    if ((init.method ?? 'GET') === 'GET' && url.includes(`/scripts/${worker}/deployments`) && ++seen === nth) throw error;
+    return await inner(url, init);
+  };
+}
+const bothChanged = { 'app/src/a.ts': '2', 'workers/tick/src/index.ts': '2' };
+
+test('an exception in one deployable fails it and skips its dependents', async () => {
+  const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }), change: bothChanged });
+  await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
+  failDeploymentsRead(s, 'example-app', 2, new Error('socket hang up'));
+  assert.equal(await s.deploy(), 1);
+  assert.match(s.lines.join('\n'), /✗ app: ship error: socket hang up/);
+  assert.match(s.lines.join('\n'), /! tick: waits for app \(failed\)/);
+  assert.match(s.lines.join('\n'), /✗ ship deploy: app failed, tick skipped/);
+  assert.deepEqual((await s.cloud.wranglerCalls()).map((c) => c.cmd), ['versions upload']);
+});
+
+test('a failed deployable does not stop an independent one', async () => {
+  const s = await setupDeploy({
+    options: { third: true },
+    seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first), 'example-job': at(first) }),
+    change: { ...bothChanged, 'workers/job/src/index.ts': '2' },
+  });
+  await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
+  failDeploymentsRead(s, 'example-app', 2, new Error('socket hang up'));
+  assert.equal(await s.deploy(), 1);
+  assert.match(s.lines.join('\n'), /! tick: waits for app \(failed\)/);
+  assert.match(s.lines.join('\n'), /✓ job: [0-9a-f]{8} live at /);
+  assert.deepEqual((await s.cloud.wranglerCalls()).map((c) => [c.cmd, c.worker]), [['versions upload', 'example-app'], ['deploy', 'example-job']]);
+});
+
+test('an interrupt inside a deployable ends the run: not a deploy failure, nothing left behind', async () => {
+  const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }), change: bothChanged });
+  await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
+  failDeploymentsRead(s, 'example-app', 2, Object.assign(new Error('interrupted'), { aborted: true }));
+  await assert.rejects(s.deploy(), (e) => e.aborted === true);
+  assert.doesNotMatch(s.lines.join('\n'), /ship error|! tick/);
+  assert.deepEqual((await s.cloud.wranglerCalls()).map((c) => c.cmd), ['versions upload']);
+  for (const dir of ['w', 'locks', 'lanes']) assert.deepEqual(await readdir(join(s.deps.tmpRoot, dir)), [], dir);
 });
