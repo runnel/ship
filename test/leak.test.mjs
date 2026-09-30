@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, writeFile, rm, symlink, unlink } from 'node:fs/promises';
+import { readFile, writeFile, rm, symlink, unlink, mkdir } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -107,9 +107,9 @@ const NOREPLY = '1+x' + AT + 'users.noreply.github.com';
 const LEAKY = 'mail bob' + AT + 'corp.ee\n';
 const git = (dir, ...args) => capture('git', ['-C', dir, '-c', 'core.hooksPath=/dev/null', ...args]);
 
-async function scratchRepo(files = {}) {
+async function scratchRepo(files = {}, init = []) {
   const dir = await tempDir('leak-');
-  await capture('git', ['init', '--quiet', '--initial-branch=main', dir]);
+  await capture('git', ['init', '--quiet', '--initial-branch=main', ...init, dir]);
   await git(dir, 'config', 'user.name', 'x');
   await git(dir, 'config', 'user.email', NOREPLY);
   await git(dir, 'config', 'commit.gpgsign', 'false');
@@ -411,7 +411,7 @@ async function commitWithMessageFile(dir, message) {
 const commitModes = (tip) => [
   { mode: '--all', args: ['--all'] },
   { mode: '--history', args: ['--history'] },
-  { mode: '--pre-push', args: ['--pre-push', 'origin'], stdin: () => Readable.from([`refs/heads/main ${tip} refs/heads/main ${'0'.repeat(40)}\n`]) },
+  { mode: '--pre-push', args: ['--pre-push', 'origin'], stdin: () => Readable.from([`refs/heads/main ${tip} refs/heads/main ${'0'.repeat(tip.length)}\n`]) },
 ];
 
 test('a git log that does not split into the commits rev-list names is refused, not guessed at', () => {
@@ -467,5 +467,285 @@ test("a commit message cannot forge a record of its own, nor earn a GitHub-made 
     // the forged author line is line 6 of the real commit's message, not line 1 of a commit "fffffff"
     assert.ok(r.lines.includes(`✗ commit ${tip.slice(0, 7)}:6: denylist`), `${mode}: ${r.printed}`);
     assert.ok(r.lines.every((l) => !l.startsWith('✗ commit ') || l.startsWith(`✗ commit ${tip.slice(0, 7)}:`)), `${mode}: ${r.printed}`);
+  }
+});
+
+// --- what a push sends that `git log -p` leaves out -------------------------------------------
+// A merge's own changes, annotated tags, and blobs or trees that a ref names are published like any
+// commit; the scan must read them, and read file names as they are stored.
+
+const zeros = (sha) => '0'.repeat(sha.length);
+const commitFindings = (lines, sha, rule) => lines.filter((l) => new RegExp(`^✗ commit ${sha.slice(0, 7)}:\\d+: ${rule}$`).test(l));
+
+// main and a side branch each add a file; `resolve` then edits the merge before it is committed.
+async function mergeSide(dir, resolve) {
+  await git(dir, 'checkout', '--quiet', '-b', 'side');
+  await writeAll(dir, { 'side.txt': 'side\n' });
+  await commitAll(dir, 'side');
+  await git(dir, 'checkout', '--quiet', 'main');
+  await writeAll(dir, { 'main.txt': 'main\n' });
+  await commitAll(dir, 'main');
+  await git(dir, 'merge', '--quiet', '--no-ff', '--no-commit', 'side');
+  await resolve();
+  return commitAll(dir, 'merge side');
+}
+
+test('text that a merge commit adds itself (an "evil merge") is scanned by --history and --pre-push', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'one\ntwo\n' });
+  await commitAll(dir, 'root');
+  const merge = await mergeSide(dir, () => writeAll(dir, {
+    'a.txt': 'one\n' + LEAKY, // a line the merge changed
+    'new.txt': LEAKY, // a file the merge added
+    'late.txt': 'x'.repeat(9000) + '\nok\0 ' + LEAKY, // text to git, but a combined diff cuts the line at the NUL
+  }));
+  const m = merge.slice(0, 7);
+  for (const { mode, args, stdin } of commitModes(merge).filter((x) => x.mode !== '--all')) {
+    const c = collect();
+    const code = await runLeak([...args, '--generic-only'], { cwd: dir, out: c.out, stdin: stdin?.() });
+    const printed = c.lines.join('\n');
+    assert.equal(code, 1, `${mode}: ${printed}`);
+    assert.deepEqual(c.lines.toSorted(), [
+      `✗ merge ${m} a.txt:2: e-mail address`,
+      `✗ merge ${m} late.txt:0: binary file — not scannable`,
+      `✗ merge ${m} new.txt:1: e-mail address`,
+    ], `${mode}: ${printed}`);
+  }
+});
+
+test('a binary file that a merge commit adds itself is a finding, and one it deletes is not', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await writeFile(join(dir, 'old.bin'), Buffer.from('old\0bin\n'));
+  const root = await commitAll(dir, 'root');
+  const merge = await mergeSide(dir, async () => {
+    await rm(join(dir, 'old.bin')); // deleting a binary publishes nothing
+    await writeFile(join(dir, 'new.bin'), Buffer.from('bin\0ary ' + LEAKY));
+  });
+  // the remote has the root commit, so the push is side, main and the merge
+  const push = async (binaryAllow) => {
+    const c = collect();
+    const stdin = Readable.from([`refs/heads/main ${merge} refs/heads/main ${root}\n`]);
+    const code = await runLeak(['--pre-push', 'origin', '--generic-only'], { cwd: dir, out: c.out, stdin, binaryAllow });
+    return { code, lines: c.lines, printed: c.lines.join('\n') };
+  };
+  const r = await push([]);
+  assert.equal(r.code, 1, r.printed);
+  assert.deepEqual(r.lines, [`✗ merge ${merge.slice(0, 7)} new.bin:0: binary file — not scannable`], r.printed);
+  assert.equal((await push(['new.bin'])).code, 0);
+});
+
+test('--history and --all leave a stash alone: local work that a push does not send', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await commitAll(dir, 'one');
+  await writeAll(dir, { 'a.txt': LEAKY }); // an unstaged edit, then stashed
+  await git(dir, 'stash', '--quiet');
+  for (const mode of ['--history', '--all']) {
+    const c = collect();
+    assert.equal(await runLeak([mode, '--generic-only'], { cwd: dir, out: c.out }), 0, `${mode}: ${c.lines.join('\n')}`);
+  }
+});
+
+test('an annotated tag is scanned: its tagger line and its message', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  const tip = await commitAll(dir, 'one');
+  await git(dir, 'update-ref', 'refs/remotes/origin/main', tip); // the commit itself is on the remote
+  await git(dir, '-c', 'user.email=' + 'bob' + AT + 'corp.ee', 'tag', '-a', '-m', 'release\n\n' + LEAKY, 'v1');
+  const tag = (await git(dir, 'rev-parse', 'v1')).trim();
+  const modes = [
+    { mode: '--all', args: ['--all'] },
+    { mode: '--history', args: ['--history'] },
+    { mode: '--pre-push', args: ['--pre-push', 'origin'], stdin: () => Readable.from([`refs/tags/v1 ${tag} refs/tags/v1 ${zeros(tag)}\n`]) },
+  ];
+  for (const { mode, args, stdin } of modes) {
+    const c = collect();
+    const code = await runLeak([...args, '--generic-only'], { cwd: dir, out: c.out, stdin: stdin?.() });
+    const printed = c.lines.join('\n');
+    assert.equal(code, 1, `${mode}: ${printed}`);
+    // line 1 object, 2 type, 3 tag name, 4 tagger, 5 blank, 6 subject, 7 blank, 8 the address
+    assert.deepEqual(c.lines, [`✗ tag ${tag.slice(0, 7)}:4: e-mail address`, `✗ tag ${tag.slice(0, 7)}:8: e-mail address`], `${mode}: ${printed}`);
+  }
+});
+
+test('a blob or a tree that a ref or a tag names is scanned, through nested tags too', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  const tip = await commitAll(dir, 'one');
+  await git(dir, 'update-ref', 'refs/remotes/origin/main', tip);
+  const loose = join(await tempDir(), 'loose.txt');
+  await writeFile(loose, 'blob ' + LEAKY);
+  const blob = (await git(dir, 'hash-object', '-w', loose)).trim();
+  await writeAll(dir, { 'in-tree.txt': 'tree ' + LEAKY });
+  await git(dir, 'add', 'in-tree.txt');
+  const tree = (await git(dir, 'write-tree')).trim(); // a tree no commit has
+  await git(dir, 'rm', '--quiet', '--cached', 'in-tree.txt');
+  await rm(join(dir, 'in-tree.txt'));
+  await git(dir, 'tag', 'plain', blob); // a lightweight tag: the ref names the blob itself
+  await git(dir, 'tag', '-a', '-m', 'a tree', 'tree-tag', tree);
+  await git(dir, 'tag', '-a', '-m', 'inner', 'inner', blob);
+  await git(dir, 'tag', '-a', '-m', 'outer', 'outer', 'inner');
+  await git(dir, 'tag', '-d', 'inner'); // only the outer tag still leads to it
+  const refs = await Promise.all(['plain', 'tree-tag', 'outer'].map(async (t) => [t, (await git(dir, 'rev-parse', t)).trim()]));
+  const pushLines = refs.map(([t, sha]) => `refs/tags/${t} ${sha} refs/tags/${t} ${zeros(sha)}\n`);
+  for (const [mode, args, stdin] of [['--all', ['--all']], ['--history', ['--history']], ['--pre-push', ['--pre-push', 'origin'], pushLines]]) {
+    const c = collect();
+    const code = await runLeak([...args, '--generic-only'], { cwd: dir, out: c.out, stdin: stdin && Readable.from(stdin) });
+    const printed = c.lines.join('\n');
+    assert.equal(code, 1, `${mode}: ${printed}`);
+    assert.deepEqual(c.lines.toSorted(), [`✗ blob ${blob.slice(0, 7)}:1: e-mail address`, '✗ in-tree.txt:1: e-mail address'], `${mode}: ${printed}`);
+  }
+});
+
+test('a denylisted term with non-ASCII letters in a file name is found in history (core.quotePath)', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await git(dir, 'config', 'core.quotePath', 'true'); // git's default, pinned against the user's own config
+  await commitAll(dir, 'one');
+  await writeAll(dir, { 'zebrä-notes.txt': 'clean\n' });
+  const tip = await commitAll(dir, 'two');
+  for (const { mode, args, stdin } of commitModes(tip).filter((m) => m.mode !== '--all')) {
+    const r = await leakWithDenylist(dir, args, ['zebrä'], stdin?.());
+    assert.equal(r.code, 1, `${mode}: ${r.printed}`);
+    assert.ok(commitFindings(r.lines, tip, 'denylist').length > 0, `${mode}: ${r.printed}`);
+  }
+});
+
+// --- local state and config -------------------------------------------------------------------
+// What a push sends is the stored objects. A clone's own state (replace refs, grafts) or config
+// (log.showRoot, textconv, diff.relative, message encodings) must not change what the scan reads.
+
+async function expectLeakIn(dir, sha, modes, { cwd = dir } = {}) {
+  for (const { mode, args, stdin } of modes) {
+    const c = collect();
+    const code = await runLeak([...args, '--generic-only'], { cwd, out: c.out, stdin: stdin?.() });
+    const printed = c.lines.join('\n');
+    assert.equal(code, 1, `${mode}: ${printed}`);
+    assert.ok(commitFindings(c.lines, sha, 'e-mail address').length > 0, `${mode}: ${printed}`);
+  }
+}
+
+test('replace refs hide nothing: the scan reads the commits and blobs a push sends', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await commitAll(dir, 'one');
+  await writeAll(dir, { 'b.txt': LEAKY });
+  const leaky = await commitAll(dir, 'two ' + LEAKY);
+  const leakyBlob = (await git(dir, 'rev-parse', ':b.txt')).trim();
+  const stand = join(await tempDir(), 'clean.txt');
+  await writeFile(stand, 'clean\n');
+  const cleanBlob = (await git(dir, 'hash-object', '-w', stand)).trim();
+  const cleanCommit = (await git(dir, 'commit-tree', '-p', 'HEAD^', '-m', 'two', 'HEAD^^{tree}')).trim();
+  await git(dir, 'replace', leaky, cleanCommit);
+  await git(dir, 'replace', leakyBlob, cleanBlob);
+  await expectLeakIn(dir, leaky, commitModes(leaky));
+  const c = collect();
+  await runLeak(['--all', '--generic-only'], { cwd: dir, out: c.out });
+  assert.ok(c.lines.includes('✗ b.txt:1: e-mail address'), c.lines.join('\n')); // the committed blob itself
+
+  await writeAll(dir, { 'staged.txt': 'staged ' + LEAKY }); // a blob of its own
+  await git(dir, 'add', 'staged.txt');
+  await git(dir, 'replace', (await git(dir, 'rev-parse', ':staged.txt')).trim(), cleanBlob);
+  const s = collect();
+  assert.equal(await runLeak(['--staged', '--generic-only'], { cwd: dir, out: s.out }), 1, s.lines.join('\n'));
+  assert.ok(s.lines.includes('✗ staged.txt:1: e-mail address'), s.lines.join('\n'));
+});
+
+test('grafts hide nothing: every commit a push sends is scanned', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  const base = await commitAll(dir, 'one');
+  await writeAll(dir, { 'b.txt': LEAKY });
+  const leaky = await commitAll(dir, 'two');
+  await writeAll(dir, { 'b.txt': 'clean\n' });
+  const tip = await commitAll(dir, 'three');
+  await writeFile(join(dir, '.git', 'info', 'grafts'), `${tip} ${base}\n`); // "three" claims "one" as its parent
+  const pushFrom = (remoteSha) => () => Readable.from([`refs/heads/main ${tip} refs/heads/main ${remoteSha}\n`]);
+  await expectLeakIn(dir, leaky, [
+    { mode: '--history', args: ['--history'] },
+    { mode: '--pre-push (remote at "one")', args: ['--pre-push', 'origin'], stdin: pushFrom(base) },
+    { mode: '--pre-push (new branch)', args: ['--pre-push', 'origin'], stdin: pushFrom(zeros(tip)) },
+  ]);
+});
+
+test('diff.srcPrefix and diff.dstPrefix hide nothing: a binary file at dev/null is still a finding', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await commitAll(dir, 'one');
+  await git(dir, 'config', 'diff.dstPrefix', '/'); // "b/dev/null" would read "/dev/null", as for a deleted file
+  await mkdir(join(dir, 'dev'));
+  await writeFile(join(dir, 'dev', 'null'), Buffer.from('bin\0ary ' + LEAKY));
+  const tip = await commitAll(dir, 'two');
+  for (const { mode, args, stdin } of commitModes(tip).filter((m) => m.mode !== '--all')) {
+    const c = collect();
+    const code = await runLeak([...args, '--generic-only'], { cwd: dir, out: c.out, stdin: stdin?.() });
+    assert.equal(code, 1, `${mode}: ${c.lines.join('\n')}`);
+    assert.equal(commitFindings(c.lines, tip, 'binary file — not scannable').length, 1, `${mode}: ${c.lines.join('\n')}`);
+  }
+});
+
+test("log.showRoot=false hides nothing: the root commit's patch is scanned", async () => {
+  const dir = await scratchRepo({ 'a.txt': LEAKY });
+  await git(dir, 'config', 'log.showRoot', 'false');
+  const root = await commitAll(dir, 'root');
+  await expectLeakIn(dir, root, commitModes(root).filter((m) => m.mode !== '--all'));
+});
+
+test('a textconv driver hides nothing: the patch shows the stored text', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await commitAll(dir, 'one');
+  await writeFile(join(dir, '.git', 'info', 'attributes'), '*.txt diff=blank\n');
+  await git(dir, 'config', 'diff.blank.textconv', 'true'); // shows every file as empty
+  await writeAll(dir, { 'b.txt': LEAKY });
+  const tip = await commitAll(dir, 'two');
+  await expectLeakIn(dir, tip, commitModes(tip).filter((m) => m.mode !== '--all'));
+});
+
+test('diff.relative hides nothing when the guard runs in a subdirectory', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  await mkdir(join(dir, 'sub'));
+  await writeAll(dir, { 'sub/s.txt': 'clean\n' });
+  await commitAll(dir, 'one');
+  await git(dir, 'config', 'diff.relative', 'true');
+  await writeAll(dir, { 'b.txt': LEAKY });
+  const tip = await commitAll(dir, 'two');
+  await expectLeakIn(dir, tip, commitModes(tip).filter((m) => m.mode !== '--all'), { cwd: join(dir, 'sub') });
+});
+
+test('i18n.logOutputEncoding does not change what is scanned', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  const tip = await commitWithMessageFile(dir, `subject\n\n${LEAKY}`);
+  await git(dir, 'config', 'i18n.logOutputEncoding', 'UTF-16');
+  for (const { mode, args, stdin } of commitModes(tip)) {
+    const c = collect();
+    const code = await runLeak([...args, '--generic-only'], { cwd: dir, out: c.out, stdin: stdin?.() });
+    assert.equal(code, 1, `${mode}: ${c.lines.join('\n')}`);
+    assert.ok(c.lines.includes(`✗ commit ${tip.slice(0, 7)}:5: e-mail address`), `${mode}: ${c.lines.join('\n')}`);
+  }
+});
+
+test('a commit message stored in another encoding is a finding: git would show it re-encoded', async () => {
+  const dir = await scratchRepo({ 'a.txt': 'clean\n' });
+  const file = join(await tempDir(), 'message');
+  await writeFile(file, `subject ${LEAKY}`);
+  // EBCDIC: re-encoded for display, the ASCII text of the message and of the author line is gone
+  await git(dir, '-c', 'i18n.commitEncoding=CP037', 'commit', '--quiet', '--allow-empty', '-F', file);
+  const tip = (await git(dir, 'rev-parse', 'HEAD')).trim();
+  for (const config of ['made elsewhere', 'still configured']) {
+    if (config === 'still configured') await git(dir, 'config', 'i18n.commitEncoding', 'CP037');
+    for (const { mode, args, stdin } of commitModes(tip)) {
+      const c = collect();
+      const code = await runLeak([...args, '--generic-only'], { cwd: dir, out: c.out, stdin: stdin?.() });
+      const printed = `${config}, ${mode}: ${c.lines.join('\n')}`;
+      assert.equal(code, 1, printed);
+      assert.ok(c.lines.includes(`✗ commit ${tip.slice(0, 7)}:0: message encoding is not UTF-8 — not scannable`), printed);
+    }
+  }
+});
+
+// --- sha256 repositories ----------------------------------------------------------------------
+
+test('a sha256 repository: line numbers hold, and a commit GitHub made keeps its exemption', async () => {
+  const dir = await scratchRepo({}, ['--object-format=sha256']);
+  await commitAs(dir, ACCOUNT_AUTHOR, GITHUB_COMMITTER, 'squash merge');
+  const tip = await commitWithMessageFile(dir, 'subject\n\nnotes about zelda\n');
+  assert.equal(tip.length, 64);
+  for (const { mode, args, stdin } of commitModes(tip)) {
+    const r = await leakWithDenylist(dir, args, ['zelda'], stdin?.());
+    assert.equal(r.code, 1, `${mode}: ${r.printed}`);
+    // line 1 author, 2 committer, 3 subject, 4 blank, 5 the term; the GitHub-made commit is clean
+    assert.deepEqual(r.lines, [`✗ commit ${tip.slice(0, 7)}:5: denylist`], `${mode}: ${r.printed}`);
   }
 });
