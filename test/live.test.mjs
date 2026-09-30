@@ -66,3 +66,20 @@ test('newestVersion, previousCode and secretChangesBetween', () => {
   assert.deepEqual(secretChangesBetween(versions, 'v4', 'v2').map((v) => v.id), ['v3']);
   assert.deepEqual(secretChangesBetween(versions, 'v4', 'v3').map((v) => v.id), []);
 });
+
+test('previousCode falls back to older versions outside the deployment history, marked as never deployed', () => {
+  const versions = [ver(1, `sha:${A}`), ver(2, `sha:${B}`), ver(3, null, 'secret'), ver(4, `sha:${C}`)];
+  const deployments = [dep(4, 'v4', `sha:${C}`)];
+  const live = resolveLive({ deployments, versions });
+  assert.deepEqual(previousCode({ deployments, versions }, live), { versionId: 'v2', sha: B, created_on: at(2), deployed: false });
+});
+
+test('the fallback of previousCode ignores newer versions, versions with the live code, and versions of unknown code', () => {
+  const newer = [ver(1, `sha:${A}`), ver(2, `sha:${B}`), ver(3, `sha:${C}`)];
+  const live = resolveLive({ deployments: [dep(2, 'v2', `sha:${B}`)], versions: newer });
+  assert.deepEqual(previousCode({ deployments: [dep(2, 'v2', `sha:${B}`)], versions: newer }, live), { versionId: 'v1', sha: A, created_on: at(1), deployed: false });
+  const same = [ver(1, `sha:${B}`), ver(2, `sha:${B}`)];
+  assert.equal(previousCode({ deployments: [dep(2, 'v2', `sha:${B}`)], versions: same }, { state: 'known', sha: B, versionId: 'v2' }), null);
+  const unknown = [ver(1, 'made by hand'), ver(2, `sha:${B}`)];
+  assert.equal(previousCode({ deployments: [dep(2, 'v2', `sha:${B}`)], versions: unknown }, { state: 'known', sha: B, versionId: 'v2' }), null);
+});

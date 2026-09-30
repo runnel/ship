@@ -2,9 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { access, readFile, mkdir, readdir, utimes } from 'node:fs/promises';
 import { join } from 'node:path';
-import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile, isAncestor, listTree, commitsTouching, subject } from '../lib/git.mjs';
+import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile, isAncestor, listTree, commitsTouching, subject, lastCommitBefore } from '../lib/git.mjs';
 import { validateConfig } from '../lib/config.mjs';
 import { classify } from '../lib/classify.mjs';
+import { capture } from '../lib/proc.mjs';
 import { makeOrigin, commitFiles, git, tempDir } from './helpers.mjs';
 
 async function branchAndMain({ feat, main }) {
@@ -178,4 +179,20 @@ test('isAncestor, listTree, commitsTouching, subject', async () => {
   assert.deepEqual((await commitsTouching(mirror, first, head, ['app/**', 'db/*.sql'])).map((c) => c.subject), ['add migration (#13)', 'app change (#11)']);
   assert.equal(await subject(mirror, head), 'add migration (#13)');
   assert.equal(await subject(mirror, 'f'.repeat(40)), null);
+});
+
+test('lastCommitBefore answers the newest commit made before a moment, or null', async () => {
+  const dir = await tempDir('dated-');
+  await git(['init', '--quiet', '--initial-branch=main', dir]);
+  const commit = async (file, iso) => {
+    await commitFiles(dir, { [file]: 'x\n' }, file); // the message is the file name; the date is set below
+    await capture('git', ['commit', '--quiet', '--amend', '--no-edit', '--date', iso], { cwd: dir, env: { ...process.env, GIT_COMMITTER_DATE: iso, GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@localhost', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@localhost' } });
+    return (await git(['rev-parse', 'HEAD'], dir)).trim();
+  };
+  const one = await commit('one.txt', '2026-01-01T00:00:10Z');
+  const two = await commit('two.txt', '2026-01-01T00:00:20Z');
+  const gitDir = join(dir, '.git');
+  assert.equal(await lastCommitBefore(gitDir, 'refs/heads/main', '2026-01-01T00:00:05.000Z'), null);
+  assert.equal(await lastCommitBefore(gitDir, 'refs/heads/main', '2026-01-01T00:00:15.123456Z'), one);
+  assert.equal(await lastCommitBefore(gitDir, 'refs/heads/main', '2026-01-01T00:00:30.000Z'), two);
 });
