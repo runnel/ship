@@ -234,3 +234,13 @@ test('the pull request\'s own config runs outside ship\'s process and without it
     delete process.env.SHIP_TEST_CALLER_SECRET;
   }
 });
+
+test('a pull request config that ignores SIGTERM cannot hang the check: it is killed and main\'s verdict stands', { timeout: 60_000 }, async () => {
+  // A busy loop with a SIGTERM handler installed: the signal is never acted on, only SIGKILL ends it.
+  const hostile = "process.on('SIGTERM', () => {});\nfor (;;) {}\nexport default {};\n";
+  const s = await setup({ configText: importConfig(['src/**']), mainFiles: MAIN_VIOLATES, featFiles: { 'ship.config.mjs': hostile } });
+  const started = Date.now();
+  assert.equal(await runCheck({ cwd: s.work, deps: { ...s.deps, treeConfigTimeoutMs: 1500 } }), 1);
+  assert.ok(Date.now() - started < 30_000, `took ${Date.now() - started} ms`);
+  assert.match((await lastStatus(s)).description, /deployable w imports lib\/y.ts/);
+});
