@@ -181,18 +181,45 @@ test('isAncestor, listTree, commitsTouching, subject', async () => {
   assert.equal(await subject(mirror, 'f'.repeat(40)), null);
 });
 
-test('lastCommitBefore answers the newest commit made before a moment, or null', async () => {
+// A repository on main whose commits carry the dates given; `commit` moves the current branch.
+async function datedRepo() {
   const dir = await tempDir('dated-');
   await git(['init', '--quiet', '--initial-branch=main', dir]);
-  const commit = async (file, iso) => {
-    await commitFiles(dir, { [file]: 'x\n' }, file); // the message is the file name; the date is set below
-    await capture('git', ['commit', '--quiet', '--amend', '--no-edit', '--date', iso], { cwd: dir, env: { ...process.env, GIT_COMMITTER_DATE: iso, GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@localhost', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@localhost' } });
-    return (await git(['rev-parse', 'HEAD'], dir)).trim();
+  const env = (iso) => ({ ...process.env, GIT_AUTHOR_DATE: iso, GIT_COMMITTER_DATE: iso, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@localhost', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@localhost' });
+  const head = async () => (await git(['rev-parse', 'HEAD'], dir)).trim();
+  return {
+    gitDir: join(dir, '.git'),
+    head,
+    switchTo: (branch, create = false) => git(['checkout', '--quiet', ...(create ? ['-b'] : []), branch], dir),
+    async commit(file, iso) {
+      await commitFiles(dir, { [file]: 'x\n' }, file);
+      await capture('git', ['commit', '--quiet', '--amend', '--no-edit'], { cwd: dir, env: env(iso) });
+      return head();
+    },
+    async merge(branch, iso) {
+      await capture('git', ['merge', '--quiet', '--no-ff', '-m', `merge ${branch}`, branch], { cwd: dir, env: env(iso) });
+      return head();
+    },
   };
-  const one = await commit('one.txt', '2026-01-01T00:00:10Z');
-  const two = await commit('two.txt', '2026-01-01T00:00:20Z');
-  const gitDir = join(dir, '.git');
-  assert.equal(await lastCommitBefore(gitDir, 'refs/heads/main', '2026-01-01T00:00:05.000Z'), null);
-  assert.equal(await lastCommitBefore(gitDir, 'refs/heads/main', '2026-01-01T00:00:15.123456Z'), one);
-  assert.equal(await lastCommitBefore(gitDir, 'refs/heads/main', '2026-01-01T00:00:30.000Z'), two);
+}
+
+test('lastCommitBefore answers the newest commit made before a moment, or null', async () => {
+  const repo = await datedRepo();
+  const one = await repo.commit('one.txt', '2026-01-01T00:00:10Z');
+  const two = await repo.commit('two.txt', '2026-01-01T00:00:20Z');
+  assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:05.000Z'), null);
+  assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:15.123456Z'), one);
+  assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:30.000Z'), two);
+});
+
+test('lastCommitBefore follows the first parents: a side commit merged later is not what main held', async () => {
+  const repo = await datedRepo();
+  const main1 = await repo.commit('main1.txt', '2026-01-01T00:00:10Z');
+  await repo.switchTo('feat', true);
+  const feat1 = await repo.commit('feat1.txt', '2026-01-01T00:00:20Z');
+  await repo.switchTo('main');
+  const merged = await repo.merge('feat', '2026-01-01T00:00:40Z');
+  assert.notEqual(feat1, main1);
+  assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:30Z'), main1);
+  assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:50Z'), merged);
 });

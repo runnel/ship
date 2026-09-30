@@ -4,6 +4,7 @@ import { readAcks, readHold, writeHold } from '../lib/state.mjs';
 import { runAck, runAdopt, runRollback, runUnhold } from '../lib/admin.mjs';
 import { runDeploy } from '../lib/deploy.mjs';
 import { at, setupDeploy } from './deploy-fixture.mjs';
+import { commitFiles, git } from './helpers.mjs';
 
 const posts = (cloud) => cloud.apiCalls.filter((c) => c.method === 'POST').map((c) => c.body.annotations['workers/message']);
 
@@ -218,4 +219,40 @@ test('migrations ack is all or nothing, prefers an exact path to a bare name, an
   assert.equal(await runAck({ cwd: s.work, files: ['db/001.sql'], deps }), 0);
   assert.match(s.lines.join('\n'), /✓ cleared for deploy: \(already cleared\)/);
   assert.deepEqual([...(await readAcks(s.deps.stateRoot, 't/r'))], ['db/001.sql']);
+});
+
+test('adopt refuses a real commit that is only on a side branch', async () => {
+  const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }) });
+  await git(['checkout', '--quiet', '-b', 'side'], s.work);
+  const side = await commitFiles(s.work, { 'app/src/side.ts': 's\n' }, 'only on a side branch');
+  await git(['push', '--quiet', s.deps.remoteUrl(), 'side'], s.work);
+  await git(['checkout', '--quiet', 'main'], s.work);
+  assert.equal(await runAdopt({ cwd: s.work, at: side, all: true, deps: s.deps }), 2);
+  assert.match(s.lines.join('\n'), new RegExp(`✗ ${side.slice(0, 7)} is not on main`));
+  assert.deepEqual(posts(s.cloud), []);
+  assert.deepEqual([...(await readAcks(s.deps.stateRoot, 't/r'))], []);
+});
+
+test('adopt --plan does not guess from a version made by wrangler versions secret put', async () => {
+  const s = await setupDeploy({ clockStart: Date.now() + 60_000, seed: () => ({
+    'example-app': { versions: [{ message: 'by hand' }, { message: 'Updated secret "K"' }], deployments: [{ versionId: null }] },
+    'example-tick': { versions: [{ message: 'Updated secret "K"' }, { triggered: 'secret' }], deployments: [{ versionId: null }] } }) });
+  assert.equal(await runAdopt({ cwd: s.work, plan: true, deps: s.deps }), 0);
+  const text = s.lines.join('\n');
+  assert.match(text, /\? app: its live version was made by `wrangler versions secret put` — name the commit yourself/);
+  assert.match(text, /\? tick: its live version was made by `wrangler versions secret put` — name the commit yourself/);
+  assert.doesNotMatch(text, /code uploaded|ship adopt --at/);
+});
+
+test('rollback says when the secret changes between the two versions cannot be counted', async () => {
+  // 201 versions: the read history (200) ends above the live version, which is the oldest.
+  const s = await setupDeploy({ seed: ({ first }) => ({
+    'example-app': {
+      versions: Array.from({ length: 201 }, (_, i) => (i === 0 ? { id: 'live-outside-history', message: 'by hand' } : i === 100 ? { message: `sha:${first} old` } : {})),
+      deployments: [{ versionId: 'live-outside-history' }] },
+    'example-tick': at(first) }) });
+  const to = await versionPrefix(s.cloud, 'example-app', 100);
+  assert.equal(await runRollback({ cwd: s.work, name: 'app', to, deps: s.deps }), 0, s.lines.join('\n'));
+  assert.match(s.lines.join('\n'), /! secret changes between the two could not be counted; if Cloudflare refuses with 10220, add --revert-secrets/);
+  assert.equal(posts(s.cloud).at(-1), `sha:${s.first} rollback`);
 });

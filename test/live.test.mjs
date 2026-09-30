@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { codeSha, newestVersion, parseSha, previousCode, resolveLive, secretChangesBetween } from '../lib/live.mjs';
+import { codeSha, madeBySecretPut, newestVersion, parseSha, previousCode, resolveLive, secretChangesBetween } from '../lib/live.mjs';
 
 const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
@@ -82,4 +82,18 @@ test('the fallback of previousCode ignores newer versions, versions with the liv
   assert.equal(previousCode({ deployments: [dep(2, 'v2', `sha:${B}`)], versions: same }, { state: 'known', sha: B, versionId: 'v2' }), null);
   const unknown = [ver(1, 'made by hand'), ver(2, `sha:${B}`)];
   assert.equal(previousCode({ deployments: [dep(2, 'v2', `sha:${B}`)], versions: unknown }, { state: 'known', sha: B, versionId: 'v2' }), null);
+});
+
+test('secret changes cannot be counted when either version is outside the history that was read', () => {
+  const versions = [ver(3, `sha:${A}`), ver(4, null, 'secret')];
+  assert.equal(secretChangesBetween(versions, 'v4', 'v1'), null);
+  assert.equal(secretChangesBetween(versions, 'v1', 'v3'), null);
+  assert.deepEqual(secretChangesBetween(versions, 'v4', 'v3').map((v) => v.id), ['v4']);
+});
+
+test('a version made by wrangler versions secret put is recognised by its message', () => {
+  assert.equal(madeBySecretPut(ver(2, 'Updated secret "K"')), true);
+  assert.equal(madeBySecretPut(ver(2, `sha:${A} app`)), false);
+  assert.equal(madeBySecretPut(ver(2, null, 'secret')), false);
+  assert.equal(madeBySecretPut({}), false);
 });
