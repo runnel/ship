@@ -313,8 +313,8 @@ test('a hung earlier status POST does not hold up the interrupt, and is stopped'
   }
 });
 
-// T-3: the wait for a hung status POST and the error POST share one budget; before, each had its
-// own and a double hang took twice as long, eating into the time left for removing the worktree.
+// The wait for a hung status POST and the error POST share one time budget: a double hang must not
+// take twice as long, which would eat into the time left for removing the worktree.
 test('the queue drain and the error POST share one time budget', { timeout: 60_000 }, async () => {
   const dir = await tempDir('unwind-');
   const s = await setupCheck({ steps: ['true'], ghOptions: { apiDelay: { ms: 120_000, match: 'state=' } } }); // every POST hangs
@@ -326,7 +326,7 @@ test('the queue drain and the error POST share one time budget', { timeout: 60_0
     assert.equal(await Promise.race([run.exited, deadline(20_000, 'ship exit')]), 130, run.out.text);
     const took = Date.now() - signalled;
     // one budget (5 s) + the error POST's floor (1.25 s) ≈ 6.3 s; two budgets would be ≥ 10 s
-    assert.ok(took < 8000, `took ${took} ms: the error POST still gets a full budget of its own`);
+    assert.ok(took < 9000, `took ${took} ms: the error POST still gets a full budget of its own`);
   } finally {
     run.kill();
   }

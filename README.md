@@ -3,7 +3,8 @@
 A local CI gate for solo developers who work on one machine: `ship check` checks a pull request
 merged with the current main branch in a fresh worktree and posts a GitHub commit status
 `local-ci`, which branch protection can require. Your checks run on your own hardware; GitHub
-Actions is left for nightly clean runs.
+Actions is left for nightly clean runs. The same gate can ship Cloudflare Workers from the main
+branch: see [Deploy](#deploy-cloudflare-workers).
 
 ## Install
 
@@ -76,10 +77,12 @@ ship check            # the PR of the current branch
 ship check --pr 42
 ```
 
+Deploying Workers (`ship deploy`, `ship status`, ...) is described under [Deploy](#deploy-cloudflare-workers).
+
 `ship check` checks the pull request head as GitHub has it, merged with main: push first, local
 commits are not checked. Pull requests that are not open, that come from a fork, or that target a
 branch other than the default one are refused (exit 2, no status). Exit codes: 0 success, 1
-failure or error, 2 refused, 130 interrupted.
+failure or error, 2 refused or a usage error, 130 interrupted.
 
 Output is one line per step; on failure the last lines of the failing step and the full log path
 under `~/.ship/logs/`. A step that outlives its `timeoutMin` is killed together with everything it
@@ -115,19 +118,22 @@ dependency order, from a fresh worktree of the main branch, on your machine.
 
 | Command | What it does | Allowlist for an agent |
 |---|---|---|
-| `ship deploy [<name>…] [--dry-run]` | Deploy every deployable (or the named ones) whose files changed since its live commit. `--dry-run` runs the gates, checks and builds, and uploads nothing. | yes |
-| `ship deploy --redeploy <name>…` | Deploy the named deployables even when nothing changed (same code again). | yes |
+| `ship deploy [<name>…] [--dry-run]` | Deploy every deployable (or the named ones) whose files changed since its live commit. `--dry-run` runs the gates, setup, checks, builds and `preDeploy` steps, uploads nothing, and exits 0 when all of that passed. | yes |
+| `ship deploy --redeploy <name>…` | Deploy the named deployables even when nothing changed (same code again). The names are required. | yes |
 | `ship status` | Per deployable: live commit, pending commits, holds, an undeployed newest version; migrations not cleared. Read-only. | yes |
-| `ship adopt --plan` | Read-only: per Worker, the main commit at the time its live code was uploaded, and the adopt commands for it. Skips Workers whose live commit is already known, and never guesses for a version made by `wrangler versions secret put`. | no |
-| `ship adopt --at <sha> (<name>… \| --all)` | Record that each Worker's current version was built from `<sha>` (7–40 hex digits, a commit on main); also records every migration file present at `<sha>` as cleared. | no |
+| `ship adopt --plan` | Read-only: per Worker, the main commit at the time its live code was uploaded, and the adopt commands for it. Skips Workers whose live commit is already known, in the repository and on main, and never guesses for a version made by `wrangler versions secret put`. | no |
+| `ship adopt --at <sha> (<name>… \| --all)` | Record that each Worker's current version was built from `<sha>` (7–40 hex digits, a commit on main): a new Cloudflare deployment of that version at 100%, annotated `sha:<sha> adopt`. A split deployment is refused, and so is a `<sha>` that would hide pending commits of a Worker whose live commit is known. Also records every migration file present at `<sha>` as cleared. See [Adopting](#adopting). | no |
 | `ship rollback <name>` | Show what a rollback would do and print the command for it. Read-only. | no |
-| `ship rollback <name> --to <version> [--revert-secrets]` | Set a hold, promote an earlier version (its id: at least 6 hex digits, the first 8 are enough) and probe it. | no |
+| `ship rollback <name> --to <version> [--revert-secrets]` | Set a hold, promote an earlier version (its id: at least 6 hex digits, the first 8 are enough; any version among the last 200 whose commit is known) and probe it. `--revert-secrets` sends the deployment with `?force=true`, so the rollback also undoes secret changes made since that version; without it Cloudflare refuses (error 10220). | no |
 | `ship unhold <name>` | Clear a hold. | no |
 | `ship migrations ack <file>…` | Mark migration files as cleared for deploy. A file is a repository path, or a bare file name when that is unambiguous. | no |
 
 The commands that are not allowlisted are the owner's: the permission prompt is the confirmation.
-ship itself never asks interactively. A bad flag or argument prints `✗ ship <command>: …` and the
-usage line, and exits 2.
+ship itself never asks interactively. Every usage error (an unknown flag, an extra or missing
+argument, a malformed value such as `--at zz`, `--redeploy` without names, an unknown deployable) prints
+`✗ ship <command>: <what is wrong>` on stderr and the command's usage line on stdout, and exits 2.
+A refusal that needs the repository (a commit that is not on main, a version that does not exist)
+says so in its own words and also exits 2.
 
 ### Configuration
 
@@ -164,15 +170,19 @@ export default {
 };
 ```
 
-Deployable keys (defaults in brackets): `name`, `worker` (the Cloudflare script name), `mode`
+Deployable keys (defaults in brackets): `name`, `worker` (the Cloudflare script name; the `name` in
+the wrangler config must be the same, or the deploy is refused before it builds), `mode`
 (`versioned` | `direct`), `paths`, `cwd` [`.`], `ignore` [none], `install`, `build`, `env`,
-`envFiles` (copied in for the build, removed after it), `bundleCheck` (at least one match, every
-match allowed), `wrangler` [`<cwd>/node_modules/.bin/wrangler`, relative to the repository root —
-must be the repo's locked copy], `wranglerConfig` [wrangler.json, wrangler.jsonc or wrangler.toml in
-`cwd`], `preDeploy`, `probes` (required for `versioned`), `liveHost`, `warmup`, `liveMarker`
-(versioned only), `after`, `timeoutMin` [30], `uploadTimeoutMin` [10]. A deployable's relative
-imports must stay inside its `paths` (`ship check` and `ship deploy` both enforce it), so a change
-to an imported file is never missed.
+`envFiles` (copied in after `install` and before `build`, removed after it), `bundleCheck` (at least
+one match, every match allowed), `wrangler` [`<cwd>/node_modules/.bin/wrangler`, relative to the
+repository root — must be the repo's locked copy], `wranglerConfig` [wrangler.json, wrangler.jsonc or
+wrangler.toml in `cwd`], `preDeploy`, `probes` (required for `versioned`; each `{ path, status,
+method, followRedirects }`, method `GET` [default], `HEAD` or `POST`, redirects not followed unless
+`followRedirects`), `liveHost` (`https://host`, required whenever there are `probes`), `warmup`,
+`liveMarker` (versioned only; `file` is read right after the build and must not be empty), `after`,
+`timeoutMin` [30], `uploadTimeoutMin` [10]. A `direct` deployable without `probes` gets no live
+probes, only the check that its new version is the current one. A deployable's relative imports must stay inside its `paths` (`ship check` and
+`ship deploy` both enforce it), so a change to an imported file is never missed.
 
 `credentials.file` is parsed (`KEY=value` lines), never sourced. `map` names the environment
 variables wrangler reads (`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are required) and the
@@ -189,6 +199,15 @@ version made outside ship (including `wrangler versions secret put`, which copie
 version whether or not it is deployed) or history beyond the last 50 deployments / 200 versions is
 **live unknown**: that deployable (and what comes after it) is not deployed until `ship adopt`.
 
+### Adopting
+
+`ship adopt --plan` suggests, per Worker, the main commit at the time its live code was uploaded
+(adopting it makes every later commit that touches the deployable pending). `ship adopt --at <sha>`
+stamps the current version as built from `<sha>`. A `<sha>` later than the code that is really live
+hides the commits in between from `ship deploy`; for a Worker whose live commit is already known
+that is refused (exit 1, the commits named, the migrations not recorded), while the same commit or an
+older one is fine.
+
 ### What `ship deploy` does
 
 1. Takes the repo's deploy lock (a second deploy waits), fetches the main branch, opens a fresh
@@ -197,21 +216,35 @@ version whether or not it is deployed) or history beyond the last 50 deployments
    whether any of its files changed since (minus `ignore` and `docsOnly`). Nothing pending: done.
 3. Migration files on main that are not cleared → stop. `requires` not live → stop.
 4. `deploySetup`, then every `onDeploy` check group; red → stop.
-5. Each pending deployable, dependencies first. `versioned`: refuses when a setting only
+5. Each pending deployable, dependencies first. Both modes refuse, before building, a wrangler
+   config whose `name` is not the deployable's `worker`. `versioned`: refuses when a setting only
    `wrangler deploy` applies differs (crons, routes, workers.dev and preview URLs, Durable Object
    migrations, observability, logpush, tail consumers); builds; `wrangler versions upload`; probes
    the preview URL; checks that live has not moved and that the newest version is ours; promotes.
    `direct`: builds; checks that live has not moved; `wrangler deploy`. Both: live probes, then
    (versioned, with a `liveMarker`) a check that the live host serves this build — a warning only.
+   The first deploy of a versioned deployable is the owner's: the Worker must exist and its preview
+   URLs must be on.
 6. A failing live probe sets a hold and rolls back to the previous version (not across a Durable
-   Object migration). A deployable that fails or is held stops the deployables that come `after`
-   it; the others go on.
+   Object migration, and never over a version that is not ours). A deployable that fails or is held
+   stops the deployables that come `after` it; the others go on. Naming a deployable whose `after`
+   dependency has pending changes skips it too, unless the dependency is named as well.
+
+### Holds
+
+A hold stops `ship deploy` from touching a deployable, and everything that comes `after` it, until
+the owner runs `ship unhold <name>`. Something sets one when it cannot say the Worker is in a good
+state: a failing live probe (before the rollback), `ship rollback --to`, an interrupt after the
+promote, a current version that is not ours right after the promote, an error after the promote, and
+`wrangler deploy` failing after our code went live. `ship status` lists them.
 
 ### Exit codes and state
 
-0 = every selected deployable is live at main; 1 = something failed, is held, blocked or skipped;
-2 = usage; 130 = interrupted. Holds live in `~/.ship/holds/`, the migration ack ledger in
-`~/.ship/acks/`, logs in `~/.ship/logs/`; locks, lanes and worktrees in `$SHIP_TMP`.
+`ship deploy` exits 0 when every selected deployable is live at main (with `--dry-run`: when
+everything it ran passed), 1 when something failed, is held, blocked or skipped, 2 on a usage
+error, 130 when interrupted. `ship status` exits 0 whatever it reports (1 when it cannot read the
+repository or Cloudflare, 2 on a usage error). Holds live in `~/.ship/holds/`, the migration ack
+ledger in `~/.ship/acks/`, logs in `~/.ship/logs/`; locks, lanes and worktrees in `$SHIP_TMP`.
 
 ## Licence
 
