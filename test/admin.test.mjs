@@ -1,10 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { readAcks, readHold, writeHold } from '../lib/state.mjs';
 import { runAck, runAdopt, runRollback, runUnhold } from '../lib/admin.mjs';
 import { runDeploy } from '../lib/deploy.mjs';
 import { at, setupDeploy } from './deploy-fixture.mjs';
-import { commitFiles, git } from './helpers.mjs';
+import { commitFiles, git, tempDir } from './helpers.mjs';
 
 const posts = (cloud) => cloud.apiCalls.filter((c) => c.method === 'POST').map((c) => c.body.annotations['workers/message']);
 
@@ -255,4 +259,100 @@ test('rollback says when the secret changes between the two versions cannot be c
   assert.equal(await runRollback({ cwd: s.work, name: 'app', to, deps: s.deps }), 0, s.lines.join('\n'));
   assert.match(s.lines.join('\n'), /! secret changes between the two could not be counted; if Cloudflare refuses with 10220, add --revert-secrets/);
   assert.equal(posts(s.cloud).at(-1), `sha:${s.first} rollback`);
+});
+
+test('adopt --at refuses a Worker whose known live commit it would advance past pending changes', async () => {
+  const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }), change: { 'app/src/a.ts': '2' } });
+  assert.equal(await runAdopt({ cwd: s.work, at: s.head, all: true, deps: s.deps }), 1);
+  const text = s.lines.join('\n');
+  assert.match(text, new RegExp(`✗ app: ${s.first.slice(0, 7)} is live and known; adopting ${s.head.slice(0, 7)} would hide 1 commit\\(s\\) that touch it \\(change \\(#9\\)\\)`));
+  // the other Worker has nothing pending, so it is adopted; the migrations are not recorded at a commit that was refused for one
+  assert.deepEqual(posts(s.cloud), [`sha:${s.head} adopt`]);
+  assert.match(text, /! migrations: not recorded/);
+  assert.deepEqual([...(await readAcks(s.deps.stateRoot, 't/r'))], []);
+  // what was refused is still pending: the deploy ships it (once the owner clears the migration)
+  assert.equal(await runAck({ cwd: s.work, files: ['001.sql'], deps: s.deps }), 0);
+  s.lines.length = 0;
+  assert.equal(await runDeploy({ cwd: s.work, deps: s.deps }), 0, s.lines.join('\n'));
+  assert.match(s.lines.join('\n'), /✓ app: [0-9a-f]{8} live at/);
+});
+
+test('adopt --at over a known live commit is fine for the same commit, an older one, and changes the deploy would not ship', async () => {
+  const ignored = await setupDeploy({ options: { appIgnore: "['app/docs/**']", docsOnly: "['*.md']" }, change: { 'app/docs/x.txt': '1', 'NOTES.md': '1' },
+    seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }) });
+  assert.equal(await runAdopt({ cwd: ignored.work, at: ignored.head, all: true, deps: ignored.deps }), 0, ignored.lines.join('\n'));
+  assert.equal(posts(ignored.cloud).length, 2);
+  const older = await setupDeploy({ change: { 'app/src/a.ts': '2' }, seed: ({ head }) => ({ 'example-app': at(head), 'example-tick': at(head) }) });
+  assert.equal(await runAdopt({ cwd: older.work, at: older.first, all: true, deps: older.deps }), 0, older.lines.join('\n'));
+  assert.equal(await runAdopt({ cwd: older.work, at: older.first, all: true, deps: older.deps }), 0, older.lines.join('\n'));
+  assert.deepEqual(posts(older.cloud), Array(4).fill(`sha:${older.first} adopt`));
+});
+
+test('adopt says whose first deploy it is when a Worker has no deployment', async () => {
+  const s = await setupDeploy({ seed: () => ({ 'example-app': { versions: [{}], deployments: [] }, 'example-tick': { versions: [{}], deployments: [] } }) });
+  assert.equal(await runAdopt({ cwd: s.work, at: s.first, all: true, deps: s.deps }), 0);
+  const text = s.lines.join('\n');
+  assert.match(text, /! app: example-app has no deployment — nothing to adopt \(the first deploy of a versioned deployable is the owner's\)/);
+  assert.match(text, /! tick: example-tick has no deployment — nothing to adopt \(ship deploy creates it\)/);
+});
+
+// runAdopt or runRollback in a child that gets SIGTERM once it has read Cloudflare's state for the
+// first time. Resolves to what the child reported: the exit code of the command, whether it still
+// asked Cloudflare for a deployment, and the hold it left.
+async function afterInterrupt(command) {
+  const dir = await tempDir('interrupted-');
+  const href = (p) => JSON.stringify(new URL(p, import.meta.url).href);
+  const script = join(dir, 'child.mjs');
+  const result = join(dir, 'result.json');
+  await writeFile(script, `
+import { writeFileSync } from 'node:fs';
+import { setupDeploy } from ${href('./deploy-fixture.mjs')};
+import { runAdopt, runRollback } from ${href('../lib/admin.mjs')};
+import { isInterrupted, onInterrupt } from ${href('../lib/interrupt.mjs')};
+import { readHold } from ${href('../lib/state.mjs')};
+
+const s = await setupDeploy({ change: { 'app/src/a.ts': '2' }, seed: ({ first, head }) => ({
+  'example-app': { versions: [{ message: 'sha:' + first + ' a' }, { message: 'sha:' + head + ' b' }], deployments: [{ versionId: null }] },
+  'example-tick': { versions: [{ message: 'sha:' + first + ' a' }], deployments: [{ versionId: null }] } }) });
+let posted = false;
+let armed = true;
+const fetch = async (url, init = {}) => {
+  if (init.method === 'POST') posted = true;
+  const res = await s.deps.fetch(url, init);
+  if (armed && (init.method ?? 'GET') === 'GET' && url.includes('/example-app/versions')) {
+    armed = false;
+    process.kill(process.pid, 'SIGTERM');
+    while (!isInterrupted()) await new Promise((r) => setTimeout(r, 5)); // the command goes on from here, interrupted
+  }
+  return res;
+};
+// Registered first, so it runs last in the unwind: the command below finishes before the process goes.
+onInterrupt(() => new Promise((r) => setTimeout(r, 2500)));
+const deps = { ...s.deps, fetch };
+const to = (await s.cloud.state('example-app')).versions[0].id.slice(0, 8);
+const code = ${command === 'adopt'
+    ? "await runAdopt({ cwd: s.work, at: s.head, names: ['app'], deps })"
+    : "await runRollback({ cwd: s.work, name: 'app', to, deps })"};
+writeFileSync(${JSON.stringify(result)}, JSON.stringify({ code, posted, lines: s.lines, hold: await readHold(s.deps.stateRoot, 't/r', 'app') }));
+`);
+  const child = spawn(process.execPath, [script], { stdio: ['ignore', 'inherit', 'inherit'] });
+  const [code] = await Promise.race([once(child, 'exit'), new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not exit')), 30_000).unref())]);
+  child.kill('SIGKILL');
+  const report = JSON.parse(await readFile(result, 'utf8').catch(() => 'null') ?? 'null');
+  assert.ok(report, 'the command did not finish before the process went');
+  return { exit: code, ...report };
+}
+
+test('adopt and rollback --to promote nothing once ship is interrupted', { timeout: 60_000 }, async () => {
+  const adopt = await afterInterrupt('adopt');
+  assert.equal(adopt.exit, 130);
+  assert.equal(adopt.posted, false, adopt.lines.join('\n'));
+  assert.notEqual(adopt.code, 0);
+  assert.match(adopt.lines.join('\n'), /✗ app: interrupted before promoting; nothing changed/);
+  const rollback = await afterInterrupt('rollback');
+  assert.equal(rollback.exit, 130);
+  assert.equal(rollback.posted, false, rollback.lines.join('\n'));
+  assert.notEqual(rollback.code, 0);
+  assert.match(rollback.lines.join('\n'), /✗ app: interrupted before promoting; nothing changed/);
+  assert.equal(rollback.hold, null, 'the hold ship wrote for the rollback is taken back');
 });

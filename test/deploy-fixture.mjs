@@ -3,17 +3,19 @@ import { commitFiles, fakeGh, git, makeOrigin, tempDir } from './helpers.mjs';
 import { runDeploy } from '../lib/deploy.mjs';
 import { fakeCloud } from './fake-cloud.mjs';
 
+// `docsOnly` and `appIgnore` are JS array literals for the config's docsOnly and the app's ignore.
 // `third: true` adds `job`, a direct deployable that depends on nothing (its files and Worker are
 // added by setupDeploy; the seed must name example-job).
-export const configText = (bin, { guard = 'test -x tools/wrangler', tickPaths = "['workers/tick/**']", requires = '[]', migrationPaths = "['db/*.sql']", third = false } = {}) => `export default {
+export const configText = (bin, { guard = 'test -x tools/wrangler', tickPaths = "['workers/tick/**']", requires = '[]', migrationPaths = "['db/*.sql']", third = false, docsOnly = '[]', appIgnore = '[]' } = {}) => `export default {
   repo: 't/r',
+  docsOnly: ${docsOnly},
   checks: [
     { name: 'unit', paths: ['**'], steps: ['true'] },
     { name: 'guard', paths: ['workers/**'], onDeploy: true, steps: [${JSON.stringify(guard)}] },
   ],
   deploySetup: ['mkdir -p tools && cp ${bin} tools/wrangler'],
   deployables: [
-    { name: 'app', worker: 'example-app', cwd: 'app', paths: ['app/**'], mode: 'versioned', wrangler: 'tools/wrangler',
+    { name: 'app', worker: 'example-app', cwd: 'app', paths: ['app/**'], ignore: ${appIgnore}, mode: 'versioned', wrangler: 'tools/wrangler',
       build: 'mkdir -p .next && echo BUILD42 > .next/BUILD_ID',
       probes: [{ path: '/health', status: 200 }], liveHost: 'https://app.example.com', liveMarker: { path: '/login', file: '.next/BUILD_ID' } },
     { name: 'tick', worker: 'example-tick', cwd: 'workers/tick', paths: ${tickPaths}, mode: 'direct', wrangler: 'tools/wrangler',
