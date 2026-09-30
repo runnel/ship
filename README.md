@@ -23,7 +23,10 @@ repository git needs credentials for that: run `gh auth setup-git` once.
 
 Add `ship.config.mjs` at the repository root. The config is always read from the main branch,
 so a pull request cannot weaken its own gate. The one exception is the pull request that adopts
-ship, when main has no config yet: it is checked with its own, and ship says so.
+ship, when main has no config yet: it is checked with its own, and ship says so. The other thing
+taken from the pull request's own config is a deployable's `paths` in the import containment check
+(so a pull request that widens them can pass when main already violates them); that file is
+evaluated in a child process with the same minimal environment as the check steps.
 
 The default export may be an object, or a function `({ root }) => config`. The config is evaluated
 from a temporary copy, so it cannot `import` files of the repository or its packages; read what
@@ -125,7 +128,7 @@ dependency order, from a fresh worktree of the main branch, on your machine.
 | `ship adopt --at <sha> (<name>… \| --all)` | Record that each Worker's current version was built from `<sha>` (7–40 hex digits, a commit on main): a new Cloudflare deployment of that version at 100%, annotated `sha:<sha> adopt`. A split deployment is refused, and so is a `<sha>` that would hide pending commits of a Worker whose live commit is known. Also records every migration file present at `<sha>` as cleared. See [Adopting](#adopting). | no |
 | `ship rollback <name>` | Show what a rollback would do and print the command for it. Read-only. | no |
 | `ship rollback <name> --to <version> [--revert-secrets]` | Set a hold, promote an earlier version (its id: at least 6 hex digits, the first 8 are enough; any version among the last 200 whose commit is known) and probe it. `--revert-secrets` sends the deployment with `?force=true`, so the rollback also undoes secret changes made since that version; without it Cloudflare refuses (error 10220). | no |
-| `ship unhold <name>` | Clear a hold. | no |
+| `ship unhold <name>` | Clear a hold. It works from the state directory alone (offline), so it cannot know the config's names: a name without a hold is reported as "no hold" (with the names that are held) and exits 0. | no |
 | `ship migrations ack <file>…` | Mark migration files as cleared for deploy. A file is a repository path, or a bare file name when that is unambiguous. | no |
 
 The commands that are not allowlisted are the owner's: the permission prompt is the confirmation.
@@ -181,12 +184,17 @@ method, followRedirects }`, method `GET` [default], `HEAD` or `POST`, redirects 
 `followRedirects`), `liveHost` (`https://host`, required whenever there are `probes`), `warmup`,
 `liveMarker` (versioned only; `file` is read right after the build and must not be empty), `after`,
 `timeoutMin` [30], `uploadTimeoutMin` [10]. A `direct` deployable without `probes` gets no live
-probes, only the check that its new version is the current one. A deployable's relative imports must stay inside its `paths` (`ship check` and
-`ship deploy` both enforce it), so a change to an imported file is never missed.
+probes, only the check that its new version is the current one. A deployable's relative imports must
+stay inside its `paths` and must not reach a file its `ignore` or the repo's `docsOnly` lists (a
+change there would never make it pending): `ship check` and `ship deploy` both enforce it, so a
+change to an imported file is never missed.
 
 `credentials.file` is parsed (`KEY=value` lines), never sourced. `map` names the environment
 variables wrangler reads (`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are required) and the
-file keys they come from; only those reach wrangler, and no build or check step sees them.
+file keys they come from; only those reach wrangler, and no build or check step of ship sees them.
+A `[build] command` in a wrangler config runs inside `wrangler deploy` (or `versions upload`), so it
+does see them. `requires` loads the other repository's `ship.config.mjs` from its main branch and
+evaluates it in ship's own process: list only repositories you trust.
 
 ### The live commit
 
@@ -244,6 +252,17 @@ passed, so a ship that is killed outright in between (`kill -9`, out of memory, 
 next run would take for verified. Look at the Worker, then `ship unhold <name>`. A deploy that fails
 before anything changed on the Worker leaves no hold, and if the hold cannot be written the deploy
 does not promote.
+
+### When a versioned deploy refuses
+
+A versioned deploy uploads a version and promotes it; it never applies the settings that only
+`wrangler deploy` applies, and it refuses when they differ instead of leaving them silently stale:
+`triggers.crons`, `workers_dev` and `preview_urls` against the Worker's actual state, and `routes`,
+Durable Object migrations, `logpush`, tail consumers and `observability` against the live commit's
+config. The owner applies such a change once, outside ship, and then `ship deploy` carries on. For
+the state keys: `wrangler triggers deploy` in the deployable's directory. For the config keys:
+`wrangler deploy --message "sha:<full main sha> <name> owner"` from a clean checkout of main; the
+`sha:` stamp keeps the live commit known, so the next `ship deploy` sees what is still pending.
 
 ### Exit codes and state
 

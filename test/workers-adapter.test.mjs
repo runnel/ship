@@ -242,7 +242,7 @@ test('versioned: refusals before any build', async () => {
   const cron = await failsWith({ targetConfig: '{"name":"example-app","triggers":{"crons":["0 * * * *"]}}' }, /triggers\.crons \(config 0 \* \* \* \*, Worker none\)/);
   assert.deepEqual(await cron.cloud.wranglerCalls(), []);
   assert.equal(await exists(join(cron.wt, 'app', '.next')), false);
-  await failsWith({ targetConfig: '{"name":"example-app","observability":{"enabled":true}}' }, /observability changed in app\/wrangler.json/);
+  await failsWith({ targetConfig: '{"name":"example-app","observability":{"enabled":true}}' }, new RegExp(`observability changed in app/wrangler.json .*wrangler deploy --message "sha:${NEW} app owner". from a clean checkout of main`));
   await failsWith({ previews: false }, /preview_urls \(config true, Worker false\)/);
   await failsWith({ targetConfig: '{"name":"example-app","preview_urls":false}', previews: false }, /preview URLs are off/);
 });
