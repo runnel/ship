@@ -45,3 +45,54 @@ test('node_modules and build output are not scanned; unresolved imports are igno
   });
   assert.deepEqual(await importsOutside(root, { cwd: 'app', paths: ['app/**'] }), []);
 });
+
+test('bare . and .. specifiers are found, look-alikes are not', () => {
+  const src = `import a from '.';\nexport * from "..";\nconst b = await import('..');\nconst c = require('.');\nimport d from '.env';\nimport e from '...';\nimport f from './x';`;
+  assert.deepEqual(relativeSpecifiers(src), ['.', '..', '..', '.', './x']);
+});
+
+test('a .js specifier resolves to the TypeScript source, the exact file wins', async () => {
+  const root = await tree({
+    'workers/tick/src/index.ts': `import '../../../lib/a.js';\nimport '../../../lib/b.mjs';\nimport '../../../lib/c.cjs';\nimport '../../../lib/d.jsx';\nimport '../../../lib/e.js';`,
+    'lib/a.ts': '',
+    'lib/b.mts': '',
+    'lib/c.cts': '',
+    'lib/d.tsx': '',
+    'lib/e.js': '',
+    'lib/e.ts': '',
+  });
+  const paths = ['workers/tick/src/**'];
+  assert.deepEqual(await importsOutside(root, { cwd: 'workers/tick', paths }), [
+    { from: 'workers/tick/src/index.ts', to: 'lib/a.ts' },
+    { from: 'workers/tick/src/index.ts', to: 'lib/b.mts' },
+    { from: 'workers/tick/src/index.ts', to: 'lib/c.cts' },
+    { from: 'workers/tick/src/index.ts', to: 'lib/d.tsx' },
+    { from: 'workers/tick/src/index.ts', to: 'lib/e.js' },
+  ]);
+});
+
+test('a bare .. resolves to the parent directory index, a bare . to its own', async () => {
+  const root = await tree({
+    'app/src/x.ts': `import up from '..';\nimport here from '.';`,
+    'app/index.ts': '',
+    'app/src/index.ts': '',
+  });
+  assert.deepEqual(await importsOutside(root, { cwd: 'app', paths: ['app/src/**'] }), [
+    { from: 'app/src/x.ts', to: 'app/index.ts' },
+  ]);
+});
+
+test('every index file form resolves, and .cts is a plain source suffix', async () => {
+  const root = await tree({
+    'app/src/x.ts': `import '../a';\nimport '../b';\nimport '../c';\nimport '../d';\nimport '../e';`,
+    'app/a/index.mts': '',
+    'app/b/index.cts': '',
+    'app/c/index.jsx': '',
+    'app/d/index.cjs': '',
+    'app/e.cts': '',
+  });
+  assert.deepEqual(
+    (await importsOutside(root, { cwd: 'app', paths: ['app/src/**'] })).map((o) => o.to),
+    ['app/a/index.mts', 'app/b/index.cts', 'app/c/index.jsx', 'app/d/index.cjs', 'app/e.cts'],
+  );
+});
