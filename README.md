@@ -238,6 +238,13 @@ state: a failing live probe (before the rollback), `ship rollback --to`, an inte
 promote, a current version that is not ours right after the promote, an error after the promote, and
 `wrangler deploy` failing after our code went live. `ship status` lists them.
 
+`ship deploy` also writes a hold just before it promotes and removes it once the live probes have
+passed, so a ship that is killed outright in between (`kill -9`, out of memory, power loss) leaves
+"deploy of <sha> in progress … the result was never verified" behind instead of a version that the
+next run would take for verified. Look at the Worker, then `ship unhold <name>`. A deploy that fails
+before anything changed on the Worker leaves no hold, and if the hold cannot be written the deploy
+does not promote.
+
 ### Exit codes and state
 
 `ship deploy` exits 0 when every selected deployable is live at main (with `--dry-run`: when

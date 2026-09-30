@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { access, chmod, copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { validateConfig } from '../lib/config.mjs';
 import { cloudflare } from '../lib/cloudflare.mjs';
 import { resolveLive } from '../lib/live.mjs';
-import { readHold } from '../lib/state.mjs';
+import { readHold, writeHold } from '../lib/state.mjs';
 import { deployMessage, deployOne } from '../lib/adapters/workers.mjs';
 import { fakeCloud } from './fake-cloud.mjs';
 import { tempDir } from './helpers.mjs';
@@ -55,10 +56,11 @@ async function fixture({ dep = APP, patch = {}, probe = healthy, wrangler = {}, 
 const exists = (p) => access(p).then(() => true, () => false);
 const posts = (cloud) => cloud.apiCalls.filter((c) => c.method === 'POST');
 const failsWith = async (opts, re) => {
-  const { cloud, ctx, wt } = await fixture(opts);
+  const { cloud, ctx, wt, stateRoot } = await fixture(opts);
   const res = await deployOne(ctx);
   assert.equal(res.outcome, 'failed');
   assert.match(res.detail, re);
+  assert.equal(await readHold(stateRoot, 't/r', ctx.dep.name), null, 'a deploy that failed changed nothing and leaves no hold');
   return { cloud, wt };
 };
 // The rollback request reaches Cloudflare and is applied, but the answer never arrives.
@@ -78,6 +80,19 @@ const failReadsAfterPromote = (inner) => {
     return res;
   };
 };
+// From the promote on, the state directory is a file: no hold can be written or read any more.
+const breakStateAfterPromote = (stateRoot, { failReads = false } = {}) => (inner) => {
+  const base = failReads ? failReadsAfterPromote(inner) : inner;
+  return async (url, init = {}) => {
+    const res = await base(url, init);
+    if (init.method === 'POST') {
+      await rm(stateRoot(), { recursive: true, force: true });
+      await writeFile(stateRoot(), 'a file where the state directory should be');
+    }
+    return res;
+  };
+};
+const IN_PROGRESS = /^deploy of bbbbbbb in progress since \d\d\/\d\d, \d\d:\d\d: if ship is not running, the result was never verified — ship status, then the owner decides \(ship unhold (app|tick)\)$/;
 
 // A deploy in a child process that gets SIGTERM once wrangler is running. Resolves to the hold the
 // interrupted process left behind (null: none) and its exit code.
@@ -129,6 +144,72 @@ await deployOne({ d: { out: () => {}, tmpRoot: join(dir, 'tmp'), pollMs: 10, sta
     return { code, hold: await readHold(join(dir, 'state'), 't/r', 'app') };
   } finally {
     child.kill('SIGKILL');
+  }
+}
+
+// A deploy in a child process (leading its own process group) that is killed outright with SIGKILL
+// once our code is live and not yet verified: for a versioned deploy while the live probes wait for
+// an answer, for a direct one while `wrangler deploy` (which has already made the deployment) runs.
+// Resolves to the hold the dead process left behind (null: none).
+async function killedAfterPromote(mode) {
+  const dir = await tempDir('killed-');
+  const href = (p) => JSON.stringify(new URL(p, import.meta.url).href);
+  const script = join(dir, 'child.mjs');
+  await writeFile(script, `
+import { chmod, copyFile, mkdir, writeFile } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { validateConfig } from ${href('../lib/config.mjs')};
+import { cloudflare } from ${href('../lib/cloudflare.mjs')};
+import { resolveLive } from ${href('../lib/live.mjs')};
+import { deployOne } from ${href('../lib/adapters/workers.mjs')};
+import { fakeCloud } from ${href('./fake-cloud.mjs')};
+
+const dir = ${JSON.stringify(dir)};
+const mode = ${JSON.stringify(mode)};
+const OLD = 'a'.repeat(40);
+const cloud = await fakeCloud({ dir: join(dir, 'cloud'), wrangler: { deploy: { sleepMs: 60_000 } },
+  hosts: { 'https://app.example.com': 'example-app' },
+  probe: ({ preview }) => {
+    if (preview) return 200;
+    writeFileSync(join(dir, 'live-probing'), '1');
+    return new Promise(() => {}); // the live host never answers
+  },
+  workers: { 'example-app': { versions: [{ message: 'sha:' + OLD + ' old' }], deployments: [{ versionId: null, message: 'sha:' + OLD + ' old' }] } } });
+const config = validateConfig({ repo: 't/r', checks: [{ name: 'u', paths: ['**'], steps: ['true'] }], credentials: { file: '/x', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } },
+  deployables: [{ name: 'app', worker: 'example-app', cwd: 'app', paths: ['app/**'], wrangler: 'tools/wrangler', probes: [{ path: '/', status: 200 }], liveHost: 'https://app.example.com', mode }] });
+const wt = join(dir, 'wt');
+await mkdir(join(wt, 'app'), { recursive: true });
+await mkdir(join(wt, 'tools'), { recursive: true });
+await copyFile(cloud.bin, join(wt, 'tools', 'wrangler'));
+await chmod(join(wt, 'tools', 'wrangler'), 0o755);
+await writeFile(join(wt, 'app', 'wrangler.json'), '{"name":"example-app"}');
+const cf = cloudflare({ token: 'tok', accountId: 'acc', fetchImpl: cloud.fetch });
+const live = resolveLive({ deployments: await cf.deployments('example-app'), versions: await cf.versions('example-app') });
+process.stdout.write('ready\\n');
+setInterval(() => {}, 1000); // a live host that never answers must not let the process end
+await deployOne({ d: { out: () => {}, tmpRoot: join(dir, 'tmp'), pollMs: 10, stateRoot: join(dir, 'state'), fetch: cloud.fetch, probeWindowMs: 60_000, probeIntervalMs: 10, sleep: async () => {} },
+  r: { repo: 't/r' }, wt, dep: config.deployables[0], entry: { live }, cf, creds: { CLOUDFLARE_API_TOKEN: 'tok' }, target: 'b'.repeat(40), nonce: 'n0nce0',
+  logFile: join(dir, 'deploy.log'), readAt: async () => '{"name":"example-app"}' });
+`);
+  const child = spawn(process.execPath, [script], { detached: true, stdio: ['ignore', 'pipe', 'inherit'] });
+  const exit = once(child, 'exit');
+  const killGroup = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } };
+  try {
+    const until = Date.now() + 20_000;
+    const promoted = async () => (mode === 'versioned'
+      ? existsSync(join(dir, 'live-probing'))
+      : (await readFile(join(dir, 'cloud', 'wrangler-calls.jsonl'), 'utf8').catch(() => '')).trim() !== '');
+    while (!(await promoted())) {
+      if (child.exitCode !== null || Date.now() > until) throw new Error('the child never got to the promote');
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    await new Promise((r) => setTimeout(r, 300)); // the deployment request or wrangler has done its work
+    killGroup();
+    await Promise.race([exit, new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not die')), 15_000).unref())]);
+    return await readHold(join(dir, 'state'), 't/r', 'app');
+  } finally {
+    killGroup();
   }
 }
 
@@ -409,23 +490,91 @@ test('an error after the promote becomes a hold, never an exception', async () =
   assert.match((await readHold(stateRoot, 't/r', 'app')).reason, /ship error after the deploy/);
 });
 
-test('a hold that cannot be written is reported, not thrown; the rollback still happens', async () => {
+test('a hold that cannot be written after the promote is reported, not thrown; the rollback still happens', async () => {
   let oldId;
-  const rollback = await fixture({ probe: (p) => (p.preview || p.versionId === oldId ? healthy(p) : 500) });
+  let rollback;
+  rollback = await fixture({ fetchWrap: breakStateAfterPromote(() => rollback.stateRoot), probe: (p) => (p.preview || p.versionId === oldId ? healthy(p) : 500) });
   oldId = rollback.cloud.live('example-app');
-  await writeFile(rollback.stateRoot, 'a file where the state directory should be');
   const rolled = await deployOne(rollback.ctx);
   assert.equal(rolled.outcome, 'rolled-back');
   assert.match(rolled.detail, /WARNING: the hold could not be written/);
   assert.doesNotMatch(rolled.detail, /Hold set/);
   assert.equal(rollback.cloud.live('example-app'), oldId);
 
-  const broken = await fixture({ fetchWrap: failReadsAfterPromote });
-  await writeFile(broken.stateRoot, 'a file where the state directory should be');
+  let broken;
+  broken = await fixture({ fetchWrap: breakStateAfterPromote(() => broken.stateRoot, { failReads: true }) });
   const stuck = await deployOne(broken.ctx);
   assert.equal(stuck.outcome, 'stuck');
   assert.match(stuck.detail, /ship error after the deploy.*WARNING: the hold could not be written/);
   assert.doesNotMatch(stuck.detail, /hold set/);
+});
+
+test('a hold that cannot be written before the promote stops the deploy: nothing is promoted', async () => {
+  for (const [dep, calls] of [[APP, ['versions upload']], [TICK, []]]) {
+    const { cloud, ctx, stateRoot } = await fixture({ dep });
+    await writeFile(stateRoot, 'a file where the state directory should be');
+    const res = await deployOne(ctx);
+    assert.equal(res.outcome, 'failed');
+    assert.match(res.detail, /could not write the deploy-in-progress hold .*nothing was deployed/);
+    assert.deepEqual((await cloud.wranglerCalls()).map((c) => c.cmd), calls);
+    assert.deepEqual(posts(cloud), []);
+    assert.equal(cloud.live(dep.worker), (await cloud.state(dep.worker)).deployments[0].versions[0].version_id);
+  }
+});
+
+test('a hold marks the deploy from just before the promote to the end of the live probes, and a verified deploy leaves none', async () => {
+  for (const dep of [APP, TICK]) {
+    const seen = {};
+    let fx;
+    fx = await fixture({
+      dep,
+      fetchWrap: (inner) => async (url, init = {}) => {
+        if (init.method === 'POST') seen.atPromote = await readHold(fx.stateRoot, 't/r', dep.name);
+        return inner(url, init);
+      },
+      probe: async (p) => {
+        if (!p.preview) seen.duringLiveProbes = await readHold(fx.stateRoot, 't/r', dep.name);
+        return healthy(p);
+      },
+    });
+    assert.equal(await readHold(fx.stateRoot, 't/r', dep.name), null);
+    const res = await deployOne(fx.ctx);
+    assert.equal(res.outcome, 'deployed', fx.lines.join('\n'));
+    assert.match(seen.duringLiveProbes.reason, IN_PROGRESS, dep.name);
+    assert.equal(seen.duringLiveProbes.sha, NEW);
+    if (dep.mode === 'versioned') {
+      assert.match(seen.atPromote.reason, IN_PROGRESS);
+      assert.equal(seen.atPromote.versionId, res.versionId);
+    }
+    assert.equal(await readHold(fx.stateRoot, 't/r', dep.name), null, `${dep.name}: a verified deploy leaves no hold`);
+  }
+});
+
+test('a verified deploy clears only its own hold', async () => {
+  let fx;
+  fx = await fixture({ probe: async (p) => {
+    if (!p.preview) await writeHold(fx.stateRoot, 't/r', 'app', { reason: 'the owner is looking at it' });
+    return healthy(p);
+  } });
+  const res = await deployOne(fx.ctx);
+  assert.equal(res.outcome, 'deployed');
+  assert.equal((await readHold(fx.stateRoot, 't/r', 'app')).reason, 'the owner is looking at it');
+});
+
+test('a hold that cannot be cleared after a verified deploy is reported and the deploy still counts', async () => {
+  let fx;
+  fx = await fixture({ probe: async (p) => {
+    if (!p.preview) await chmod(join(fx.stateRoot, 'holds', 't__r'), 0o500); // its hold can be read, not removed
+    return healthy(p);
+  } });
+  try {
+    const res = await deployOne(fx.ctx);
+    assert.equal(res.outcome, 'deployed');
+    assert.match(fx.lines.join('\n'), /! app: deployed and verified, but its deploy-in-progress hold could not be cleared \(.*\) — ship unhold app/);
+    assert.match((await readHold(fx.stateRoot, 't/r', 'app')).reason, IN_PROGRESS);
+  } finally {
+    await chmod(join(fx.stateRoot, 'holds', 't__r'), 0o700);
+  }
 });
 
 // wrangler is told to make nothing, so the only thing that can write the hold is the interrupt
@@ -437,6 +586,16 @@ test('an interrupt while wrangler promotes leaves a hold; before the promote it 
   const uploading = await interruptDuringWrangler({ dep: { mode: 'versioned' }, wrangler: { 'versions upload': { sleepMs: 60_000 } } });
   assert.equal(uploading.code, 130);
   assert.equal(uploading.hold, null);
+});
+
+// Nothing can run in a process that is killed outright, so the hold has to be there before.
+test('a deploy killed outright after the promote leaves a hold that says the result was never verified', { timeout: 60_000 }, async () => {
+  for (const mode of ['versioned', 'direct']) {
+    const hold = await killedAfterPromote(mode);
+    assert.match(hold?.reason ?? '', IN_PROGRESS, mode);
+    assert.equal(hold.sha, NEW);
+    if (mode === 'versioned') assert.ok(hold.versionId, 'the uploaded version is named');
+  }
 });
 
 test('direct: wrangler deploy with the message, then live probes', async () => {
