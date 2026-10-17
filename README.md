@@ -252,10 +252,11 @@ older one is fine.
    worktree at its tip and loads `ship.config.mjs` from it.
 2. Per deployable: holds, import containment, the live commit (must be an ancestor of main), and
    whether any of its files changed since (minus `ignore` and `docsOnly`). Nothing pending: done.
-   Each pending deployable's plan line ends with what it carries, for instance
-   `· ships 3 commit(s): #41 #43 + 1 without a PR number` (a number is read from a trailing `(#n)`
-   in the commit subject). The lines are printed before the migration gate, setup, checks and
-   builds, so a deploy says what it will ship before it runs anything.
+   A pending deployable whose live commit is known gets `· ships 3 commit(s): #41 #43 + 1 without a
+   PR number` at the end of its plan line (a number is read from a trailing `(#n)` in the commit
+   subject). A first deploy, and a `--redeploy` of code with no new commits, show none. The lines are
+   printed before the migration gate, setup, checks and builds, so a deploy says what it will ship
+   before it runs anything.
 3. Migration files on main that are not cleared → stop. `requires` not live → stop.
 4. `deploySetup`, then every `onDeploy` check group; red → stop.
 5. Each pending deployable, dependencies first. Both modes refuse, before building, a wrangler
