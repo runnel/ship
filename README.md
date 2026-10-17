@@ -270,7 +270,8 @@ older one is fine.
    serves this build — a warning only. Right after the promote Cloudflare's deployment list can
    still show the version that was live before, or none; while it does, ship reads it again for up
    to 30 s. Any other version is somebody else's deploy and sets a hold at once, and so does a
-   version that is still not ours when the 30 s are over. The first deploy of a versioned deployable
+   deployment that splits traffic between versions (even with ours among them) and a version that
+   is still not ours when the 30 s are over. The first deploy of a versioned deployable
    is the owner's: the Worker must exist and its preview URLs must be on.
 6. A failing live probe sets a hold and, when it can, rolls back to the previous version (see
    [Rollbacks](#rollbacks)). A deployable that fails or is held stops the deployables that come
@@ -320,8 +321,9 @@ new deployment of the version that was live before:
   there is nothing to go back to);
 - no Durable Object migration differs between that commit and this one (Cloudflare refuses a
   rollback past one);
-- the version that is live, read again just before the rollback, is still ours: ship never promotes
-  over somebody else's deploy, and does not roll back when it cannot read which version is live;
+- the version that is live, read again just before the rollback, is still ours alone: ship never
+  promotes over somebody else's deploy (a deployment that splits traffic between versions is one,
+  even with ours among them), and does not roll back when it cannot read which version is live;
 - Cloudflare accepts the deployment. A refusal leaves our version live; for error 10220 (a secret
   changed since that version was live) the owner decides between
   `ship rollback <name> --to <version> --revert-secrets` and a fix forward.
@@ -333,18 +335,20 @@ rollback does not restore (crons, routes, ...); the hold stays set either way, u
 A rollback request that gets no answer (a network error, a timeout, a 5xx) may still have been
 applied, so ship reads the deployment again, with the same settle window as after a promote: while
 the deployment list still shows the version that was live before the request (ours), or none, ship
-reads it again for up to 30 s. If the previous version is live, the rollback counts as done and is
-reported as rolled back, with a note that its answer was lost. If ours is still live when the 30 s
-are over, another version is (which ends the wait at once), or the deployment cannot be read, the
-deploy ends stuck and the output says which.
+reads it again for up to 30 s. If the previous version is live at 100 %, the rollback counts as
+done and is reported as rolled back, with a note that its answer was lost. If ours is still live
+when the 30 s are over, another version is, the deployment splits traffic between versions (either
+ends the wait at once; a split is not the rollback, even with the previous version among them), or
+the deployment cannot be read, the deploy ends stuck and the output says which.
 
 `ship rollback <name> --to <version>` sets the hold first too. A refusal from Cloudflare changed
 nothing, and the hold goes back to what it was. When the request gets no answer, ship reads which
 version is live, through the same 30 s settle window (it says so, and re-reads while the list
-still names the version it named before the request, or none): the target means the rollback took
-effect, and it is reported as done and probed like any other. Anything else is reported as an unknown outcome
-that names the version that is live (or says that it could not be read), and the hold stays: look
-with `ship status`.
+still names the version it named before the request, the split it showed, or none): the target at
+100 % means the rollback took effect, and it is reported as done and probed like any other. Anything
+else is reported as an unknown outcome that names the version that is live (or says that the current
+deployment splits traffic between versions, even with the target among them, or that it could not
+be read), and the hold stays: look with `ship status`.
 
 ### When a versioned deploy refuses
 

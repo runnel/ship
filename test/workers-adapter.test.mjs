@@ -509,7 +509,7 @@ test('another version current right after the promote is held, not rolled over',
   cloud = fx.cloud;
   const res = await deployOne(fx.ctx);
   assert.equal(res.outcome, 'stuck');
-  assert.match(res.detail, /after the deploy the current version is .*, not ours .*hold set/);
+  assert.match(res.detail, /after the deploy version [0-9a-f]{8} is live, not ours .*hold set/);
   assert.equal(posts(cloud).length, 1);
   assert.ok(await readHold(fx.stateRoot, 't/r', 'app'));
   assert.equal(c.now(), 0, 'a third version is somebody else\'s deploy: held at once, not waited on');
@@ -535,6 +535,31 @@ const staleAfter = (starts) => (reads) => (inner) => {
 };
 const staleAfterPromote = staleAfter((init) => init.method === 'POST');
 const staleAfterRollback = staleAfter(isRollback);
+const isList = (url, init) => (init.method ?? 'GET') === 'GET' && url.includes('/deployments');
+// A deployments list whose newest deployment splits traffic 50/50, `first` (by default the version
+// it had) first.
+const splitNewest = async (res, first = null) => {
+  const body = await res.json();
+  const newest = body.result.deployments[0];
+  newest.versions = [{ version_id: first ?? newest.versions[0].version_id, percentage: 50 }, { version_id: 'f'.repeat(36), percentage: 50 }];
+  return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+};
+
+test('a split right after the promote is held at once, even with ours as its first version', async () => {
+  const c = clock();
+  let promoted = false;
+  const fx = await fixture({ deps: { settleWindowMs: 30_000, probeIntervalMs: 1000, now: c.now, sleep: c.sleep }, fetchWrap: (inner) => async (url, init = {}) => {
+    const res = await inner(url, init);
+    if (init.method === 'POST') promoted = true;
+    return promoted && isList(url, init) ? splitNewest(res) : res;
+  } });
+  const res = await deployOne(fx.ctx);
+  assert.equal(res.outcome, 'stuck', res.detail);
+  assert.match(res.detail, /after the deploy the current deployment splits traffic between versions, not ours \([0-9a-f]{8}\).*hold set/);
+  assert.equal(posts(fx.cloud).length, 1);
+  assert.ok(await readHold(fx.stateRoot, 't/r', 'app'));
+  assert.equal(c.now(), 0, 'the list did not show a split before the promote: not waited on');
+});
 
 test('a current version that lags the promote for a few reads is waited out, not held', async () => {
   const c = clock();
@@ -550,7 +575,7 @@ test('a current version that stays the previous one through the window is held',
   const fx = await fixture({ fetchWrap: staleAfterPromote(1000), deps: { settleWindowMs: 30_000, probeIntervalMs: 1000, now: c.now, sleep: c.sleep } });
   const res = await deployOne(fx.ctx);
   assert.equal(res.outcome, 'stuck');
-  assert.match(res.detail, /after the deploy the current version is .*, not ours .*hold set/);
+  assert.match(res.detail, /after the deploy version [0-9a-f]{8} is live, not ours .*hold set/);
   assert.ok(c.now() >= 30_000);
 });
 
@@ -602,6 +627,45 @@ test('a third version on the re-read after a lost rollback answer is reported at
   assert.equal(cloud.live('example-app'), (await cloud.state('example-app')).versions.at(-1).id);
   assert.ok(await readHold(fx.stateRoot, 't/r', 'app'));
   assert.equal(fx.c.now(), 0, 'another version is somebody else\'s deploy: reported at once, not waited on');
+});
+
+test('a split on the re-read after an unanswered rollback is not the rollback, even with the previous version first', async () => {
+  let sent = false;
+  let fx;
+  fx = await failingProbes({ fetchWrap: (inner) => async (url, init = {}) => {
+    if (isRollback(init)) {
+      sent = true;
+      throw new Error('socket hang up'); // the request never reached Cloudflare
+    }
+    const res = await inner(url, init);
+    return sent && isList(url, init) ? splitNewest(res, fx.oldId) : res;
+  } });
+  const res = await deployOne(fx.ctx);
+  assert.equal(res.outcome, 'stuck', res.detail);
+  assert.match(res.detail, /Rolling back to [0-9a-f]{8} failed \(socket hang up\); the current deployment splits traffic between versions; hold in place/);
+  assert.notEqual(fx.cloud.live('example-app'), fx.oldId);
+  assert.ok(await readHold(fx.stateRoot, 't/r', 'app'));
+  assert.equal(fx.c.now(), 0, 'the list did not show a split before the request: reported at once, not waited on');
+});
+
+test('the auto-rollback does not promote over a split, even with ours as its first version', async () => {
+  let split = false;
+  const { cloud, ctx, stateRoot } = await fixture({
+    probe: (p) => {
+      if (p.preview) return healthy(p);
+      split = true;
+      return 500;
+    },
+    fetchWrap: (inner) => async (url, init = {}) => {
+      const res = await inner(url, init);
+      return split && isList(url, init) ? splitNewest(res) : res;
+    },
+  });
+  const res = await deployOne(ctx);
+  assert.equal(res.outcome, 'stuck');
+  assert.match(res.detail, /live probes failed .*Not rolling back: the current deployment splits traffic between versions, not ours \([0-9a-f]{8}\).*hold in place/);
+  assert.equal(posts(cloud).length, 1, 'only our own promote; no rollback deployment');
+  assert.ok(await readHold(stateRoot, 't/r', 'app'));
 });
 
 test('a first deploy has nothing to roll back to: a failing live probe holds', async () => {
