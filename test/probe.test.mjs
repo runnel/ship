@@ -43,3 +43,11 @@ test('waitForText', async () => {
   const never = scripted({ 'https://a.example.com/login': [{ status: 200, body: 'old' }] });
   assert.equal(await waitForText('https://a.example.com', '/login', 'BUILD42', { fetchImpl: never.fetchImpl, windowMs: 6000, intervalMs: 3000, ...clock() }), false);
 });
+
+test('a network error names its cause', async () => {
+  const refused = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:443'), { code: 'ECONNREFUSED' }) });
+  const expired = Object.assign(new TypeError('fetch failed'), { cause: new Error('certificate has expired') });
+  const { fetchImpl } = scripted({ 'https://a.example.com/r': [refused], 'https://a.example.com/c': [expired] });
+  assert.equal(await probeOnce('https://a.example.com', { path: '/r' }, { fetchImpl }), 'error: fetch failed (ECONNREFUSED)');
+  assert.equal(await probeOnce('https://a.example.com', { path: '/c' }, { fetchImpl }), 'error: fetch failed (certificate has expired)');
+});
