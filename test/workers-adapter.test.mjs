@@ -63,10 +63,11 @@ const failsWith = async (opts, re) => {
   assert.equal(await readHold(stateRoot, 't/r', ctx.dep.name), null, 'a deploy that failed changed nothing and leaves no hold');
   return { cloud, wt };
 };
+const isRollback = (init) => init.method === 'POST' && JSON.parse(init.body).annotations['workers/message'].endsWith(' rollback');
 // The rollback request reaches Cloudflare and is applied, but the answer never arrives.
 const loseRollbackAnswer = (inner) => async (url, init = {}) => {
   const res = await inner(url, init);
-  if (init.method === 'POST' && JSON.parse(init.body).annotations['workers/message'].endsWith(' rollback')) throw new Error('socket hang up');
+  if (isRollback(init)) throw new Error('socket hang up');
   return res;
 };
 
@@ -514,23 +515,26 @@ test('another version current right after the promote is held, not rolled over',
   assert.equal(c.now(), 0, 'a third version is somebody else\'s deploy: held at once, not waited on');
 });
 
-// Answers the deployments list as it was before the promote for the next `reads` reads after it.
-const staleAfterPromote = (reads) => (inner) => {
-  let promoted = false;
+// Answers the deployments list as it was before the first request `starts` matches, for the next
+// `reads` reads after it.
+const staleAfter = (starts) => (reads) => (inner) => {
+  let started = false;
   let before = null;
   let left = reads;
   return async (url, init = {}) => {
     const isList = (init.method ?? 'GET') === 'GET' && url.includes('/deployments');
-    if (promoted && isList && before !== null && left > 0) {
+    if (started && isList && before !== null && left > 0) {
       left -= 1;
       return new Response(before, { status: 200, headers: { 'content-type': 'application/json' } });
     }
     const res = await inner(url, init);
-    if (isList && !promoted) before = await res.clone().text();
-    if (init.method === 'POST') promoted = true;
+    if (isList && !started) before = await res.clone().text();
+    if (starts(init)) started = true;
     return res;
   };
 };
+const staleAfterPromote = staleAfter((init) => init.method === 'POST');
+const staleAfterRollback = staleAfter(isRollback);
 
 test('a current version that lags the promote for a few reads is waited out, not held', async () => {
   const c = clock();
@@ -548,6 +552,56 @@ test('a current version that stays the previous one through the window is held',
   assert.equal(res.outcome, 'stuck');
   assert.match(res.detail, /after the deploy the current version is .*, not ours .*hold set/);
   assert.ok(c.now() >= 30_000);
+});
+
+// Live probes fail on our version, so the deploy rolls back to the one live before it.
+const failingProbes = async ({ fetchWrap }) => {
+  let oldId;
+  const c = clock();
+  const fx = await fixture({ fetchWrap, deps: { settleWindowMs: 30_000, probeIntervalMs: 1000, now: c.now, sleep: c.sleep },
+    probe: (p) => (p.preview || p.versionId === oldId ? healthy(p) : 500) });
+  oldId = fx.cloud.live('example-app');
+  return { ...fx, oldId, c };
+};
+
+test('a rollback whose answer is lost and whose re-read lags for a few reads is reported as rolled back', async () => {
+  const { cloud, ctx, stateRoot, oldId, c } = await failingProbes({ fetchWrap: (inner) => loseRollbackAnswer(staleAfterRollback(2)(inner)) });
+  const res = await deployOne(ctx);
+  assert.equal(res.outcome, 'rolled-back', res.detail);
+  assert.match(res.detail, /the answer to the rollback was lost; the re-read shows it took effect/);
+  assert.equal(cloud.live('example-app'), oldId);
+  assert.ok(await readHold(stateRoot, 't/r', 'app'));
+  assert.ok(c.now() >= 2000 && c.now() < 30_000, `waited ${c.now()} ms`);
+});
+
+test('a rollback whose re-read still shows our version through the window is reported stuck', async () => {
+  const { ctx, stateRoot, c } = await failingProbes({ fetchWrap: (inner) => loseRollbackAnswer(staleAfterRollback(1000)(inner)) });
+  const res = await deployOne(ctx);
+  assert.equal(res.outcome, 'stuck');
+  assert.match(res.detail, /Rolling back to [0-9a-f]{8} failed \(socket hang up\); our version [0-9a-f]{8} is still live; hold in place/);
+  assert.ok(await readHold(stateRoot, 't/r', 'app'));
+  assert.ok(c.now() >= 30_000);
+});
+
+test('a third version on the re-read after a lost rollback answer is reported at once', async () => {
+  const other = 'c'.repeat(40);
+  let cloud;
+  const fx = await failingProbes({ fetchWrap: (inner) => async (url, init = {}) => {
+    const res = await inner(url, init);
+    if (isRollback(init)) {
+      const v = cloud.addVersion('example-app', { message: `sha:${other} other` });
+      cloud.addDeployment('example-app', v.id, { message: `sha:${other} other` });
+      throw new Error('socket hang up');
+    }
+    return res;
+  } });
+  cloud = fx.cloud;
+  const res = await deployOne(fx.ctx);
+  assert.equal(res.outcome, 'stuck');
+  assert.match(res.detail, /failed \(socket hang up\); version [0-9a-f]{8} is live; hold in place/);
+  assert.equal(cloud.live('example-app'), (await cloud.state('example-app')).versions.at(-1).id);
+  assert.ok(await readHold(fx.stateRoot, 't/r', 'app'));
+  assert.equal(fx.c.now(), 0, 'another version is somebody else\'s deploy: reported at once, not waited on');
 });
 
 test('a first deploy has nothing to roll back to: a failing live probe holds', async () => {

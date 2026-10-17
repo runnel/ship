@@ -211,6 +211,70 @@ test('a manual rollback whose answer was lost but which took effect is reported 
   assert.ok(await readHold(s.deps.stateRoot, 't/r', 'app'));
 });
 
+// The rollback request is applied but its answer is lost; for the next `reads` reads after it the
+// deployments list answers as it did before the request. `then` runs once the request is applied.
+const lostAndStale = (inner, reads, then = () => {}) => {
+  let before = null;
+  let sent = false;
+  let left = reads;
+  return async (url, init = {}) => {
+    const isList = (init.method ?? 'GET') === 'GET' && url.includes('/deployments');
+    if (sent && isList && left > 0) {
+      left -= 1;
+      return new Response(before, { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    const res = await inner(url, init);
+    if (isList && !sent) before = await res.clone().text();
+    if (init.method === 'POST' && String(init.body ?? '').includes(' rollback')) {
+      sent = true;
+      then();
+      throw new Error('socket hang up');
+    }
+    return res;
+  };
+};
+
+test('a manual rollback whose lost answer is followed by a lagging list is waited out and reported as done', async () => {
+  const s = await setupDeploy({ change: { 'app/src/a.ts': '2' }, seed: twoVersions });
+  const to = await versionPrefix(s.cloud, 'example-app', 0);
+  const t0 = s.deps.now();
+  // A zero probe interval still moves on: the re-reads have a floor.
+  const deps = { ...s.deps, fetch: lostAndStale(s.deps.fetch, 2), settleWindowMs: 30_000, probeIntervalMs: 0 };
+  assert.equal(await runRollback({ cwd: s.work, name: 'app', to, deps }), 0, s.lines.join('\n'));
+  assert.match(s.lines.join('\n'), new RegExp(`✓ app: ${to} is live; hold set`));
+  assert.ok(s.cloud.live('example-app').startsWith(to));
+  const waited = s.deps.now() - t0;
+  assert.ok(waited >= 2000 && waited < 30_000, `waited ${waited} ms`);
+});
+
+test('a manual rollback whose re-read shows the old version through the window is reported unknown', async () => {
+  const s = await setupDeploy({ change: { 'app/src/a.ts': '2' }, seed: twoVersions });
+  const to = await versionPrefix(s.cloud, 'example-app', 0);
+  const was = await versionPrefix(s.cloud, 'example-app', 1);
+  const t0 = s.deps.now();
+  const deps = { ...s.deps, fetch: lostAndStale(s.deps.fetch, 1000), settleWindowMs: 30_000, probeIntervalMs: 1000 };
+  assert.equal(await runRollback({ cwd: s.work, name: 'app', to, deps }), 1);
+  assert.match(s.lines.join('\n'), new RegExp(`rollback outcome unknown \\(socket hang up\\); version ${was} is live; the hold stays`));
+  assert.ok(await readHold(s.deps.stateRoot, 't/r', 'app'));
+  assert.ok(s.deps.now() - t0 >= 30_000);
+});
+
+test('a manual rollback whose re-read shows a third version reports it at once', async () => {
+  const s = await setupDeploy({ change: { 'app/src/a.ts': '2' }, seed: twoVersions });
+  const to = await versionPrefix(s.cloud, 'example-app', 0);
+  let other;
+  const third = () => {
+    other = s.cloud.addVersion('example-app', { message: 'by hand' });
+    s.cloud.addDeployment('example-app', other.id, { message: 'by hand' });
+  };
+  const t0 = s.deps.now();
+  const deps = { ...s.deps, fetch: lostAndStale(s.deps.fetch, 0, third), settleWindowMs: 30_000, probeIntervalMs: 1000 };
+  assert.equal(await runRollback({ cwd: s.work, name: 'app', to, deps }), 1);
+  assert.match(s.lines.join('\n'), new RegExp(`rollback outcome unknown \\(socket hang up\\); version ${other.id.slice(0, 8)} is live; the hold stays`));
+  assert.ok(await readHold(s.deps.stateRoot, 't/r', 'app'));
+  assert.equal(s.deps.now() - t0, 0, 'another version is somebody else\'s: reported at once, not waited on');
+});
+
 test('rollback refused by Cloudflare puts an earlier hold back exactly as it was', async () => {
   const s = await setupDeploy({ change: { 'app/src/a.ts': '2' }, seed: ({ first, head }) => ({
     'example-app': { versions: [{ message: `sha:${first} a` }, { message: `sha:${head} b` }, { triggered: 'secret' }], deployments: [{ versionId: null }] },

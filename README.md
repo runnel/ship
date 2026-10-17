@@ -331,16 +331,20 @@ was rolled back. After a rollback ship probes again, reports the result and name
 rollback does not restore (crons, routes, ...); the hold stays set either way, until `ship unhold`.
 
 A rollback request that gets no answer (a network error, a timeout, a 5xx) may still have been
-applied, so ship reads the deployment again. If the previous version is live, the rollback counts
-as done and is reported as rolled back, with a note that its answer was lost. If ours is still live,
-another version is, or the deployment cannot be read, the deploy ends stuck and the output says
-which.
+applied, so ship reads the deployment again, with the same settle window as after a promote: while
+the deployment list still shows the version that was live before the request (ours), or none, ship
+reads it again for up to 30 s. If the previous version is live, the rollback counts as done and is
+reported as rolled back, with a note that its answer was lost. If ours is still live when the 30 s
+are over, another version is (which ends the wait at once), or the deployment cannot be read, the
+deploy ends stuck and the output says which.
 
 `ship rollback <name> --to <version>` sets the hold first too. A refusal from Cloudflare changed
 nothing, and the hold goes back to what it was. When the request gets no answer, ship reads which
-version is live: the target means the rollback took effect, and it is reported as done and probed
-like any other. Anything else is reported as an unknown outcome that names the version that is live
-(or says that it could not be read), and the hold stays: look with `ship status`.
+version is live, through the same 30 s settle window (re-reading while the list still shows the
+version that was live before the request, or none): the target means the rollback took effect, and
+it is reported as done and probed like any other. Anything else is reported as an unknown outcome
+that names the version that is live (or says that it could not be read), and the hold stays: look
+with `ship status`.
 
 ### When a versioned deploy refuses
 
