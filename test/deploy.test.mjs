@@ -203,7 +203,7 @@ test('a dry run ends by saying nothing was uploaded', async () => {
   const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }), change: { 'app/src/a.ts': '2' } });
   await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
   assert.equal(await s.deploy([], true), 0, s.lines.join('\n'));
-  assert.equal(s.lines.at(-1), '✓ ship deploy --dry-run: everything selected built and passed its checks; nothing was uploaded');
+  assert.equal(s.lines.at(-1), '✓ ship deploy --dry-run: every pending deployable built and passed its checks; nothing was uploaded');
 });
 
 test('a dry run with nothing pending still says everything is live', async () => {

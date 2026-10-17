@@ -300,5 +300,5 @@ test('no migration added: open PRs are not listed', async () => {
 test('listing open PRs failing does not fail the check', async () => {
   const s = await setup({ configText: MIGRATIONS, featFiles: { 'src/x.ts': 'x\n', 'db/002_feature.sql': '' }, ghOptions: { prListFail: true } });
   assert.equal(await runCheck({ cwd: s.work, pr: '7', deps: s.deps }), 0);
-  assert.match(s.lines.join('\n'), /! could not compare migration prefixes with open PRs/);
+  assert.match(s.lines.join('\n'), /! could not compare migration prefixes with open PRs \(HTTP 502: Bad Gateway\)/);
 });

@@ -49,7 +49,7 @@ export async function makeOrigin(files) {
 // prSequence = [overrides…]: the Nth `gh pr view` answers `pr` merged with the Nth entry (the last
 // entry repeats), as GitHub does while it catches up with a push; empty: every answer is `pr`.
 // openPrs = [{ number, files: [{ path }] }]: what `gh pr list` prints (the open pull requests).
-// prListFail: `gh pr list` fails (exit 1), as gh does offline.
+// prListFail: `gh pr list` fails (exit 1) with a reason on stderr, as gh does when GitHub is unreachable.
 export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false }) {
   const log = join(dir, 'gh.log');
   const script = join(dir, 'gh');
@@ -69,7 +69,7 @@ if (args[0] === 'pr' && args[1] === 'view') {
   reply({ ...${JSON.stringify(pr)}, ...(sequence.length > 0 ? sequence[Math.min(i, sequence.length - 1)] : {}) });
 }
 if (args[0] === 'pr' && args[1] === 'list') {
-  if (${JSON.stringify(prListFail)}) { process.stderr.write('fake gh: forced failure'); process.exit(1); }
+  if (${JSON.stringify(prListFail)}) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
   reply(${JSON.stringify(openPrs)});
 }
 if (args[0] === 'repo' && args[1] === 'view') reply(${JSON.stringify(repo)});
