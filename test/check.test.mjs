@@ -276,3 +276,29 @@ test('a head GitHub never catches up with is not checked and gets no status', as
   assert.match(s.lines.join('\n'), /✗ local-ci not run: GitHub still shows .* run ship check again in a minute/);
   assert.deepEqual(statusesOf(await g.calls()), []);
 });
+
+const MIGRATIONS = "export default { repo: 't/r', docsOnly: ['*.md'], migrations: { paths: ['db/*.sql'] }, checks: [{ name: 'unit', paths: ['src/**'], steps: ['test -f src/x.ts'] }] };\n";
+
+test('another open PR adding the same migration prefix is a warning, not a failure', async () => {
+  const s = await setup({
+    configText: MIGRATIONS, featFiles: { 'src/x.ts': 'x\n', 'db/002_feature.sql': '' },
+    ghOptions: { openPrs: [{ number: 7, files: [{ path: 'db/002_feature.sql' }] }, { number: 8, files: [{ path: 'db/002_other.sql' }, { path: 'README.md' }] }] },
+  });
+  assert.equal(await runCheck({ cwd: s.work, pr: '7', deps: s.deps }), 0, s.lines.join('\n'));
+  assert.match(s.lines.join('\n'), /! migration prefix 002 is also added by open PR #8 \(db\/002_other\.sql\) — whichever merges second must renumber/);
+  const final = (await s.statuses()).at(-1);
+  assert.equal(final.state, 'success');
+  assert.match(final.description, /migration 002 also in #8/);
+});
+
+test('no migration added: open PRs are not listed', async () => {
+  const s = await setup({ configText: MIGRATIONS, ghOptions: { openPrs: [{ number: 8, files: [{ path: 'db/002_other.sql' }] }] } });
+  assert.equal(await runCheck({ cwd: s.work, pr: '7', deps: s.deps }), 0);
+  assert.ok(!(await s.calls()).some((a) => a[0] === 'pr' && a[1] === 'list'));
+});
+
+test('listing open PRs failing does not fail the check', async () => {
+  const s = await setup({ configText: MIGRATIONS, featFiles: { 'src/x.ts': 'x\n', 'db/002_feature.sql': '' }, ghOptions: { prListFail: true } });
+  assert.equal(await runCheck({ cwd: s.work, pr: '7', deps: s.deps }), 0);
+  assert.match(s.lines.join('\n'), /! could not compare migration prefixes with open PRs/);
+});

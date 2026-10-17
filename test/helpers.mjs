@@ -48,7 +48,9 @@ export async function makeOrigin(files) {
 // apiFail = { match }: `gh api` calls whose arguments contain `match` fail (exit 1), as gh does offline.
 // prSequence = [overrides…]: the Nth `gh pr view` answers `pr` merged with the Nth entry (the last
 // entry repeats), as GitHub does while it catches up with a push; empty: every answer is `pr`.
-export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null }) {
+// openPrs = [{ number, files: [{ path }] }]: what `gh pr list` prints (the open pull requests).
+// prListFail: `gh pr list` fails (exit 1), as gh does offline.
+export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false }) {
   const log = join(dir, 'gh.log');
   const script = join(dir, 'gh');
   const viewCount = join(dir, 'gh-pr-view.count');
@@ -65,6 +67,10 @@ if (args[0] === 'pr' && args[1] === 'view') {
     fs.writeFileSync(${JSON.stringify(viewCount)}, String(i + 1));
   }
   reply({ ...${JSON.stringify(pr)}, ...(sequence.length > 0 ? sequence[Math.min(i, sequence.length - 1)] : {}) });
+}
+if (args[0] === 'pr' && args[1] === 'list') {
+  if (${JSON.stringify(prListFail)}) { process.stderr.write('fake gh: forced failure'); process.exit(1); }
+  reply(${JSON.stringify(openPrs)});
 }
 if (args[0] === 'repo' && args[1] === 'view') reply(${JSON.stringify(repo)});
 if (args[0] === 'run' && args[1] === 'list') reply(${JSON.stringify(runs)});
