@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readAcks, readHold, writeHold } from '../lib/state.mjs';
 import { runAck, runAdopt, runRollback, runUnhold } from '../lib/admin.mjs';
@@ -229,6 +230,20 @@ test('migrations ack is all or nothing, prefers an exact path to a bare name, an
   assert.equal(await runAck({ cwd: s.work, files: ['db/001.sql'], deps }), 0);
   assert.match(s.lines.join('\n'), /✓ cleared for deploy: \(already cleared\)/);
   assert.deepEqual([...(await readAcks(s.deps.stateRoot, 't/r'))], ['db/001.sql']);
+});
+
+test('migrations ack takes absolute, subdirectory and other-checkout paths, and says where it looked', async () => {
+  const s = await setupDeploy({ options: { migrationPaths: "['db/*.sql', 'db/old/*.sql']" }, change: { 'db/old/001.sql': '' },
+    seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }) });
+  const deps = s.deps;
+  assert.equal(await runAck({ cwd: s.work, files: [join(s.work, 'db', '001.sql')], deps }), 0, s.lines.join('\n'));
+  assert.equal(await runAck({ cwd: join(s.work, 'db', 'old'), files: ['./001.sql'], deps }), 0, s.lines.join('\n'));
+  assert.equal(await runAck({ cwd: s.work, files: [join(tmpdir(), 'another-checkout', 'db', 'old', '001.sql')], deps }), 0, s.lines.join('\n'));
+  assert.deepEqual([...(await readAcks(s.deps.stateRoot, 't/r'))].sort(), ['db/001.sql', 'db/old/001.sql']);
+  assert.equal(await runAck({ cwd: s.work, files: ['db/999_not_merged.sql'], deps }), 2);
+  assert.match(s.lines.join('\n'), /✗ db\/999_not_merged\.sql: not a migration on t\/r main@[0-9a-f]{7} \(looked in db\/\*\.sql, db\/old\/\*\.sql\); a migration that is not merged yet cannot be cleared — nothing recorded/);
+  assert.equal(await runAck({ cwd: s.work, files: ['001.sql'], deps }), 2);
+  assert.match(s.lines.join('\n'), /✗ 001\.sql: ambiguous \(db\/001\.sql, db\/old\/001\.sql\) — give the path; nothing recorded/);
 });
 
 test('adopt refuses a real commit that is only on a side branch', async () => {
