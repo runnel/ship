@@ -188,3 +188,26 @@ test('an interrupt inside a deployable ends the run: not a deploy failure, nothi
   assert.deepEqual((await s.cloud.wranglerCalls()).map((c) => c.cmd), ['versions upload']);
   for (const dir of ['w', 'locks', 'lanes']) assert.deepEqual(await readdir(join(s.deps.tmpRoot, dir)), [], dir);
 });
+
+test('the plan names the PRs each deployable will ship before anything is built', async () => {
+  const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }), change: { 'app/src/a.ts': '2' } });
+  await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
+  assert.equal(await s.deploy([], true), 0, s.lines.join('\n'));
+  const plan = s.lines.findIndex((l) => /app: .* · ships 1 commit\(s\): #9$/.test(l));
+  const firstBuildOrSetup = s.lines.findIndex((l) => /^▸ app:|setup:/.test(l));
+  assert.ok(plan >= 0, s.lines.join('\n'));
+  assert.ok(firstBuildOrSetup === -1 || plan < firstBuildOrSetup, s.lines.join('\n'));
+});
+
+test('a dry run ends by saying nothing was uploaded', async () => {
+  const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }), change: { 'app/src/a.ts': '2' } });
+  await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
+  assert.equal(await s.deploy([], true), 0, s.lines.join('\n'));
+  assert.equal(s.lines.at(-1), '✓ ship deploy --dry-run: everything selected built and passed its checks; nothing was uploaded');
+});
+
+test('a dry run with nothing pending still says everything is live', async () => {
+  const s = await setupDeploy({ seed: ({ head }) => ({ 'example-app': at(head), 'example-tick': at(head) }) });
+  assert.equal(await s.deploy([], true), 0, s.lines.join('\n'));
+  assert.equal(s.lines.at(-1), '✓ ship deploy: everything selected is live');
+});

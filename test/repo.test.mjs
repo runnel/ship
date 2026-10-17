@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { fakeGh, makeOrigin, tempDir } from './helpers.mjs';
-import { openTree, prRefs, syncMirror } from '../lib/repo.mjs';
+import { openTree, prRefs, shipsText, syncMirror } from '../lib/repo.mjs';
 
 const pkg = JSON.parse(await readFile(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'));
 
@@ -104,4 +104,10 @@ finish();
   } finally {
     child.kill('SIGKILL');
   }
+});
+
+test('shipsText names the PRs and counts commits without one', () => {
+  assert.equal(shipsText(['a (#9)', 'b (#12)', 'direct fix']), 'ships 3 commit(s): #9 #12 + 1 without a PR number');
+  assert.equal(shipsText(['a (#9)', 'b (#12)']), 'ships 2 commit(s): #9 #12');
+  assert.equal(shipsText(['direct fix']), 'ships 1 commit(s)');
 });
