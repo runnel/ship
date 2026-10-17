@@ -44,11 +44,12 @@ export async function setupDeploy({ options = {}, seed, change = null, probe = h
   const cloud = await fakeCloud({ dir: cloudDir, workers: seed({ first, head }), probe, clockStart, hosts: { 'https://app.example.com': 'example-app', 'https://tick.example.com': 'example-tick', 'https://job.example.com': 'example-job' } });
   const { gh } = await fakeGh(root, { pr: null });
   const lines = [];
+  let t = 0; // a fake clock: a settle window (deployDeps' default) passes without real waiting
   const deps = {
     gh, remoteUrl: () => origin, mirrorRoot: join(root, 'm'), tmpRoot: join(root, 'tmp'), logRoot: join(root, 'logs'), stateRoot: join(root, 'state'),
     out: (l) => lines.push(l), pollMs: 10, fetch: cloud.fetch,
     readCredentials: async () => ({ CLOUDFLARE_API_TOKEN: 'tok', CLOUDFLARE_ACCOUNT_ID: 'acc' }),
-    probeWindowMs: 0, probeIntervalMs: 0, sleep: async () => {},
+    probeWindowMs: 0, probeIntervalMs: 1000, now: () => t, sleep: async (ms) => { t += ms; },
   };
   const deploy = (names = [], dryRun = false, redeploy = false) => runDeploy({ cwd: work, names, dryRun, redeploy, deps });
   return { cloud, lines, deploy, deps, first, head, root, work };
