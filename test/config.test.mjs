@@ -106,3 +106,30 @@ test('migrations, requires, deploySetup shapes', () => {
   assert.throws(() => validateConfig(withDeploy({ requires: [{ repo: 'nope' }] })), /requires/);
   assert.throws(() => validateConfig(withDeploy({ deploySetup: [{ run: 'x', cwd: '../up' }] })), /deploySetup/);
 });
+
+test('wrong shapes are ConfigErrors, never TypeErrors', () => {
+  const badDep = (patch) => assert.throws(() => validateConfig(withDeploy({ deployables: [{ ...app, ...patch }] })), ConfigError);
+  badDep({ probes: 'GET /' });
+  badDep({ probes: {} });
+  badDep({ preDeploy: 'npm test' });
+  assert.throws(() => validateConfig({ ...base, checks: [null] }), ConfigError);
+});
+
+test('unknown keys in nested objects are refused', () => {
+  const badDep = (patch, re) => assert.throws(() => validateConfig(withDeploy({ deployables: [{ ...app, ...patch }] })), re);
+  assert.throws(() => validateConfig(withDeploy({ migrations: { paths: ['db/*.sql'], zzz: 1 } })), /migrations: unknown key zzz/);
+  assert.throws(() => validateConfig(withDeploy({ requires: [{ repo: 'acme/api', deployable: 'app', zzz: 1 }] })), /requires: unknown key zzz/);
+  assert.throws(() => validateConfig(withDeploy({ credentials: { ...creds, zzz: 1 } })), /credentials: unknown key zzz/);
+  badDep({ bundleCheck: { file: 'out/worker.js', pattern: 'x', allow: [], zzz: 1 } }, /bundleCheck: unknown key zzz/);
+  badDep({ envFiles: [{ from: '/etc/example.env', to: '.env', zzz: 1 }] }, /envFiles: unknown key zzz/);
+});
+
+test('unknown keys in liveMarker and check-level step objects are refused', () => {
+  assert.throws(() => validateConfig(withDeploy({ deployables: [{ ...app, liveMarker: { path: '/', file: '.next/BUILD_ID', zzz: 1 } }] })), /liveMarker: unknown key zzz/);
+  assert.throws(() => validateConfig({ ...base, checks: [{ ...base.checks[0], steps: [{ run: 'npm test', zzz: 1 }] }] }), /check unit steps: unknown key zzz/);
+});
+
+test('liveHost is checked even without probes', () => {
+  // A versioned deployable needs probes, so use the direct `tick` with its probes removed to reach the rule.
+  assert.throws(() => validateConfig(withDeploy({ deployables: [app, { ...tick, probes: [], liveHost: 'garbage' }] })), /liveHost must be https:\/\/host/);
+});
