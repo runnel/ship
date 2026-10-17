@@ -141,7 +141,9 @@ await deployOne({ d: { out: () => {}, tmpRoot: join(dir, 'tmp'), pollMs: 10, sta
       await new Promise((r) => setTimeout(r, 25));
     }
     child.kill('SIGTERM');
-    const [code] = await Promise.race([exit, new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not exit')), 15_000).unref())]);
+    // The unwind exits by its own hard deadline (30 s) at the latest; wait past it, so that only a
+    // child that breaks that promise fails here, not one slowed down by a loaded machine.
+    const [code] = await Promise.race([exit, new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not exit')), 40_000).unref())]);
     return { code, hold: await readHold(join(dir, 'state'), 't/r', 'app') };
   } finally {
     child.kill('SIGKILL');
@@ -579,6 +581,40 @@ test('a current version that stays the previous one through the window is held',
   assert.ok(c.now() >= 30_000);
 });
 
+// Answers the deployments list with no deployment at all for the next `reads` reads after the promote.
+const emptyAfterPromote = (reads) => (inner) => {
+  let promoted = false;
+  let left = reads;
+  return async (url, init = {}) => {
+    if (promoted && isList(url, init) && left > 0) {
+      left -= 1;
+      return new Response(JSON.stringify({ success: true, errors: [], result: { deployments: [] } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    const res = await inner(url, init);
+    if (init.method === 'POST') promoted = true;
+    return res;
+  };
+};
+
+test('a deployments list that shows no deployment for a few reads after the promote is waited out, not held', async () => {
+  const c = clock();
+  const fx = await fixture({ fetchWrap: emptyAfterPromote(2), deps: { settleWindowMs: 30_000, probeIntervalMs: 1000, now: c.now, sleep: c.sleep } });
+  const res = await deployOne(fx.ctx);
+  assert.equal(res.outcome, 'deployed', res.detail);
+  assert.equal(await readHold(fx.stateRoot, 't/r', 'app'), null);
+  assert.ok(c.now() >= 2000 && c.now() < 30_000, `waited ${c.now()} ms`);
+});
+
+test('a deployments list that shows no deployment through the window is held', async () => {
+  const c = clock();
+  const fx = await fixture({ fetchWrap: emptyAfterPromote(1000), deps: { settleWindowMs: 30_000, probeIntervalMs: 1000, now: c.now, sleep: c.sleep } });
+  const res = await deployOne(fx.ctx);
+  assert.equal(res.outcome, 'stuck');
+  assert.match(res.detail, /after the deploy no version is live, not ours .*hold set/);
+  assert.ok(await readHold(fx.stateRoot, 't/r', 'app'));
+  assert.ok(c.now() >= 30_000);
+});
+
 // Live probes fail on our version, so the deploy rolls back to the one live before it.
 const failingProbes = async ({ fetchWrap }) => {
   let oldId;
@@ -606,6 +642,24 @@ test('a rollback whose re-read still shows our version through the window is rep
   assert.match(res.detail, /Rolling back to [0-9a-f]{8} failed \(socket hang up\); our version [0-9a-f]{8} is still live; hold in place/);
   assert.ok(await readHold(stateRoot, 't/r', 'app'));
   assert.ok(c.now() >= 30_000);
+});
+
+test('a rollback whose answer is lost and whose re-read fails is reported stuck, not rolled back', async () => {
+  let sent = false;
+  const { cloud, ctx, stateRoot, oldId } = await failingProbes({ fetchWrap: (inner) => async (url, init = {}) => {
+    if (sent && isList(url, init)) throw new Error('socket hang up');
+    const res = await inner(url, init);
+    if (isRollback(init)) {
+      sent = true;
+      throw new Error('socket hang up');
+    }
+    return res;
+  } });
+  const res = await deployOne(ctx);
+  assert.equal(res.outcome, 'stuck', res.detail);
+  assert.match(res.detail, /Rolling back to [0-9a-f]{8} failed \(socket hang up\); could not read which version is live; hold in place/);
+  assert.equal(cloud.live('example-app'), oldId, 'the rollback was applied; ship could not see it, so it does not claim it');
+  assert.ok(await readHold(stateRoot, 't/r', 'app'));
 });
 
 test('a third version on the re-read after a lost rollback answer is reported at once', async () => {
@@ -800,7 +854,7 @@ test('a hold that cannot be cleared after a verified deploy is reported and the 
 
 // wrangler is told to make nothing, so the only thing that can write the hold is the interrupt
 // handler: the deploy's own flow sees live untouched and reports a failure.
-test('an interrupt while wrangler promotes leaves a hold; before the promote it leaves none', { timeout: 60_000 }, async () => {
+test('an interrupt while wrangler promotes leaves a hold; before the promote it leaves none', { timeout: 120_000 }, async () => {
   const promoting = await interruptDuringWrangler({ dep: { mode: 'direct' }, wrangler: { deploy: { create: false, sleepMs: 60_000 } } });
   assert.equal(promoting.code, 130);
   assert.match(promoting.hold?.reason ?? '', /interrupted while deploying/);

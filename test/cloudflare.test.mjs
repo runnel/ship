@@ -128,12 +128,16 @@ test('a token that cannot be a header value is refused without echoing it', () =
   }
 });
 
-test('cloudflareFor reads the mapped credentials once and builds the client', async () => {
+test('cloudflareFor reads the mapped credentials once and builds a client that uses them and d.fetch', async () => {
   const seen = [];
-  const d = { fetch: async () => new Response('{}'), readCredentials: async (c) => { seen.push(c); return { CLOUDFLARE_API_TOKEN: 'token-1234', CLOUDFLARE_ACCOUNT_ID: 'acct' }; } };
+  const { fetchImpl, calls } = fakeFetch({ 'GET workers/scripts/w/deployments?per_page=50': { success: true, result: { deployments: [] } } });
+  const d = { fetch: fetchImpl, readCredentials: async (c) => { seen.push(c); return { CLOUDFLARE_API_TOKEN: 'token-1234', CLOUDFLARE_ACCOUNT_ID: ACCOUNT }; } };
+  await assert.rejects(cloudflareFor(d, null), /has no credentials/);
+  assert.deepEqual(seen, [], 'no credentials configured: nothing is read');
   const { creds, cf } = await cloudflareFor(d, { file: 'x.env', map: {} });
   assert.equal(creds.CLOUDFLARE_API_TOKEN, 'token-1234');
-  assert.equal(typeof cf.deployments, 'function');
   assert.deepEqual(seen, [{ file: 'x.env', map: {} }]);
-  await assert.rejects(cloudflareFor(d, null), /has no credentials/);
+  assert.deepEqual(await cf.deployments('w'), []);
+  assert.equal(calls.length, 1, 'the request went through d.fetch, to the account the credentials name');
+  assert.equal(calls[0].auth, 'Bearer token-1234');
 });
