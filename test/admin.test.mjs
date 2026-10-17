@@ -247,6 +247,29 @@ test('a manual rollback whose lost answer is followed by a lagging list is waite
   assert.ok(waited >= 2000 && waited < 30_000, `waited ${waited} ms`);
 });
 
+test('a manual rollback from a split deployment waits out a list that still shows the split', async () => {
+  const s = await setupDeploy({ change: { 'app/src/a.ts': '2' }, seed: twoVersions });
+  const to = await versionPrefix(s.cloud, 'example-app', 0);
+  const liveId = (await s.cloud.state('example-app')).versions[1].id;
+  let sent = false;
+  const splitUntilRollback = async (url, init = {}) => {
+    if (init.method === 'POST' && String(init.body ?? '').includes(' rollback')) sent = true;
+    const res = await s.cloud.fetch(url, init);
+    if (sent || (init.method ?? 'GET') !== 'GET' || !url.includes('/example-app/deployments')) return res;
+    const body = await res.json();
+    body.result.deployments[0].versions = [{ version_id: liveId, percentage: 50 }, { version_id: 'f'.repeat(36), percentage: 50 }];
+    return new Response(JSON.stringify(body), { status: 200 });
+  };
+  const t0 = s.deps.now();
+  const deps = { ...s.deps, fetch: lostAndStale(splitUntilRollback, 2), settleWindowMs: 30_000, probeIntervalMs: 1000 };
+  assert.equal(await runRollback({ cwd: s.work, name: 'app', to, deps }), 0, s.lines.join('\n'));
+  const text = s.lines.join('\n');
+  assert.match(text, /now: live unknown \(the current deployment splits traffic/);
+  assert.match(text, /! app: no answer to the rollback \(socket hang up\); reading which version is live \(up to 30 s\)/);
+  assert.match(text, new RegExp(`✓ app: ${to} is live; hold set`));
+  assert.ok(s.deps.now() - t0 >= 2000);
+});
+
 test('a manual rollback whose re-read shows the old version through the window is reported unknown', async () => {
   const s = await setupDeploy({ change: { 'app/src/a.ts': '2' }, seed: twoVersions });
   const to = await versionPrefix(s.cloud, 'example-app', 0);

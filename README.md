@@ -340,9 +340,9 @@ deploy ends stuck and the output says which.
 
 `ship rollback <name> --to <version>` sets the hold first too. A refusal from Cloudflare changed
 nothing, and the hold goes back to what it was. When the request gets no answer, ship reads which
-version is live, through the same 30 s settle window (re-reading while the list still shows the
-version that was live before the request, or none): the target means the rollback took effect, and
-it is reported as done and probed like any other. Anything else is reported as an unknown outcome
+version is live, through the same 30 s settle window (it says so, and re-reads while the list
+still names the version it named before the request, or none): the target means the rollback took
+effect, and it is reported as done and probed like any other. Anything else is reported as an unknown outcome
 that names the version that is live (or says that it could not be read), and the hold stays: look
 with `ship status`.
 
