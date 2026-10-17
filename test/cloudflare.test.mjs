@@ -140,4 +140,5 @@ test('cloudflareFor reads the mapped credentials once and builds a client that u
   assert.deepEqual(await cf.deployments('w'), []);
   assert.equal(calls.length, 1, 'the request went through d.fetch, to the account the credentials name');
   assert.equal(calls[0].auth, 'Bearer token-1234');
+  assert.ok(calls[0].url.includes(`/accounts/${ACCOUNT}/`), calls[0].url);
 });

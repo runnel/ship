@@ -134,17 +134,18 @@ await deployOne({ d: { out: () => {}, tmpRoot: join(dir, 'tmp'), pollMs: 10, sta
   const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'inherit'] });
   const exit = once(child, 'exit');
   try {
-    const until = Date.now() + 15_000;
+    const until = Date.now() + 30_000;
     const called = async () => (await readFile(join(dir, 'cloud', 'wrangler-calls.jsonl'), 'utf8').catch(() => '')).trim() !== '';
     while (!(await called())) {
       if (child.exitCode !== null || Date.now() > until) throw new Error('the child never started wrangler');
       await new Promise((r) => setTimeout(r, 25));
     }
+    const signalled = Date.now();
     child.kill('SIGTERM');
     // The unwind exits by its own hard deadline (30 s) at the latest; wait past it, so that only a
     // child that breaks that promise fails here, not one slowed down by a loaded machine.
     const [code] = await Promise.race([exit, new Promise((_, reject) => setTimeout(() => reject(new Error('the child did not exit')), 40_000).unref())]);
-    return { code, hold: await readHold(join(dir, 'state'), 't/r', 'app') };
+    return { code, exitMs: Date.now() - signalled, hold: await readHold(join(dir, 'state'), 't/r', 'app') };
   } finally {
     child.kill('SIGKILL');
   }
@@ -854,13 +855,16 @@ test('a hold that cannot be cleared after a verified deploy is reported and the 
 
 // wrangler is told to make nothing, so the only thing that can write the hold is the interrupt
 // handler: the deploy's own flow sees live untouched and reports a failure.
-test('an interrupt while wrangler promotes leaves a hold; before the promote it leaves none', { timeout: 120_000 }, async () => {
+test('an interrupt while wrangler promotes leaves a hold; before the promote it leaves none', { timeout: 150_000 }, async () => {
   const promoting = await interruptDuringWrangler({ dep: { mode: 'direct' }, wrangler: { deploy: { create: false, sleepMs: 60_000 } } });
   assert.equal(promoting.code, 130);
   assert.match(promoting.hold?.reason ?? '', /interrupted while deploying/);
+  // Well inside the unwind's 30 s hard deadline: a hung unwind also exits 130, by that deadline.
+  assert.ok(promoting.exitMs < 25_000, `exited ${promoting.exitMs} ms after the signal`);
   const uploading = await interruptDuringWrangler({ dep: { mode: 'versioned' }, wrangler: { 'versions upload': { sleepMs: 60_000 } } });
   assert.equal(uploading.code, 130);
   assert.equal(uploading.hold, null);
+  assert.ok(uploading.exitMs < 25_000, `exited ${uploading.exitMs} ms after the signal`);
 });
 
 // Nothing can run in a process that is killed outright, so the hold has to be there before.
