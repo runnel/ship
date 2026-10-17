@@ -26,7 +26,7 @@ const TICK = { name: 'tick', worker: 'example-tick', cwd: 'workers/tick', paths:
   probes: [{ path: '/', status: 403 }], liveHost: 'https://tick.example.com' };
 const healthy = ({ path }) => (path === '/login' ? { status: 200, body: '<!--BUILD42-->' } : path === '/' ? 403 : 200);
 
-async function fixture({ dep = APP, patch = {}, probe = healthy, wrangler = {}, previews = true, liveConfig = null, targetConfig = null, configFile = 'wrangler.json', fresh = false, fetchWrap = (f) => f } = {}) {
+async function fixture({ dep = APP, patch = {}, probe = healthy, wrangler = {}, previews = true, liveConfig = null, targetConfig = null, configFile = 'wrangler.json', fresh = false, fetchWrap = (f) => f, deps = {} } = {}) {
   const dir = await tempDir('adapter-');
   const cloud = await fakeCloud({
     dir: join(dir, 'cloud'), probe, wrangler, hosts: { 'https://app.example.com': 'example-app', 'https://tick.example.com': 'example-tick' },
@@ -48,7 +48,7 @@ async function fixture({ dep = APP, patch = {}, probe = healthy, wrangler = {}, 
   const [deployments, versions] = await Promise.all([cf.deployments(d0.worker), cf.versions(d0.worker)]);
   const lines = [];
   const stateRoot = join(dir, 'state');
-  const d = { out: (l) => lines.push(l), tmpRoot: join(dir, 'tmp'), pollMs: 10, stateRoot, fetch: fetchImpl, probeWindowMs: 0, probeIntervalMs: 0, sleep: async () => {} };
+  const d = { out: (l) => lines.push(l), tmpRoot: join(dir, 'tmp'), pollMs: 10, stateRoot, fetch: fetchImpl, probeWindowMs: 0, probeIntervalMs: 0, sleep: async () => {}, ...deps };
   const ctx = { d, r: { repo: 't/r' }, wt, dep: d0, entry: { live: resolveLive({ deployments, versions }) }, cf, creds, target: NEW, nonce: 'n0nce0', note: '#7',
     logFile: join(dir, 'deploy.log'), dryRun: false, readAt: async () => liveConfig ?? plain };
   return { cloud, ctx, lines, wt, stateRoot, d0 };
@@ -460,8 +460,8 @@ test('a rollback whose answer is lost is checked against what is live', async ()
   const { cloud, ctx, stateRoot } = await fixture({ fetchWrap: loseRollbackAnswer, probe: (p) => (p.preview || p.versionId === oldId ? healthy(p) : 500) });
   oldId = cloud.live('example-app');
   const res = await deployOne(ctx);
-  assert.equal(res.outcome, 'stuck');
-  assert.match(res.detail, /Rolling back to .* failed .*socket hang up.*the rollback did take effect: .*hold in place/);
+  assert.equal(res.outcome, 'rolled-back', res.detail);
+  assert.match(res.detail, /Rolled back to .*the answer to the rollback was lost; the re-read shows it took effect/);
   assert.equal(cloud.live('example-app'), oldId);
   assert.ok(await readHold(stateRoot, 't/r', 'app'));
 });
@@ -488,10 +488,16 @@ test('a changed Durable Object migration is not rolled back past', async () => {
   assert.match((await readHold(stateRoot, 't/r', 'tick')).reason, /live probes failed/);
 });
 
+const clock = () => {
+  let t = 0;
+  return { now: () => t, sleep: async (ms) => { t += ms; } };
+};
+
 test('another version current right after the promote is held, not rolled over', async () => {
   const other = 'c'.repeat(40);
+  const c = clock();
   let cloud;
-  const fx = await fixture({ fetchWrap: (inner) => async (url, init = {}) => {
+  const fx = await fixture({ deps: { settleWindowMs: 30_000, probeIntervalMs: 1000, now: c.now, sleep: c.sleep }, fetchWrap: (inner) => async (url, init = {}) => {
     const res = await inner(url, init);
     if (cloud && init.method === 'POST') {
       const v = cloud.addVersion('example-app', { message: `sha:${other} other` });
@@ -505,6 +511,43 @@ test('another version current right after the promote is held, not rolled over',
   assert.match(res.detail, /after the deploy the current version is .*, not ours .*hold set/);
   assert.equal(posts(cloud).length, 1);
   assert.ok(await readHold(fx.stateRoot, 't/r', 'app'));
+  assert.equal(c.now(), 0, 'a third version is somebody else\'s deploy: held at once, not waited on');
+});
+
+// Answers the deployments list as it was before the promote for the next `reads` reads after it.
+const staleAfterPromote = (reads) => (inner) => {
+  let promoted = false;
+  let before = null;
+  let left = reads;
+  return async (url, init = {}) => {
+    const isList = (init.method ?? 'GET') === 'GET' && url.includes('/deployments');
+    if (promoted && isList && before !== null && left > 0) {
+      left -= 1;
+      return new Response(before, { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    const res = await inner(url, init);
+    if (isList && !promoted) before = await res.clone().text();
+    if (init.method === 'POST') promoted = true;
+    return res;
+  };
+};
+
+test('a current version that lags the promote for a few reads is waited out, not held', async () => {
+  const c = clock();
+  const fx = await fixture({ fetchWrap: staleAfterPromote(2), deps: { settleWindowMs: 30_000, probeIntervalMs: 1000, now: c.now, sleep: c.sleep } });
+  const res = await deployOne(fx.ctx);
+  assert.equal(res.outcome, 'deployed', res.detail);
+  assert.equal(await readHold(fx.stateRoot, 't/r', 'app'), null);
+  assert.ok(c.now() >= 2000);
+});
+
+test('a current version that stays the previous one through the window is held', async () => {
+  const c = clock();
+  const fx = await fixture({ fetchWrap: staleAfterPromote(1000), deps: { settleWindowMs: 30_000, probeIntervalMs: 1000, now: c.now, sleep: c.sleep } });
+  const res = await deployOne(fx.ctx);
+  assert.equal(res.outcome, 'stuck');
+  assert.match(res.detail, /after the deploy the current version is .*, not ours .*hold set/);
+  assert.ok(c.now() >= 30_000);
 });
 
 test('a first deploy has nothing to roll back to: a failing live probe holds', async () => {

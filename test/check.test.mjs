@@ -5,7 +5,7 @@ import { mkdir, readdir, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runCheck } from '../lib/check.mjs';
-import { setupCheck as setup, CONFIG, git, tempDir } from './helpers.mjs';
+import { setupCheck as setup, CONFIG, git, tempDir, commitFiles, fakeGh, statusesOf } from './helpers.mjs';
 
 test('a green check of the PR merged with main', async () => {
   const s = await setup();
@@ -243,4 +243,62 @@ test('a pull request config that ignores SIGTERM cannot hang the check: it is ki
   assert.equal(await runCheck({ cwd: s.work, deps: { ...s.deps, treeConfigTimeoutMs: 1500 } }), 1);
   assert.ok(Date.now() - started < 30_000, `took ${Date.now() - started} ms`);
   assert.match((await lastStatus(s)).description, /deployable w imports lib\/y.ts/);
+});
+
+// The work clone's `origin` remote is a GitHub URL; push to the bare repo the fixture serves instead.
+async function pushSecondFeatCommit(s) {
+  const old = (await git(['rev-parse', 'feat'], s.work)).trim();
+  const tip = await commitFiles(s.work, { 'src/y.ts': 'y\n' }, 'second commit');
+  await git(['push', '--quiet', s.origin, 'feat'], s.work);
+  return { old, tip };
+}
+
+const PR = (head) => ({ number: 7, headRefOid: head, headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'OPEN' });
+
+test('a head GitHub has not caught up with yet is waited for, then checked', async () => {
+  const s = await setup();
+  const { old, tip } = await pushSecondFeatCommit(s);
+  const g = await fakeGh(await tempDir(), { pr: PR(old), prSequence: [{ headRefOid: old }, { headRefOid: old }, { headRefOid: tip }] });
+  const code = await runCheck({ cwd: s.work, pr: '7', deps: { ...s.deps, gh: g.gh, headPollMs: 1, headWaitMs: 5_000, sleep: async () => {} } });
+  assert.equal(code, 0, s.lines.join('\n'));
+  assert.match(s.lines.join('\n'), /GitHub still shows .* as the head of #7; the branch is at .* waiting for GitHub/);
+  const posted = statusesOf(await g.calls());
+  assert.ok(posted.length > 0);
+  assert.ok(posted.every((x) => x.sha === tip), JSON.stringify(posted));
+});
+
+test('a head GitHub never catches up with is not checked and gets no status', async () => {
+  const s = await setup();
+  const { old } = await pushSecondFeatCommit(s);
+  const g = await fakeGh(await tempDir(), { pr: PR(old) });
+  const code = await runCheck({ cwd: s.work, pr: '7', deps: { ...s.deps, gh: g.gh, headPollMs: 1, headWaitMs: 20, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) } });
+  assert.equal(code, 1);
+  assert.match(s.lines.join('\n'), /✗ local-ci not run: GitHub still shows .* run ship check again in a minute/);
+  assert.deepEqual(statusesOf(await g.calls()), []);
+});
+
+const MIGRATIONS = "export default { repo: 't/r', docsOnly: ['*.md'], migrations: { paths: ['db/*.sql'] }, checks: [{ name: 'unit', paths: ['src/**'], steps: ['test -f src/x.ts'] }] };\n";
+
+test('another open PR adding the same migration prefix is a warning, not a failure', async () => {
+  const s = await setup({
+    configText: MIGRATIONS, featFiles: { 'src/x.ts': 'x\n', 'db/002_feature.sql': '' },
+    ghOptions: { openPrs: [{ number: 7, files: [{ path: 'db/002_feature.sql' }] }, { number: 8, files: [{ path: 'db/002_other.sql' }, { path: 'README.md' }] }] },
+  });
+  assert.equal(await runCheck({ cwd: s.work, pr: '7', deps: s.deps }), 0, s.lines.join('\n'));
+  assert.match(s.lines.join('\n'), /! migration prefix 002 is also added by open PR #8 \(db\/002_other\.sql\) — whichever merges second must renumber/);
+  const final = (await s.statuses()).at(-1);
+  assert.equal(final.state, 'success');
+  assert.match(final.description, /migration 002 also in #8/);
+});
+
+test('no migration added: open PRs are not listed', async () => {
+  const s = await setup({ configText: MIGRATIONS, ghOptions: { openPrs: [{ number: 8, files: [{ path: 'db/002_other.sql' }] }] } });
+  assert.equal(await runCheck({ cwd: s.work, pr: '7', deps: s.deps }), 0);
+  assert.ok(!(await s.calls()).some((a) => a[0] === 'pr' && a[1] === 'list'));
+});
+
+test('listing open PRs failing does not fail the check', async () => {
+  const s = await setup({ configText: MIGRATIONS, featFiles: { 'src/x.ts': 'x\n', 'db/002_feature.sql': '' }, ghOptions: { prListFail: true } });
+  assert.equal(await runCheck({ cwd: s.work, pr: '7', deps: s.deps }), 0);
+  assert.match(s.lines.join('\n'), /! could not compare migration prefixes with open PRs \(HTTP 502: Bad Gateway\)/);
 });

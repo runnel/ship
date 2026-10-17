@@ -46,15 +46,32 @@ export async function makeOrigin(files) {
 // apiDelay = { ms, match }: `gh api` calls whose arguments contain `match` answer after `ms`; every
 // answered api call is logged again as ['done', ...args], so a call that was killed is visible.
 // apiFail = { match }: `gh api` calls whose arguments contain `match` fail (exit 1), as gh does offline.
-export async function fakeGh(dir, { pr, repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null }) {
+// prSequence = [overrides…]: the Nth `gh pr view` answers `pr` merged with the Nth entry (the last
+// entry repeats), as GitHub does while it catches up with a push; empty: every answer is `pr`.
+// openPrs = [{ number, files: [{ path }] }]: what `gh pr list` prints (the open pull requests).
+// prListFail: `gh pr list` fails (exit 1) with a reason on stderr, as gh does when GitHub is unreachable.
+export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false }) {
   const log = join(dir, 'gh.log');
   const script = join(dir, 'gh');
+  const viewCount = join(dir, 'gh-pr-view.count');
   await writeFile(script, `#!/usr/bin/env node
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');
 const reply = (v) => { process.stdout.write(JSON.stringify(v)); process.exit(0); };
-if (args[0] === 'pr' && args[1] === 'view') reply(${JSON.stringify(pr)});
+if (args[0] === 'pr' && args[1] === 'view') {
+  const sequence = ${JSON.stringify(prSequence)};
+  let i = 0;
+  if (sequence.length > 0) {
+    try { i = Number(fs.readFileSync(${JSON.stringify(viewCount)}, 'utf8')) || 0; } catch { /* first call */ }
+    fs.writeFileSync(${JSON.stringify(viewCount)}, String(i + 1));
+  }
+  reply({ ...${JSON.stringify(pr)}, ...(sequence.length > 0 ? sequence[Math.min(i, sequence.length - 1)] : {}) });
+}
+if (args[0] === 'pr' && args[1] === 'list') {
+  if (${JSON.stringify(prListFail)}) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
+  reply(${JSON.stringify(openPrs)});
+}
 if (args[0] === 'repo' && args[1] === 'view') reply(${JSON.stringify(repo)});
 if (args[0] === 'run' && args[1] === 'list') reply(${JSON.stringify(runs)});
 if (args[0] === 'api') {
@@ -72,6 +89,15 @@ if (args[0] === 'api') {
   const calls = async () => (await readFile(log, 'utf8').catch(() => '')).split('\n').filter(Boolean).map((l) => JSON.parse(l));
   return { gh: script, calls };
 }
+
+// The status posts among a fake gh's recorded calls: [{ sha, state, description }].
+export const statusesOf = (calls) =>
+  calls
+    .filter((a) => a[0] === 'api')
+    .map((a) => ({
+      sha: a[3].slice(a[3].lastIndexOf('/') + 1),
+      ...Object.fromEntries(a.filter((x) => /^(state|description)=/.test(x)).map((x) => [x.slice(0, x.indexOf('=')), x.slice(x.indexOf('=') + 1)])),
+    }));
 
 export const CONFIG = (steps, extra = {}) =>
   `export default { repo: 't/r', docsOnly: ['*.md'], checks: [${JSON.stringify({ name: 'unit', paths: ['src/**'], steps, ...extra })}] };\n`;
@@ -98,10 +124,7 @@ export async function setupCheck({
     mirrorRoot: join(root, 'mirrors'), tmpRoot: join(root, 'tmp'), logRoot: join(root, 'logs'),
     out: (s) => lines.push(s), pollMs: 10,
   };
-  const statuses = async () =>
-    (await fake.calls())
-      .filter((a) => a[0] === 'api')
-      .map((a) => Object.fromEntries(a.filter((x) => /^(state|description)=/.test(x)).map((x) => [x.slice(0, x.indexOf('=')), x.slice(x.indexOf('=') + 1)])));
+  const statuses = async () => statusesOf(await fake.calls());
   return { work, deps, statuses, lines, origin, root, gh: fake.gh, calls: fake.calls };
 }
 
