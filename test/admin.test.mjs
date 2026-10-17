@@ -298,6 +298,30 @@ test('a manual rollback whose re-read shows a third version reports it at once',
   assert.equal(s.deps.now() - t0, 0, 'another version is somebody else\'s: reported at once, not waited on');
 });
 
+test('a manual rollback whose unanswered request is followed by a split is reported unknown, even with the target first', async () => {
+  const s = await setupDeploy({ change: { 'app/src/a.ts': '2' }, seed: twoVersions });
+  const to = await versionPrefix(s.cloud, 'example-app', 0);
+  const targetId = (await s.cloud.state('example-app')).versions[0].id;
+  let sent = false;
+  const splitAfterRollback = async (url, init = {}) => {
+    if (init.method === 'POST' && String(init.body ?? '').includes(' rollback')) {
+      sent = true;
+      throw new Error('socket hang up'); // the request never reached Cloudflare
+    }
+    const res = await s.deps.fetch(url, init);
+    if (!sent || (init.method ?? 'GET') !== 'GET' || !url.includes('/example-app/deployments')) return res;
+    const body = await res.json();
+    body.result.deployments[0].versions = [{ version_id: targetId, percentage: 50 }, { version_id: 'f'.repeat(36), percentage: 50 }];
+    return new Response(JSON.stringify(body), { status: 200 });
+  };
+  const t0 = s.deps.now();
+  const deps = { ...s.deps, fetch: splitAfterRollback, settleWindowMs: 30_000, probeIntervalMs: 1000 };
+  assert.equal(await runRollback({ cwd: s.work, name: 'app', to, deps }), 1, s.lines.join('\n'));
+  assert.match(s.lines.join('\n'), /rollback outcome unknown \(socket hang up\); the current deployment splits traffic between versions; the hold stays/);
+  assert.ok(await readHold(s.deps.stateRoot, 't/r', 'app'));
+  assert.equal(s.deps.now() - t0, 0, 'the list did not show a split before the request: reported at once, not waited on');
+});
+
 test('rollback refused by Cloudflare puts an earlier hold back exactly as it was', async () => {
   const s = await setupDeploy({ change: { 'app/src/a.ts': '2' }, seed: ({ first, head }) => ({
     'example-app': { versions: [{ message: `sha:${first} a` }, { message: `sha:${head} b` }, { triggered: 'secret' }], deployments: [{ versionId: null }] },

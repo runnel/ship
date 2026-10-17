@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { codeSha, madeBySecretPut, newestVersion, parseSha, previousCode, resolveLive, secretChangesBetween } from '../lib/live.mjs';
+import { SPLIT, codeSha, currentOf, describeCurrent, madeBySecretPut, newestVersion, parseSha, previousCode, resolveLive, secretChangesBetween } from '../lib/live.mjs';
 
 const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
@@ -23,6 +23,18 @@ test('no deployment: none; a split: unknown', () => {
   assert.deepEqual(resolveLive({ deployments: [], versions: [] }), { state: 'none' });
   const split = { ...dep(1, 'v1', `sha:${A}`), versions: [{ version_id: 'v1', percentage: 50 }, { version_id: 'v2', percentage: 50 }] };
   assert.equal(resolveLive({ deployments: [split], versions: [] }).state, 'unknown');
+});
+
+test('currentOf: the newest deployment, whatever order the API used; a split is never a version', () => {
+  assert.equal(currentOf([]), null);
+  assert.equal(currentOf([dep(1, 'v1'), dep(3, 'v3'), dep(2, 'v2')]), 'v3');
+  // Even with the version a caller waits for first, a split is not that version.
+  const split = { ...dep(4, 'v3'), versions: [{ version_id: 'v3', percentage: 50 }, { version_id: 'v1', percentage: 50 }] };
+  assert.equal(currentOf([dep(3, 'v3'), split, dep(1, 'v1')]), SPLIT);
+  assert.equal(currentOf([{ ...dep(5, 'v1'), versions: [{ version_id: 'v1', percentage: 99 }] }, split]), SPLIT);
+  assert.equal(describeCurrent(SPLIT), 'the current deployment splits traffic between versions');
+  assert.equal(describeCurrent('0123456789abcdef'), 'version 01234567 is live');
+  assert.equal(describeCurrent(null), 'version none is live');
 });
 
 test("the newest deployment's own sha wins, whatever order the API used", () => {
