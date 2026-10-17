@@ -34,7 +34,7 @@ test('currentOf: the newest deployment, whatever order the API used; a split is 
   assert.equal(currentOf([{ ...dep(5, 'v1'), versions: [{ version_id: 'v1', percentage: 99 }] }, split]), SPLIT);
   assert.equal(describeCurrent(SPLIT), 'the current deployment splits traffic between versions');
   assert.equal(describeCurrent('0123456789abcdef'), 'version 01234567 is live');
-  assert.equal(describeCurrent(null), 'version none is live');
+  assert.equal(describeCurrent(null), 'no version is live');
 });
 
 test("the newest deployment's own sha wins, whatever order the API used", () => {
