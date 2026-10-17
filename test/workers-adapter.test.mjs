@@ -460,8 +460,8 @@ test('a rollback whose answer is lost is checked against what is live', async ()
   const { cloud, ctx, stateRoot } = await fixture({ fetchWrap: loseRollbackAnswer, probe: (p) => (p.preview || p.versionId === oldId ? healthy(p) : 500) });
   oldId = cloud.live('example-app');
   const res = await deployOne(ctx);
-  assert.equal(res.outcome, 'stuck');
-  assert.match(res.detail, /Rolling back to .* failed .*socket hang up.*the rollback did take effect: .*hold in place/);
+  assert.equal(res.outcome, 'rolled-back', res.detail);
+  assert.match(res.detail, /Rolled back to .*the answer to the rollback was lost; the re-read shows it took effect/);
   assert.equal(cloud.live('example-app'), oldId);
   assert.ok(await readHold(stateRoot, 't/r', 'app'));
 });

@@ -173,13 +173,41 @@ test('rollback keeps the hold when the promote may or may not have happened', as
   const to = await versionPrefix(s.cloud, 'example-app', 0);
   const down = promoteFails(s.cloud, () => { throw new TypeError('fetch failed'); });
   assert.equal(await runRollback({ cwd: s.work, name: 'app', to, deps: { ...s.deps, fetch: down } }), 1);
-  assert.match(s.lines.join('\n'), /rollback outcome unknown \(fetch failed\); the hold stays/);
+  assert.match(s.lines.join('\n'), /rollback outcome unknown \(fetch failed\); version [0-9a-f]{8} is live; the hold stays/);
   assert.match((await readHold(s.deps.stateRoot, 't/r', 'app')).reason, /rolled back to/);
   // an answer that is not Cloudflare's own refusal counts as unknown as well
   await runUnhold({ cwd: s.work, name: 'app', deps: s.deps });
   const gateway = promoteFails(s.cloud, () => new Response('bad gateway', { status: 502 }));
   assert.equal(await runRollback({ cwd: s.work, name: 'app', to, deps: { ...s.deps, fetch: gateway } }), 1);
   assert.match(s.lines.join('\n'), /outcome unknown \(Cloudflare POST .*HTTP 502/);
+  assert.ok(await readHold(s.deps.stateRoot, 't/r', 'app'));
+  // when Cloudflare cannot be read afterwards either, the report says it cannot tell
+  await runUnhold({ cwd: s.work, name: 'app', deps: s.deps });
+  let promoted = false;
+  const blind = async (url, init) => {
+    if (promoted || init?.method === 'POST') {
+      promoted = true;
+      throw new TypeError('fetch failed');
+    }
+    return s.cloud.fetch(url, init);
+  };
+  s.lines.length = 0;
+  assert.equal(await runRollback({ cwd: s.work, name: 'app', to, deps: { ...s.deps, fetch: blind } }), 1);
+  assert.match(s.lines.join('\n'), /rollback outcome unknown \(fetch failed\); could not read which version is live; the hold stays/);
+  assert.ok(await readHold(s.deps.stateRoot, 't/r', 'app'));
+});
+
+test('a manual rollback whose answer was lost but which took effect is reported as done', async () => {
+  const s = await setupDeploy({ change: { 'app/src/a.ts': '2' }, seed: twoVersions });
+  const to = await versionPrefix(s.cloud, 'example-app', 0);
+  const inner = s.deps.fetch;
+  const loseAnswer = async (url, init = {}) => {
+    const res = await inner(url, init);
+    if (init.method === 'POST' && String(init.body ?? '').includes(' rollback')) throw new Error('socket hang up');
+    return res;
+  };
+  assert.equal(await runRollback({ cwd: s.work, name: 'app', to, deps: { ...s.deps, fetch: loseAnswer } }), 0, s.lines.join('\n'));
+  assert.match(s.lines.join('\n'), /✓ app: .* is live; hold set/);
   assert.ok(await readHold(s.deps.stateRoot, 't/r', 'app'));
 });
 
