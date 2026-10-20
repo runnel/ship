@@ -108,7 +108,9 @@ under `~/.ship/logs/`. A step that outlives its `timeoutMin` is killed together 
 started. Background processes a step leaves running (a build worker, a dev server) stay available to
 the later steps and are stopped when the check ends, with a line saying so. A daemon that detaches
 itself (`setsid`, `pg_ctl start`) escapes that: stop it from a `trap` in the script that starts it. Two checks of the same commit started at the same time run once. Ctrl-C stops the running
-step, marks the status as errored (never as success) and cleans up. Times in messages use the
+step, marks the status as errored (never as success) and cleans up. A check that uses the heavy
+lane prints `! on battery power` right after the groups line when `pmset` (macOS only) says the Mac
+is on battery, because heavy checks time out more often there; it warns and goes on. Times in messages use the
 system time zone; `SHIP_TZ=UTC` (any IANA name) overrides it.
 
 Short-lived state (locks, lanes, worktrees) lives in a per-user directory created with mode 0700:

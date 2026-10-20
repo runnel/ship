@@ -123,6 +123,7 @@ export async function setupCheck({
     gh: fake.gh, remoteUrl: () => origin,
     mirrorRoot: join(root, 'mirrors'), tmpRoot: join(root, 'tmp'), logRoot: join(root, 'logs'),
     out: (s) => lines.push(s), pollMs: 10,
+    onBattery: async () => false, // never ask the real pmset: a test that wants the warning injects its own
   };
   const statuses = async () => statusesOf(await fake.calls());
   return { work, deps, statuses, lines, origin, root, gh: fake.gh, calls: fake.calls };
