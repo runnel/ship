@@ -42,6 +42,9 @@ test('recheckOnMainChange is a list of globs, empty unless set', () => {
   assert.deepEqual(validateConfig({ ...base, recheckOnMainChange: ['db/migrations/**'] }).recheckOnMainChange, ['db/migrations/**']);
   assert.throws(() => validateConfig({ ...base, recheckOnMainChange: 'db/**' }), /recheckOnMainChange/);
   assert.throws(() => validateConfig({ ...base, recheckOnMainChange: [1] }), /recheckOnMainChange/);
+  for (const never of ['./db/**', '/db/**', 'db/migrations/', 'db/', '']) {
+    assert.throws(() => validateConfig({ ...base, recheckOnMainChange: ['ok/**', never] }), /recheckOnMainChange: .* can never match/, JSON.stringify(never));
+  }
 });
 
 test('loads an object export', async () => {

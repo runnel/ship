@@ -47,12 +47,15 @@ export async function makeOrigin(files) {
 // answered api call is logged again as ['done', ...args], so a call that was killed is visible.
 // apiFail = { match }: `gh api` calls whose arguments contain `match` fail (exit 1), as gh does offline.
 // prSequence = [overrides…]: the Nth `gh pr view` answers `pr` merged with the Nth entry (the last
-// entry repeats), as GitHub does while it catches up with a push; empty: every answer is `pr`.
+// entry repeats), as GitHub does while it catches up with a push; empty: every answer is `pr`. An
+// entry { fail: true } makes that `gh pr view` fail (exit 1) instead.
 // openPrs = [{ number, files: [{ path }] }]: what `gh pr list` prints (the open pull requests).
 // prListFail: `gh pr list` fails (exit 1) with a reason on stderr, as gh does when GitHub is unreachable.
-// statuses = [{ context, state, description }]: what the combined-status call of a commit answers.
+// statuses = { <sha>: [{ context, state, description }] }: what the combined-status call answers for
+// that commit (an empty list for any other sha, as GitHub does for a commit without statuses).
 // mergeFail = 'reason': `gh pr merge` fails (exit 1) with that reason on stderr, as gh does when GitHub refuses.
-export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false, statuses = null, mergeFail = null }) {
+// mergeDelayMs: `gh pr merge` answers only after that long (a hung call).
+export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false, statuses = null, mergeFail = null, mergeDelayMs = 0 }) {
   const log = join(dir, 'gh.log');
   const script = join(dir, 'gh');
   const viewCount = join(dir, 'gh-pr-view.count');
@@ -68,19 +71,21 @@ if (args[0] === 'pr' && args[1] === 'view') {
     try { i = Number(fs.readFileSync(${JSON.stringify(viewCount)}, 'utf8')) || 0; } catch { /* first call */ }
     fs.writeFileSync(${JSON.stringify(viewCount)}, String(i + 1));
   }
-  reply({ ...${JSON.stringify(pr)}, ...(sequence.length > 0 ? sequence[Math.min(i, sequence.length - 1)] : {}) });
+  const entry = sequence.length > 0 ? sequence[Math.min(i, sequence.length - 1)] : {};
+  if (entry.fail) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
+  reply({ ...${JSON.stringify(pr)}, ...entry });
 }
 if (args[0] === 'pr' && args[1] === 'list') {
   if (${JSON.stringify(prListFail)}) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
   reply(${JSON.stringify(openPrs)});
 }
 if (args[0] === 'pr' && args[1] === 'merge') {
+  if (${JSON.stringify(mergeDelayMs)} > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${JSON.stringify(mergeDelayMs)});
   if (${JSON.stringify(mergeFail)}) { process.stderr.write(${JSON.stringify(mergeFail)} + '\\n'); process.exit(1); }
   reply({});
 }
-if (args[0] === 'api' && ${JSON.stringify(statuses)} !== null && /\\/commits\\/[0-9a-f]+\\/status/.test(args[1])) {
-  reply({ state: 'success', statuses: ${JSON.stringify(statuses)} });
-}
+const asked = ${JSON.stringify(statuses)} !== null && args[0] === 'api' && /\\/commits\\/([0-9a-f]+)\\/status/.exec(args[1]);
+if (asked) reply({ state: 'success', statuses: ${JSON.stringify(statuses)}[asked[1]] ?? [] });
 if (args[0] === 'repo' && args[1] === 'view') reply(${JSON.stringify(repo)});
 if (args[0] === 'run' && args[1] === 'list') reply(${JSON.stringify(runs)});
 if (args[0] === 'api') {

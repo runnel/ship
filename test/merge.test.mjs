@@ -63,18 +63,29 @@ export default ({ root }) => ({
 
 // The merge of PR #7 in a repo where local-ci passed against main as it was when this is called.
 // `then(s)` runs after the check and before the merge (main moves, the branch is pushed again).
-async function scenario({ description = (main) => `unit · vs main@${main} · 4s`, state = 'success', status = true, then = async () => {}, mergeFail = null, prOverrides = {}, mainFiles } = {}) {
+// `description(main7, head7)` is what the status says; `statusAt` names the commit that carries
+// it (default: the head of the PR; `older` is the commit before it). `times` runs the command that
+// often at once.
+async function scenario({
+  description = (main) => `unit · vs main@${main} · 4s`, state = 'success', status = true, statusAt = (head) => head, then = async () => {},
+  mergeFail = null, mergeDelayMs = 0, prOverrides = {}, prSequence = [], mainFiles, times = 1, deps = {},
+} = {}) {
   const s = await setup({ configText: CONFIG_TEXT, ...(mainFiles ? { mainFiles } : {}) });
   const head = (await git(['rev-parse', 'feat'], s.work)).trim();
+  const older = (await git(['rev-parse', 'feat~1'], s.work)).trim();
   const main = (await git(['--git-dir', s.origin, 'rev-parse', 'refs/heads/main'], s.work)).trim();
   await then(s);
   const merged = 'f'.repeat(40);
   const pr = { number: 7, headRefOid: head, headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'OPEN', mergeCommit: { oid: merged }, ...prOverrides };
-  const statuses = status ? [{ context: 'local-ci', state, description: description(main.slice(0, 7)) }] : [];
-  const fake = await fakeGh(await tempDir(), { pr, statuses, mergeFail });
-  const code = await runMerge({ cwd: s.work, pr: '7', deps: { ...s.deps, gh: fake.gh } });
+  const statuses = status ? { [statusAt(head, older)]: [{ context: 'local-ci', state, description: description(main.slice(0, 7), head.slice(0, 7)) }] } : {};
+  const fake = await fakeGh(await tempDir(), { pr, prSequence, statuses, mergeFail, mergeDelayMs });
+  const codes = await Promise.all(Array.from({ length: times }, () => runMerge({ cwd: s.work, pr: '7', deps: { ...s.deps, gh: fake.gh, ...deps } })));
   const calls = await fake.calls();
-  return { code, lines: s.lines, merges: calls.filter((c) => c[0] === 'pr' && c[1] === 'merge'), head, merged };
+  return {
+    code: codes[0], codes, lines: s.lines, head, merged,
+    merges: calls.filter((c) => c[0] === 'pr' && c[1] === 'merge'),
+    statusCalls: calls.filter((c) => c[0] === 'api').map((c) => c[1]),
+  };
 }
 
 const pushMain = async (s, files) => {
@@ -90,6 +101,16 @@ test('a checked PR on an unchanged main is squash-merged, pinned to the head tha
   assert.equal(r.merges.length, 1);
   assert.deepEqual(r.merges[0], ['pr', 'merge', '7', '--repo', 't/r', '--squash', '--match-head-commit', r.head, '--delete-branch']);
   assert.ok(r.lines.includes(`✓ merged PR #7 into main as ${r.merged}`), r.lines.join('\n'));
+  // the status of the head that is being merged, and no other commit's
+  assert.deepEqual(r.statusCalls, [`repos/t/r/commits/${r.head}/status?per_page=100`]);
+});
+
+test('only an older head is green: the PR head has no local-ci, so nothing is merged', async () => {
+  const r = await scenario({ statusAt: (head, older) => older });
+  assert.equal(r.code, 2);
+  assert.equal(r.merges.length, 0);
+  assert.match(r.lines.at(-1), /^✗ no local-ci status on [0-9a-f]{7}; run ship check --pr 7$/);
+  assert.equal(r.statusCalls[0], `repos/t/r/commits/${r.head}/status?per_page=100`);
 });
 
 test('main gained files outside recheckOnMainChange: the merge goes ahead and says so', async () => {
@@ -139,6 +160,19 @@ test('a status for a main that is not in the repository is refused', async () =>
   assert.match(r.lines.at(-1), /^✗ main@1234567, the main that local-ci checked, is not in t\/r; run ship check --pr 7 again$/);
 });
 
+test('a status that checked another branch, or a main that was rewritten, is refused', async () => {
+  const other = await scenario({ description: (main) => `unit · vs release@${main} · 4s` });
+  assert.equal(other.code, 2);
+  assert.equal(other.merges.length, 0);
+  assert.match(other.lines.at(-1), /^✗ local-ci checked against release, not main; run ship check --pr 7 again$/);
+
+  // the "main" it names is a commit that exists in the repository but is not on main
+  const rewritten = await scenario({ description: (main, head) => `unit · vs main@${head} · 4s` });
+  assert.equal(rewritten.code, 2);
+  assert.equal(rewritten.merges.length, 0);
+  assert.match(rewritten.lines.at(-1), /^✗ main no longer contains main@[0-9a-f]{7}, the main that local-ci checked; run ship check --pr 7 again$/);
+});
+
 test('a head GitHub has not caught up with is refused: the branch holds an unchecked commit', async () => {
   const r = await scenario({ then: async (s) => {
     await commitFiles(s.work, { 'src/y.ts': 'y\n' }, 'pushed after the check');
@@ -167,7 +201,7 @@ test('--keep-branch leaves the branch to GitHub; --admin is never passed', async
   const head = (await git(['rev-parse', 'feat'], s.work)).trim();
   const main = (await git(['--git-dir', s.origin, 'rev-parse', 'refs/heads/main'], s.work)).trim();
   const pr = { number: 7, headRefOid: head, headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'OPEN' };
-  const statuses = [{ context: 'local-ci', state: 'success', description: `unit · vs main@${main.slice(0, 7)} · 4s` }];
+  const statuses = { [head]: [{ context: 'local-ci', state: 'success', description: `unit · vs main@${main.slice(0, 7)} · 4s` }] };
   const fake = await fakeGh(await tempDir(), { pr, statuses });
   assert.equal(await runMerge({ cwd: s.work, pr: '7', keepBranch: true, deps: { ...s.deps, gh: fake.gh } }), 0, s.lines.join('\n'));
   const merge = (await fake.calls()).find((c) => c[1] === 'merge');
@@ -181,4 +215,33 @@ test('GitHub refusing the merge (protection, a conflict) is reported and fails',
   assert.equal(r.code, 1);
   assert.equal(r.merges.length, 1);
   assert.match(r.lines.at(-1), /^✗ gh pr merge refused PR #7: Pull request is not mergeable/);
+});
+
+test('gh failing after the PR was in fact merged: reported as merged, with the reason, exit 0', async () => {
+  const r = await scenario({ mergeFail: 'failed to delete remote branch: HTTP 422', prSequence: [{}, { state: 'MERGED' }] });
+  assert.equal(r.code, 0);
+  assert.equal(r.merges.length, 1);
+  assert.equal(r.lines.at(-1), `✓ merged PR #7 into main as ${r.merged}, but gh reported: failed to delete remote branch: HTTP 422`);
+});
+
+test('gh failing and the PR state unreadable: the outcome is unknown, exit 1', async () => {
+  const r = await scenario({ mergeFail: 'connection reset', prSequence: [{}, { fail: true }] });
+  assert.equal(r.code, 1);
+  assert.match(r.lines.at(-1), /^✗ gh pr merge failed for PR #7 \(.*connection reset.*\) and its state could not be read: the outcome is unknown, check gh pr view 7$/);
+});
+
+test('a hung gh pr merge is stopped after mergeTimeoutMs; the PR is looked at, not assumed', async () => {
+  const hung = await scenario({ mergeDelayMs: 5000, deps: { mergeTimeoutMs: 300 } });
+  assert.equal(hung.code, 1);
+  assert.equal(hung.lines.at(-1), '✗ gh pr merge gave no answer for PR #7 within 0.3s; it is still open — check gh pr view 7 before merging again');
+  const landed = await scenario({ mergeDelayMs: 5000, deps: { mergeTimeoutMs: 300 }, prSequence: [{}, { state: 'MERGED' }] });
+  assert.equal(landed.code, 0);
+  assert.equal(landed.lines.at(-1), `✓ merged PR #7 into main as ${landed.merged}, but gh reported: no answer after 0.3s`);
+});
+
+test('two ship merges of one repository take turns', async () => {
+  const r = await scenario({ times: 2 });
+  assert.deepEqual(r.codes, [0, 0], r.lines.join('\n'));
+  assert.equal(r.merges.length, 2);
+  assert.equal(r.lines.filter((l) => l === '… another ship merge of t/r is running — waiting for it').length, 1, r.lines.join('\n'));
 });
