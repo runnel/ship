@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseRepoFromUrl, prInfo, defaultBranch, postStatus, nightlyFailures } from '../lib/github.mjs';
+import { parseRepoFromUrl, prInfo, defaultBranch, postStatus, nightlyFailures, commitStatus, mergedSha } from '../lib/github.mjs';
 import { fakeGh, tempDir } from './helpers.mjs';
 
 test('parseRepoFromUrl handles https and ssh remotes', () => {
@@ -31,4 +31,22 @@ test('prInfo, defaultBranch, postStatus and nightlyFailures call gh as expected'
   assert.ok(api.includes('context=local-ci'));
   const desc = api.find((a) => a.startsWith('description='));
   assert.equal(desc.length - 'description='.length, 140);
+});
+
+test('commitStatus picks one context out of the combined status; mergedSha reads the merge commit', async () => {
+  const sha = 'c'.repeat(40);
+  const statuses = [
+    { context: 'other', state: 'failure', description: 'x' },
+    { context: 'local-ci', state: 'success', description: 'app · vs main@52d4c19 · 4s' },
+  ];
+  const pr = { number: 5, headRefOid: sha, headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'MERGED', mergeCommit: { oid: 'd'.repeat(40) } };
+  const fake = await fakeGh(await tempDir(), { pr, statuses });
+  assert.deepEqual(await commitStatus({ repo: 'acme/app', sha, gh: fake.gh }), { state: 'success', description: 'app · vs main@52d4c19 · 4s' });
+  assert.equal(await commitStatus({ repo: 'acme/app', sha, context: 'nope', gh: fake.gh }), null);
+  assert.equal(await mergedSha({ repo: 'acme/app', pr: 5, gh: fake.gh }), 'd'.repeat(40));
+  const unmerged = await fakeGh(await tempDir(), { pr: { ...pr, state: 'OPEN', mergeCommit: null }, statuses: [] });
+  assert.equal(await mergedSha({ repo: 'acme/app', pr: 5, gh: unmerged.gh }), null);
+  assert.equal(await commitStatus({ repo: 'acme/app', sha, gh: unmerged.gh }), null);
+  const api = (await fake.calls()).find((c) => c[0] === 'api');
+  assert.equal(api[1], `repos/acme/app/commits/${sha}/status?per_page=100`);
 });

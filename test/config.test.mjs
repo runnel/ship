@@ -9,6 +9,7 @@ test('fills defaults and normalises steps', () => {
   assert.equal(c.mainBranch, 'main');
   assert.deepEqual(c.docsOnly, []);
   assert.deepEqual(c.deployables, []);
+  assert.deepEqual(c.recheckOnMainChange, []);
   assert.equal(c.checks[0].lane, 'light');
   assert.equal(c.checks[0].cwd, '.');
   assert.equal(c.checks[0].install, null);
@@ -35,6 +36,12 @@ test('rejects unknown keys, bad repo, bad checks', () => {
   assert.throws(() => validateConfig({ ...base, checks: [{ ...base.checks[0], steps: [] }] }), /steps/);
   assert.throws(() => validateConfig({ ...base, checks: [{ ...base.checks[0], paths: [] }] }), /paths/);
   assert.throws(() => validateConfig({ ...base, deployables: 'x' }), /deployables/);
+});
+
+test('recheckOnMainChange is a list of globs, empty unless set', () => {
+  assert.deepEqual(validateConfig({ ...base, recheckOnMainChange: ['db/migrations/**'] }).recheckOnMainChange, ['db/migrations/**']);
+  assert.throws(() => validateConfig({ ...base, recheckOnMainChange: 'db/**' }), /recheckOnMainChange/);
+  assert.throws(() => validateConfig({ ...base, recheckOnMainChange: [1] }), /recheckOnMainChange/);
 });
 
 test('loads an object export', async () => {

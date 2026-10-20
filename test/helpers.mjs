@@ -50,7 +50,9 @@ export async function makeOrigin(files) {
 // entry repeats), as GitHub does while it catches up with a push; empty: every answer is `pr`.
 // openPrs = [{ number, files: [{ path }] }]: what `gh pr list` prints (the open pull requests).
 // prListFail: `gh pr list` fails (exit 1) with a reason on stderr, as gh does when GitHub is unreachable.
-export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false }) {
+// statuses = [{ context, state, description }]: what the combined-status call of a commit answers.
+// mergeFail = 'reason': `gh pr merge` fails (exit 1) with that reason on stderr, as gh does when GitHub refuses.
+export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false, statuses = null, mergeFail = null }) {
   const log = join(dir, 'gh.log');
   const script = join(dir, 'gh');
   const viewCount = join(dir, 'gh-pr-view.count');
@@ -71,6 +73,13 @@ if (args[0] === 'pr' && args[1] === 'view') {
 if (args[0] === 'pr' && args[1] === 'list') {
   if (${JSON.stringify(prListFail)}) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
   reply(${JSON.stringify(openPrs)});
+}
+if (args[0] === 'pr' && args[1] === 'merge') {
+  if (${JSON.stringify(mergeFail)}) { process.stderr.write(${JSON.stringify(mergeFail)} + '\\n'); process.exit(1); }
+  reply({});
+}
+if (args[0] === 'api' && ${JSON.stringify(statuses)} !== null && /\\/commits\\/[0-9a-f]+\\/status/.test(args[1])) {
+  reply({ state: 'success', statuses: ${JSON.stringify(statuses)} });
 }
 if (args[0] === 'repo' && args[1] === 'view') reply(${JSON.stringify(repo)});
 if (args[0] === 'run' && args[1] === 'list') reply(${JSON.stringify(runs)});
