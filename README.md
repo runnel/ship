@@ -37,6 +37,7 @@ export default {
   repo: 'acme/app',
   mainBranch: 'main',
   docsOnly: ['*.md', 'docs/**'],        // a diff entirely inside these passes instantly
+  recheckOnMainChange: [],              // globs; see "Merge" below (default: none)
   checks: [
     {
       name: 'app',
@@ -78,6 +79,7 @@ EOF
 ```bash
 ship check            # the PR of the current branch
 ship check --pr 42
+ship merge --pr 42    # merge a PR that passed, unless main changed under its check
 ```
 
 Deploying Workers (`ship deploy`, `ship status`, ...) is described under [Deploy](#deploy-cloudflare-workers).
@@ -117,6 +119,45 @@ Short-lived state (locks, lanes, worktrees) lives in a per-user directory create
 on macOS always `/private/tmp/ship-<uid>`, whatever `$TMPDIR` says (so every session of yours shares
 one set of lanes and locks), elsewhere `ship-<uid>` under the system temp directory. Set `SHIP_TMP`
 to move it; that splits sessions that do not share the variable.
+
+### Merge
+
+A passing check says the pull request was fine against the main of that moment. When main moves
+afterwards, the verdict is usually still good, but not always: a generated file that carries a hash
+of all migrations, for instance, goes stale when another pull request adds one. `ship merge --pr
+<number>` merges only when that cannot have happened. It reads the `local-ci` status of the pull
+request's current head (it must be `success`; a head that was pushed after the check has none),
+takes the main commit the check ran against from the `vs main@<sha>` in its description, fetches
+main and compares the two. It refuses (exit 2) when that commit is no longer on main (main was
+rewritten) or the check ran against another branch. If main gained a file that matches
+`recheckOnMainChange` since then, it refuses and names the files:
+
+```
+✗ main gained db/migrations/0042_x.sql since the check (vs main@52d4c19); run ship check --pr 42 again
+```
+
+```js
+recheckOnMainChange: ['db/migrations/**'],   // in ship.config.mjs; default: none
+```
+
+The globs are read from the main branch's config, like the checks, and are relative to the
+repository root: an entry with a leading `./` or `/` or a trailing `/` could never match, so the
+config is refused (write `dir/**`). Otherwise it squash-merges with
+`gh pr merge --squash --delete-branch` (`--keep-branch` leaves the branch, which a pull request
+stacked on it needs) and prints the merge commit. The merge is pinned to the checked head
+(`--match-head-commit`), so a push made in between is refused by GitHub rather than merged
+unchecked. A docs-only verdict ran nothing that main could have made stale and is never held back.
+Two `ship merge` runs for one repository on one machine take turns, so the second fetches the main
+the first one made. If `gh pr merge` fails or gets no answer within two minutes, ship reads the pull
+request again: when it is merged after all (gh can fail after the merge, deleting the branch) the
+line says `merged … but gh reported: …`; when it is not, or its state cannot be read, the line says
+which. ship neither posts a status nor passes `--admin`: branch protection decides exactly as it
+does for `gh pr merge`. Main can still move on GitHub between ship's fetch and the merge itself
+(there is no merge queue).
+
+Exit codes: 0 merged (also when gh reported an error after the merge landed); 1 failed: GitHub
+refused the merge, the merge got no answer, or any other error (no network, a config on main that
+does not load); 2 refused by ship, or a usage error.
 
 ## Leak guard (for this repository)
 

@@ -39,6 +39,15 @@ test('ship check: a bad flag or an extra argument is a usage error, exit 2', { t
   await usageError(['check', '--pr'], 'check: .*--pr', usage);
 });
 
+test('ship merge needs a pull request number: a missing, malformed or extra argument is a usage error, exit 2', { timeout: 30_000 }, async () => {
+  const usage = /^ship merge --pr <number> \[--keep-branch\] {3,}merge a checked pull request/;
+  await usageError(['merge'], 'merge: missing --pr <number>', usage);
+  await usageError(['merge', '--keep-branch'], 'merge: missing --pr <number>', usage);
+  await usageError(['merge', '--pr', 'feat'], 'merge: --pr feat: give a pull request number', usage);
+  await usageError(['merge', '--pr', '12', '--admin'], 'merge: .*--admin', usage);
+  await usageError(['merge', '--pr', '12', '13'], 'merge: .*13', usage);
+});
+
 test('missing arguments and malformed values are usage errors in the same style', { timeout: 60_000 }, async () => {
   const adopt = /^ship adopt --at <sha> /;
   await usageError(['adopt'], 'adopt: missing --at <sha>', adopt);
@@ -97,6 +106,6 @@ test('ship unhold and ship migrations reject what they cannot take with exit 2',
 
 test('the usage lists every command with its description in one column', { timeout: 30_000 }, async () => {
   const rows = (await ship()).stdout.split('\n').filter((l) => l.startsWith('  ship '));
-  assert.equal(rows.length, 8);
+  assert.equal(rows.length, 9);
   assert.equal(new Set(rows.map((l) => l.match(/^ {2}ship .*? {2,}/)[0].length)).size, 1, rows.join('\n'));
 });
