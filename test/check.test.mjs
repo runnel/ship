@@ -302,3 +302,25 @@ test('listing open PRs failing does not fail the check', async () => {
   assert.equal(await runCheck({ cwd: s.work, pr: '7', deps: s.deps }), 0);
   assert.match(s.lines.join('\n'), /! could not compare migration prefixes with open PRs \(HTTP 502: Bad Gateway\)/);
 });
+
+test('a heavy check on battery power warns and goes on; a light or docs-only one does not even ask', async () => {
+  const asked = [];
+  const onBattery = async () => { asked.push(1); return true; };
+  const warned = (s) => s.lines.some((l) => /^! on battery power: heavy checks time out more often/.test(l));
+
+  const heavy = await setup({ checkExtra: { lane: 'heavy' } });
+  assert.equal(await runCheck({ cwd: heavy.work, deps: { ...heavy.deps, onBattery } }), 0);
+  assert.ok(warned(heavy), heavy.lines.join('\n'));
+  assert.equal((await heavy.statuses()).at(-1).state, 'success');
+
+  const light = await setup();
+  assert.equal(await runCheck({ cwd: light.work, deps: { ...light.deps, onBattery } }), 0);
+  const docs = await setup({ featFiles: { 'README.md': 'r\n' } });
+  assert.equal(await runCheck({ cwd: docs.work, deps: { ...docs.deps, onBattery } }), 0);
+  assert.ok(!warned(light) && !warned(docs));
+  assert.equal(asked.length, 1);
+
+  const plugged = await setup({ checkExtra: { lane: 'heavy' } });
+  assert.equal(await runCheck({ cwd: plugged.work, deps: { ...plugged.deps, onBattery: async () => false } }), 0);
+  assert.ok(!warned(plugged));
+});
