@@ -253,12 +253,13 @@ test('the usage report is read for this UTC month', { timeout: 60_000 }, async (
   assert.equal((await billingReads(s)).at(-1)[1], '/users/acme/settings/billing/usage?year=2026&month=12');
 });
 
-for (const [name, github] of [['at the reserve', { usage: AT_THE_RESERVE }], ['the usage unreadable', {}]]) {
+for (const [name, github, why] of [['at the reserve', { usage: AT_THE_RESERVE }, /at the reserve/], ['the usage unreadable', {}, /could not be read \(HTTP 403/]]) {
   test(`${name}: a check that stays gives its place back at once`, { timeout: 60_000 }, async () => {
     const s = await setup({ github });
     await mkdir(s.deps.tmpRoot, { recursive: true, mode: 0o700 });
-    const gate = overflowGate({ d: s.deps, owner: { repo: 't/r', pr: 7, sha: 'abc1234' }, overflow: { ...OVERFLOW, runMinutes: 20 } });
+    const gate = overflowGate({ d: { ...s.deps, now: () => Date.now() }, owner: { repo: 't/r', pr: 7, sha: 'abc1234' }, overflow: { ...OVERFLOW, runMinutes: 20 } });
     assert.equal(await gate.claim(), false);
+    assert.ok(says(s, why), s.lines.join('\n'));
     await assertPlaceFree(s);
     assert.equal((await ledgerLines(s)).length, 0, 'nothing is spent');
   });
@@ -407,7 +408,9 @@ test('Ctrl-C while on GitHub cancels the run, says error, and frees the place', 
   // The flow sleeps between looks, as it does for 20 s in use: the cancel has to come from the unwind.
   const run = await spawnCheckLeader(s, dir, { github: true, githubPollMs: 120_000 });
   try {
-    await waitUntil(() => run.out.text.includes('GitHub run:'), 'the run has started', 30_000);
+    // After the status that says so: from there on the flow is asleep, and only the unwind is awake.
+    await waitUntil(async () => (await s.statuses()).some((x) => /on GitHub/.test(x.description ?? '')), 'the run has started', 30_000);
+    await new Promise((r) => setTimeout(r, 300));
     process.kill(-run.child.pid, 'SIGINT');
     await run.exited;
     assert.equal((await cancels(s)).length, 1);
