@@ -192,6 +192,7 @@ test('an interrupt while waiting for the lane ends in error and leaves the holde
     assert.equal(await Promise.race([run.exited, deadline(30_000, 'ship exit')]), 130, run.out.text);
     assert.deepEqual((await s.statuses()).map((x) => x.state), ['pending', 'error']); // never "running"
     assert.equal((await readOwner(laneDir)).label, 'holder');
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'lanes')), ['light']); // the holder's lock only: the waiter took its place in line back
     assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
     assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'checks')), []);
   } finally {
@@ -239,6 +240,7 @@ test('an interrupt while waiting for the lane still removes the worktree when th
     assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'w')), []);
     assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'checks')), []);
     assert.equal((await readOwner(laneDir)).label, 'holder');
+    assert.deepEqual(await readdir(join(s.deps.tmpRoot, 'lanes')), ['light']); // no ticket left behind
   } finally {
     run.kill();
     await holder();
