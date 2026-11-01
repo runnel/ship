@@ -318,6 +318,20 @@ test('Ctrl-C while on GitHub cancels the run, says error, and frees the place', 
   }
 });
 
+test('a pull request that moves on while its check is on GitHub: the run is cancelled, no verdict', { timeout: 60_000 }, async () => {
+  const s = await setup({ github: { usage: LOTS_LEFT, runs: [{ status: 'in_progress', conclusion: null }] } });
+  const check = runCheck({ cwd: s.work, github: true, deps: { ...s.deps, doomedPollMs: 20 } });
+  await waitUntil(() => says(s, /GitHub run:/), 'the run has started');
+  await s.setPr({ headRefOid: 'f'.repeat(40) });
+  assert.equal(await check, 2);
+  assert.equal((await cancels(s)).length, 1);
+  assert.ok(says(s, /stopped checking PR #7/));
+  assert.equal((await s.statuses()).filter((x) => x.state === 'success' || x.state === 'failure').length, 0);
+  const free = await tryLock(join(s.deps.tmpRoot, 'lanes', 'github-0'), await ownerInfo());
+  assert.ok(free, 'the place is free again');
+  await free();
+});
+
 // --- what the run on GitHub executes ---------------------------------------------------------------
 
 async function treeOnBranch(mainConfig, featConfig = null) {

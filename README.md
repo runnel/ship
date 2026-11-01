@@ -246,7 +246,9 @@ main, ends in success, ship posts `local-ci` with `· on GitHub` in the descript
 run. Anything else (a red run, a cancelled one, one that is not started after 5 minutes or has no result
 after `timeoutMin`, GitHub not answering, a failed start) sends the check back to its old place in
 line, with a `! … back in line on this machine` line, and this machine gives the verdict. A red on
-GitHub may be GitHub's, so it never reads as a red check. Ctrl-C cancels the run.
+GitHub may be GitHub's, so it never reads as a red check. Ctrl-C cancels the run, and so does a pull
+request that moves on while it runs, like any check whose result can no longer be used. `ship queue`
+lists the running ones as `on GitHub:` with a link to the run.
 
 `ship merge` refuses a `local-ci` posted by a bot: a workflow's token can post a status, and only
 `ship check` may.
