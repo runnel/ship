@@ -181,6 +181,21 @@ test('a holder is possibly stuck past three times the usual run, 1.5 times the 9
   assert.match(render([stuck]).join('\n'), /! possibly stuck: held for 16m00s, well over the usual 5m \(9 in 10 runs end within 6m\)/);
 });
 
+test('a stuck-looking holder says whether its log is still being written', async () => {
+  const logRoot = await tempDir();
+  const lineFor = async (quietMs) => {
+    const log = join(logRoot, `holder-${quietMs}.log`);
+    await writeFile(log, 'x');
+    await utimes(log, new Date(NOW - quietMs), new Date(NOW - quietMs));
+    const holder = await live({ repo: 'acme/app', pr: 12, log }, { since: new Date(NOW - 30 * MIN).toISOString() });
+    const [heavy] = await snapshot({ nowMs: NOW, history: runs('acme/app', 'check', [4, 5, 6]), lanes: [{ name: 'heavy', holder, stale: false, waiters: [] }] });
+    return render([heavy]).find((l) => l.includes('possibly stuck'));
+  };
+  assert.match(await lineFor(5_000), /\(9 in 10 runs end within 6m\), but its log is still being written$/);
+  assert.match(await lineFor(2 * MIN), /\(9 in 10 runs end within 6m\)$/);
+  assert.match(await lineFor(7 * MIN), /\(9 in 10 runs end within 6m\), and its log has been quiet for 7m00s$/);
+});
+
 test('a holder whose process is gone is said to be, not stuck', async () => {
   const holder = await deadOwner({ repo: 'acme/app', pr: 12 });
   const [heavy] = await snapshot({ nowMs: NOW, history: [], lanes: [{ name: 'heavy', holder: { ...holder, since: new Date(NOW - 99 * MIN).toISOString() }, stale: true, waiters: [] }] });
