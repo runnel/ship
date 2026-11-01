@@ -27,7 +27,7 @@ jobs:
       HEAD_SHA: ${{ inputs.head_sha }}
       MAIN_SHA: ${{ inputs.main_sha }}
       TREE_SHA: ${{ inputs.tree_sha }}
-      GROUPS: ${{ inputs.groups }}
+      CHECK_GROUPS: ${{ inputs.groups }}
       SHIP_SHA: ${{ inputs.ship_sha }}
     steps:
       - name: Runner
@@ -51,7 +51,7 @@ jobs:
           mkdir "$RUNNER_TEMP/ship"
           curl -fsSL "https://codeload.github.com/runnel/ship/tar.gz/$SHIP_SHA" | tar -xz -C "$RUNNER_TEMP/ship" --strip-components=1
       - name: Run the check groups
-        run: node "$RUNNER_TEMP/ship/bin/ship.mjs" run-groups --groups "$GROUPS" --main "$MAIN_SHA" --head "$HEAD_SHA"
+        run: node "$RUNNER_TEMP/ship/bin/ship.mjs" run-groups --groups "$CHECK_GROUPS" --main "$MAIN_SHA" --head "$HEAD_SHA"
       - name: Log of the failed step
         if: failure()
         run: tail -n 300 "$RUNNER_TEMP/ship-groups.log" || true

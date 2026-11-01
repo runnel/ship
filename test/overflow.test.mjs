@@ -365,6 +365,7 @@ test('the example workflow takes what ship sends, can only read, and starts noth
   // Inputs reach a shell only through env: `${{ }}` inside a script would run what it contains.
   for (const script of text.matchAll(/run: \|?\n?((?:.*\n)*?)(?=^ {6}- |\Z)/gm)) assert.doesNotMatch(script[1], /\$\{\{/);
   assert.match(text, /timeout-minutes: \d+/);
+  assert.doesNotMatch(text, /\bGROUPS:|\$GROUPS/, 'bash keeps its own GROUPS: the user\'s group ids, whatever the environment says');
 });
 
 // --- configuration ---------------------------------------------------------------------------------
