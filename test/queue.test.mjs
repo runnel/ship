@@ -43,7 +43,8 @@ const runs = (repo, kind, minutes) => minutes.map((m, i) => run(NOW - (i + 1) * 
 
 test('a log name says the repository, whether it was a check or a deploy, and when it began', () => {
   assert.deepEqual(parseLogName('acme__app-1a2b3c4-20261101T160014Z.log'), { repo: 'acme/app', kind: 'check', stampMs: Date.parse('2026-11-01T16:00:14Z') });
-  assert.deepEqual(parseLogName('acme__app-deploy-1a2b3c4-20261101T155515Z.log'), { repo: 'acme/app', kind: 'deploy', stampMs: Date.parse('2026-11-01T15:55:15Z') });
+  // a name ending in -deploy is also a check of a repository whose name ends in -deploy
+  assert.deepEqual(parseLogName('acme__app-deploy-1a2b3c4-20261101T155515Z.log'), { repo: 'acme/app', kind: 'deploy', stampMs: Date.parse('2026-11-01T15:55:15Z'), alt: { repo: 'acme/app-deploy', kind: 'check' } });
   assert.equal(parseLogName('acme__my-app-mcp-deploy-1a2b3c4-20261101T155515Z.log').repo, 'acme/my-app-mcp');
   for (const junk of ['notes.txt', 'acme__app-1a2b3c-20261101T160014Z.log', 'acme-app-1a2b3c4-20261101T160014Z.log']) assert.equal(parseLogName(junk), null, junk);
 });
@@ -64,6 +65,14 @@ test('the usual time is the median of the latest runs of one kind in one reposit
   // only the latest 20 count: an old slow run does not stay in the picture forever
   const many = [...runs('acme/app', 'check', Array(20).fill(4)), run(NOW - 1000 * 60 * MIN, 90 * MIN)];
   assert.equal(usualFor(many, 'acme/app', 'check').high, 4 * MIN);
+});
+
+test('a log that could be a deploy of one repository or a check of another counts for the one that is asked about', () => {
+  const ambiguous = (ms) => ({ ...run(NOW, ms, 'acme/infra', 'deploy'), alt: { repo: 'acme/infra-deploy', kind: 'check' } });
+  const history = [ambiguous(9 * MIN), ambiguous(9 * MIN), ambiguous(9 * MIN)];
+  assert.equal(usualFor(history, 'acme/infra', 'deploy').median, 9 * MIN);
+  assert.equal(usualFor(history, 'acme/infra-deploy', 'check').median, 9 * MIN);
+  assert.equal(usualFor(history, 'acme/infra', 'check'), null);
 });
 
 test('the history is read from the log directory, newest first, and other files are ignored', async () => {

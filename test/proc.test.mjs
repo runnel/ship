@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { buildEnv, run, capture, ownsItsGroup } from '../lib/proc.mjs';
 import { assertGone, killQuietly, readPid, tempDir } from './helpers.mjs';
@@ -131,4 +132,32 @@ test('a process group is ship\'s own only when ship leads it and has no controll
   assert.equal(ownsItsGroup({ pid: 10, pgid: '4', tty: '??' }), false); // not the leader
   assert.equal(ownsItsGroup({ pid: 10, pgid: '10', tty: '' }), false); // unknown is not ours
   assert.equal(ownsItsGroup({ pid: 10, pgid: undefined, tty: '??' }), false);
+});
+
+test('the group sweep leaves ship\'s own helpers and what they started alone', { timeout: 30_000 }, async () => {
+  // A leader of its own group, as bin/ship.mjs makes ship: it runs a helper (capture) that has a child
+  // of its own, as git has git-remote-https, and sweeps the group while both are running.
+  const dir = await tmp();
+  const childFile = join(dir, 'child.pid');
+  const script = join(dir, 'leader.mjs');
+  await writeFile(script, `
+import { capture, sweepGroup } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'lib/proc.mjs')).href)};
+import { readFileSync } from 'node:fs';
+const helper = capture('sh', ['-c', ${JSON.stringify(`sleep 30 & echo $! > ${childFile}; wait`)}]).catch(() => {});
+for (let i = 0; i < 200; i++) {
+  try { if (readFileSync(${JSON.stringify(childFile)}, 'utf8').trim()) break; } catch { /* not yet */ }
+  await new Promise((r) => setTimeout(r, 25));
+}
+const stopped = await sweepGroup();
+const pid = Number(readFileSync(${JSON.stringify(childFile)}, 'utf8'));
+let alive = true;
+try { process.kill(pid, 0); } catch { alive = false; }
+process.stdout.write(JSON.stringify({ stopped, alive }));
+try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+`);
+  const child = spawn(process.execPath, [script], { detached: true, stdio: ['ignore', 'pipe', 'inherit'] });
+  let out = '';
+  child.stdout.on('data', (b) => { out += b; });
+  await new Promise((resolve) => child.on('close', resolve));
+  assert.deepEqual(JSON.parse(out), { stopped: 0, alive: true });
 });

@@ -128,28 +128,32 @@ itself is still one lock, so two heavy builds never run at once.
 
 A check that cannot be used any more stops instead of taking, or keeping, a lane. From the moment
 it queues for a lane, and then once a minute while it waits and runs, it asks GitHub and its mirror
-whether (1) the pull request is still open, (2) its head is still the one being checked, and (3)
-main has gained a file that matches `recheckOnMainChange`, which would make `ship merge` refuse the
-result anyway. It also looks once more when it wins the lane. If any of these is no longer so, it
-prints `✗ stopped checking PR #…: <reason> (no verdict posted)` and exits 2: a waiting check gives
-its place in line back, a running one has its step and everything the step started stopped, the
-steps after it do not start, and the lane and the worktree are released. Nothing is posted: the
-`pending` status it already left stays on a head, or against a main, that nobody will merge on this
-result. A main that moved in any other way does not stop a check. A look that cannot be made
-(GitHub unreachable) says nothing, and the check goes on. Stopping only ends work in progress: a
-check that has finished posts its verdict as before.
+whether (1) the pull request is still open and still aimed at the default branch, (2) its head is
+still the one being checked (a different head must be seen twice, a few seconds apart, because
+`gh` can answer with an older one for a while after a push), and (3) main still contains the main
+the check began against and has gained no file that matches `recheckOnMainChange`: the cases in
+which `ship merge` would refuse the result anyway. (The look uses the `recheckOnMainChange` the
+check began with; `ship merge` reads the one on main at the time.) It also looks once more when it
+wins the lane. If any of these is no longer so, it prints
+`✗ stopped checking PR #…: <reason> (no verdict posted)` and exits 2: a waiting check gives its
+place in line back, a running one has its step and everything the step started stopped, the steps
+after it do not start, and the lane and the worktree are released. Nothing is posted: the
+`pending` status it already left stays on a head, or against a main, that nobody will merge on
+this result. A main that moved in any other way does not stop a check. A look that cannot be made
+or takes more than 30 s (GitHub unreachable, a hung fetch) says nothing, and the check goes on.
+Stopping only ends work in progress: a check that has finished posts its verdict as before.
 
-`ship queue` shows the lanes on one screen, read only: for each lane the holder (the pull request
-or command, how long it has held the lane, the usual run time, and how long ago its log was last
-written), and the waiters in line order with how long each has waited and when it should start. The
-usual time is the median of the latest 20 runs of that kind in that repository (and the 90th percentile as the top of the range), from `~/.ship/logs/`
-(a deploy's log spans all of its turns at the lane, so a deploy's figure is for the whole deploy);
-with fewer than 3 runs there is no estimate. The estimate is the holder's time left plus the usual
-time of each waiter ahead, and assumes that no deploy work is put in front of them (a `+` marks a
-holder that is already past its usual time). A holder is marked `possibly stuck` once it has held
-the lane for more than three times the usual time and 1.5 times the 90th percentile, and at least
-five minutes. A holder whose
-process is gone is said to be; the next in line takes the lane over.
+`ship queue` shows the lanes on one screen, read only. For each lane it shows the holder (the pull
+request or command, how long it has held the lane, the usual run time, and how long ago its log
+was last written) and the waiters in line order with how long each has waited and when it should
+start. The usual time is the median of the latest 20 runs of that kind in that repository, and the
+90th percentile is the top of the range; both come from `~/.ship/logs/`. A deploy's log spans all
+of its turns at the lane, so a deploy's figure is for the whole deploy. With fewer than 3 runs
+there is no estimate. The estimate is the holder's time left plus the usual time of each waiter
+ahead, and assumes that no deploy work is put in front of them (a `+` marks a holder that is
+already past its usual time). A holder is marked `possibly stuck` once it has held the lane for
+more than three times the usual time, more than 1.5 times the 90th percentile, and at least five
+minutes. A holder whose process is gone is said to be; the next in line takes the lane over.
 
 Short-lived state (locks, lanes, worktrees) lives in a per-user directory created with mode 0700:
 on macOS always `/private/tmp/ship-<uid>`, whatever `$TMPDIR` says (so every session of yours shares
