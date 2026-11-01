@@ -6,11 +6,12 @@
 //   facts: [{ label, match, before: false, after: true, afterDry: after }]
 //   applyStatus: 400 → the apply is refused (nothing changes), with `applyMessage`
 //   applyThrows: n → the first n apply requests get no answer; each took effect anyway if `appliedAnyway`
+//   applyThrowsCode: the error code of that failure ('ECONNREFUSED' = it never left the machine)
 //   refusalCommits: a refused apply has changed the database all the same (a file that commits part of itself)
 //   dryMessage: the dry run fails with that Postgres message (default: the marker with the results)
 //   echoTokenInErrors: every error message repeats the bearer token, as a careless API might
 
-export function fakeSupabase({ project = 'abcdefghijklmnopqrst', token = 'sbp_test_token_0123456789', facts = [], applyStatus = null, applyMessage = 'ERROR:  42P07: relation "x" already exists', applyThrows = 0, appliedAnyway = false, refusalCommits = false, dryMessage = null, echoTokenInErrors = false, denyToken = false, unreachable = false } = {}) {
+export function fakeSupabase({ project = 'abcdefghijklmnopqrst', token = 'sbp_test_token_0123456789', facts = [], applyStatus = null, applyMessage = 'ERROR:  42P07: relation "x" already exists', applyThrows = 0, applyThrowsCode = null, appliedAnyway = false, refusalCommits = false, dryMessage = null, echoTokenInErrors = false, denyToken = false, unreachable = false } = {}) {
   const requests = [];
   let throwsLeft = applyThrows === true ? 1 : applyThrows;
   const state = { applied: false };
@@ -41,7 +42,7 @@ export function fakeSupabase({ project = 'abcdefghijklmnopqrst', token = 'sbp_te
     if (throwsLeft > 0) {
       throwsLeft--;
       if (appliedAnyway) state.applied = true;
-      throw new TypeError('fetch failed');
+      throw Object.assign(new TypeError('fetch failed'), applyThrowsCode ? { cause: { code: applyThrowsCode } } : {});
     }
     if (applyStatus) {
       if (refusalCommits) state.applied = true;

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { addAcks, addProof, clearHold, listHolds, readAcks, readClearances, readHold, recordAttempt, settleAttempt, unsettledAttempt, writeHold } from '../lib/state.mjs';
+import { addAcks, addProof, clearHold, listHolds, readAcks, readClearances, openAttempts, readHold, recordAttempt, settleAttempt, unsettledAttempt, writeHold } from '../lib/state.mjs';
 import { tempDir } from './helpers.mjs';
 
 test('holds: write, read, list, clear', async () => {
@@ -96,20 +96,24 @@ test('a verified file is a proof too, and an attempt is not a clearance', async 
   assert.deepEqual([...(await readAcks(root, 'acme/app'))], ['db/005.sql'], 'an attempt does not clear a file for deploy');
 });
 
-test('attempts: open until settled, per file and per content', async () => {
+test('attempts: open until their own id is settled, per file and per content', async () => {
   const root = await tempDir('state-');
   const one = 'a'.repeat(64);
   const two = 'b'.repeat(64);
   assert.equal(await unsettledAttempt(root, 'acme/app', 'db/001.sql', one), null);
-  await recordAttempt(root, 'acme/app', { file: 'db/001.sql', sha256: one, by: 'o@l', at: '2026-01-01T00:00:00.000Z' });
-  assert.deepEqual(await unsettledAttempt(root, 'acme/app', 'db/001.sql', one), { at: '2026-01-01T00:00:00.000Z', by: 'o@l' });
+  const first = await recordAttempt(root, 'acme/app', { file: 'db/001.sql', sha256: one, by: 'o@l', at: '2026-01-01T00:00:00.000Z' });
+  assert.deepEqual(await unsettledAttempt(root, 'acme/app', 'db/001.sql', one), { id: first, at: '2026-01-01T00:00:00.000Z', by: 'o@l' });
   assert.equal(await unsettledAttempt(root, 'acme/app', 'db/001.sql', two), null, 'another content is another file');
   assert.equal(await unsettledAttempt(root, 'acme/app', 'db/002.sql', one), null);
   assert.equal(await unsettledAttempt(root, 'acme/other', 'db/001.sql', one), null);
-  await settleAttempt(root, 'acme/app', { file: 'db/001.sql', sha256: one, by: 'o@l', outcome: 'refused' });
+  const second = await recordAttempt(root, 'acme/app', { file: 'db/001.sql', sha256: one, by: 'o@l', at: '2026-01-02T00:00:00.000Z' });
+  assert.notEqual(first, second);
+  assert.deepEqual((await openAttempts(root, 'acme/app', 'db/001.sql', one)).map((a) => a.id), [first, second]);
+  await settleAttempt(root, 'acme/app', { file: 'db/001.sql', sha256: one, by: 'o@l', outcome: 'refused', id: second });
+  assert.deepEqual((await openAttempts(root, 'acme/app', 'db/001.sql', one)).map((a) => a.id), [first], 'settling one attempt leaves the earlier one open');
+  assert.equal((await unsettledAttempt(root, 'acme/app', 'db/001.sql', one)).id, first);
+  await settleAttempt(root, 'acme/app', { file: 'db/001.sql', sha256: one, by: 'o@l', outcome: 'proven', id: first });
   assert.equal(await unsettledAttempt(root, 'acme/app', 'db/001.sql', one), null);
-  await recordAttempt(root, 'acme/app', { file: 'db/001.sql', sha256: one, by: 'o@l', at: '2026-01-02T00:00:00.000Z' });
-  assert.equal((await unsettledAttempt(root, 'acme/app', 'db/001.sql', one)).at, '2026-01-02T00:00:00.000Z', 'a later attempt opens it again');
 });
 
 test('an old two-field ledger line is a bare ack', async () => {

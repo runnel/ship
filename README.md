@@ -449,16 +449,20 @@ are hashed, shown, dry-run and applied are those of one commit) and then:
    and the proof is recorded as `applied`. Otherwise it cannot say who made the conditions hold, so
    it shows the SQL, warns, asks the owner to type `record`, and records `verified` instead;
 4. otherwise runs the file and the conditions as a dry run (below); a file that fails, or whose
-   post-conditions do not hold at its end, stops here. A file with `CONCURRENTLY`, `VACUUM`,
-   `ALTER SYSTEM` or `CREATE DATABASE` cannot run in a transaction; the dry run is skipped and the
-   plan says so;
+   post-conditions do not hold at its end, stops here. The dry run is skipped, and the plan says
+   why, for a file with `CONCURRENTLY`, `VACUUM`, `ALTER SYSTEM` or `CREATE DATABASE` (they cannot
+   run in a transaction) and for one with effects that outlive a rollback: `setval`, a
+   session-level advisory lock, `dblink`, `pg_terminate_backend`, or its own `lock_timeout` /
+   `statement_timeout` (a lone `SET` of those is simply dropped from the dry run). `nextval` leaves
+   a gap in a sequence, which is harmless;
 5. prints the plan (commit, file, size and hash, project, post-conditions with their state now,
    earlier migrations not yet cleared, the SQL) and waits. The typed word goes on (`yes`; `apply
    again` when an earlier send of this file has no recorded result), `v` shows all of the SQL,
    anything else cancels;
 6. takes the repository's deploy lock (only now, so an open prompt blocks nobody), reads the
-   database again and cancels if anything differs from the plan, writes an *attempt* line, and sends
-   the file as one request;
+   database and the attempts again and cancels if anything differs from the plan (a second terminal
+   that sent the file meanwhile included), writes an *attempt* line with an id, and sends the file
+   as one request;
 7. reads the database again: the post-conditions, not the answer to the apply, decide. All hold: the
    file is cleared for deploy and the ledger line records `applied`, who (`user@host`), when, the
    file's sha256, main's commit and the number of post-conditions; the attempt is settled. One
@@ -466,9 +470,14 @@ are hashed, shown, dry-run and applied are those of one commit) and then:
 
 What the outcome of the request means:
 
-- **Postgres refused it** (an HTTP error carrying the database's own error): nothing committed, the
-  attempt is settled, and re-running is safe. If every condition holds anyway, ship does not
-  record: someone else changed the database, or the file commits part of itself.
+- **Postgres refused it** (an HTTP error carrying the database's own error), for a file that is one
+  transaction and was dry-run: nothing committed, the attempt is settled, and re-running is safe.
+  If every condition holds anyway, ship does not record: someone else changed the database, or the
+  file commits part of itself. A file that is **not** one transaction (several `begin;`/`commit;`
+  blocks, `savepoint`, `CONCURRENTLY`, or no dry run) may have committed part of itself: the plan
+  says so, a refusal keeps the attempt open and is never called safe.
+- **Never sent** (no address, connection refused, a certificate that is not accepted): the attempt
+  is settled and nothing is open.
 - **No answer** (a timeout, a gateway error, Ctrl-C): the statement may still be running or may yet
   commit, so ship never says a re-run is safe. The attempt stays open; the next run warns about it,
   and applying that file again needs the typed answer `apply again`. If the conditions hold when

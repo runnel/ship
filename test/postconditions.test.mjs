@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { conditionExpression, dryRunSql, nonTransactional, parseConditions, parseDryRun, parseProbe, probeSql, stripTransaction } from '../lib/postconditions.mjs';
+import { conditionExpression, dryRunSql, dryRunUnsafe, isSingleTransaction, nonTransactional, parseConditions, parseDryRun, parseProbe, probeSql, stripTransaction } from '../lib/postconditions.mjs';
 
 const one = (line, opts) => parseConditions(`-- ship:verify ${line}\n`, opts);
 const sqlOf = (line) => conditionExpression(one(line).conditions[0]);
@@ -133,4 +133,28 @@ test('the example in the README parses', () => {
   const { conditions, errors } = parseConditions(block);
   assert.deepEqual(errors, []);
   assert.deepEqual(new Set(conditions.map((c) => c.kind)), new Set(['table', 'column', 'function', 'rls', 'no-access', 'no-execute', 'access', 'execute', 'absent', 'sql']));
+});
+
+test('timeouts and effects that outlive a rollback: dropped or flagged before the dry run', () => {
+  assert.equal(stripTransaction('SET statement_timeout = 0;\nset local lock_timeout=\'1s\';\nSET SESSION idle_in_transaction_session_timeout = 0;\nselect 1;'), 'select 1;');
+  assert.equal(dryRunUnsafe('SET statement_timeout = 0;\nselect 1;'), null, 'a lone SET line is simply dropped');
+  assert.match(dryRunUnsafe("select set_config('lock_timeout', '0', false);"), /lock_timeout\/statement_timeout/);
+  assert.match(dryRunUnsafe('set a = 1, lock_timeout = 0;'), /lock_timeout/);
+  assert.match(dryRunUnsafe("select setval('s', 1, false);"), /^setval/);
+  assert.match(dryRunUnsafe('select pg_advisory_lock(1);'), /session-level advisory lock/);
+  assert.match(dryRunUnsafe("select dblink_exec('x', 'y');"), /dblink/);
+  assert.match(dryRunUnsafe('select pg_terminate_backend(1);'), /pg_terminate_backend/);
+  assert.equal(dryRunUnsafe('select pg_advisory_xact_lock(1); create table t (id int);'), null, 'a transaction-level lock is released with the rollback');
+});
+
+test('what counts as one transaction', () => {
+  assert.equal(isSingleTransaction('create table t (id int);'), true);
+  assert.equal(isSingleTransaction('-- note\nbegin;\ncreate table t (id int);\ncommit;\nnotify pgrst, \'reload schema\';\n'), true);
+  assert.equal(isSingleTransaction('begin;\nupdate t set a = 1;\ncommit;\nbegin;\nupdate t set b = 1;\ncommit;'), false);
+  assert.equal(isSingleTransaction('update t set a = 1;\ncommit;\nupdate t set b = 1;'), false);
+  assert.equal(isSingleTransaction('begin;\nupdate t set a = 1;'), false);
+  assert.equal(isSingleTransaction('begin;\nsavepoint a;\ncommit;'), false);
+  assert.equal(isSingleTransaction('start transaction;\nupdate t set a = 1;\ncommit work;'), false);
+  assert.equal(isSingleTransaction('create index concurrently i on t (c);'), false);
+  assert.equal(isSingleTransaction('create function f() returns int language plpgsql as $$ begin return 1; end; $$;'), true, 'a plpgsql end; is not a COMMIT');
 });

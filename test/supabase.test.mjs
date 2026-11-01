@@ -33,6 +33,21 @@ test('Postgres refusing the SQL with a 5xx is an answer; a gateway error or no a
   }
 });
 
+test('a failure before the request left this machine is marked as not sent; any other lost answer is not', async () => {
+  const fails = (code) => client(async () => { throw Object.assign(new TypeError('fetch failed'), code ? { cause: { code } } : {}); }).query('x');
+  for (const code of ['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE']) {
+    await assert.rejects(fails(code), (e) => e instanceof OutcomeUnknown && e.notSent === true, code);
+  }
+  for (const code of ['ECONNRESET', 'UND_ERR_SOCKET', 'ETIMEDOUT', undefined]) {
+    await assert.rejects(fails(code), (e) => e instanceof OutcomeUnknown && e.notSent === false, String(code));
+  }
+});
+
+test('a token that JSON would escape is refused, so redacting the raw body is enough', () => {
+  for (const bad of ['a"b', 'a\\b', 'a b', 'a\nb']) assert.throws(() => supabase({ project: PROJECT, token: bad }), /token/, JSON.stringify(bad));
+  assert.doesNotThrow(() => supabase({ project: PROJECT, token: 'sbp_0123456789abcdef.ghi-jkl~+/=' }));
+});
+
 test('a token or project that cannot be used is refused at once, without being echoed', () => {
   assert.throws(() => supabase({ project: PROJECT, token: 'has space' }), (e) => !e.message.includes('has space'));
   assert.throws(() => supabase({ project: PROJECT, token: '' }), /token/);

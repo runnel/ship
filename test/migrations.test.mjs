@@ -20,6 +20,10 @@ test('clashes are the other PRs adding a file with one of our prefixes', () => {
   assert.deepEqual(prefixClashes({ ours: ['db/seed.sql'], others }), []);
 });
 
+test('mixed zero padding sorts by value', () => {
+  assert.deepEqual(['db/11_b.sql', 'db/010_a.sql', 'db/0009_c.sql'].sort(byNumber), ['db/0009_c.sql', 'db/010_a.sql', 'db/11_b.sql']);
+});
+
 test('migrations sort by number, not by text', () => {
   assert.deepEqual(['db/1000_x.sql', 'db/999_y.sql', 'db/seed.sql', 'db/012_a.sql', 'db/20261017120000_z.sql'].sort(byNumber), ['db/012_a.sql', 'db/999_y.sql', 'db/1000_x.sql', 'db/20261017120000_z.sql', 'db/seed.sql']);
 });

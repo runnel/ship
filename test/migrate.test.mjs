@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { runMigrationsApply } from '../lib/migrate.mjs';
-import { addAcks, readAcks, readClearances, unsettledAttempt } from '../lib/state.mjs';
+import { addAcks, readAcks, readClearances, recordAttempt, unsettledAttempt } from '../lib/state.mjs';
 import { UsageError } from '../lib/shared.mjs';
 import { fakeGh, git, makeOrigin, tempDir } from './helpers.mjs';
 import { fakeSupabase } from './fake-supabase.mjs';
@@ -288,7 +288,7 @@ test('an apply Postgres refused changes nothing: nothing holds, nothing is clear
   const s = await setup({ api: { applyStatus: 400 } });
   assert.equal(await s.apply(), 1);
   assert.match(s.text(), /✗ apply refused: HTTP 400: Failed to run sql query: ERROR: {2}42P07/);
-  assert.match(s.text(), /✗ Postgres refused the file and none of the post-conditions holds: nothing took effect and nothing was cleared\. Running the command again is safe\./);
+  assert.match(s.text(), /✗ Postgres refused the file and the database is as it was before: nothing took effect and nothing was cleared\. Running the command again is safe\./);
   assert.equal((await s.clearances()).size, 0);
   assert.equal(await unsettledAttempt(s.deps.stateRoot, 't/r', 'db/002_things.sql', await sha(s)), null, 'a refusal settles the attempt');
 });
@@ -402,4 +402,102 @@ test('refusals that change nothing: a file not on main, a repository without mig
 
   await assert.rejects(runMigrationsApply({ cwd: s.work, file: null, deps: s.deps }), UsageError);
   for (const x of [s, plain]) assert.deepEqual(x.supabase.requests, []);
+});
+
+test('another run sending the same file while this prompt is open cancels this run: the "apply again" gate cannot be skipped', async () => {
+  const s = await setup({ onAsk: async () => { await recordAttempt(s.deps.stateRoot, 't/r', { file: 'db/002_things.sql', sha256: await sha(s), by: 'owner@other-terminal' }); } });
+  assert.equal(await s.apply(), 1);
+  assert.match(s.text(), /✗ another run sent or settled this file while you were deciding/);
+  assert.deepEqual(s.supabase.of('apply'), []);
+  assert.equal((await s.clearances()).size, 0);
+});
+
+const TWO_BLOCKS = `-- ship:verify table public.things
+begin;
+create table public.things (id uuid primary key);
+commit;
+begin;
+update public.things set id = id;
+commit;
+`;
+const ONE_BLOCK = `-- ship:verify table public.things
+begin;
+create table public.things (id uuid primary key);
+commit;
+notify pgrst, 'reload schema';
+`;
+const THINGS_FACT = [{ label: 'table public.things', match: "to_regclass('public.things') is not null", before: false, after: true }];
+
+test('a file with several transaction blocks is not called atomic: a refusal keeps the attempt open and never says "safe"', async () => {
+  const s = await setup({ files: { 'db/002_things.sql': TWO_BLOCKS }, api: { facts: THINGS_FACT, applyStatus: 400 } });
+  assert.equal(await s.apply(), 1);
+  assert.match(s.text(), /! this file is NOT one transaction \(its own BEGIN\/COMMIT/);
+  assert.match(s.text(), /will run {5}the file's SQL, as one request$/m);
+  assert.match(s.text(), /✗ Postgres refused the file, and it is not a single transaction, so part of it may have committed\./);
+  assert.doesNotMatch(s.text(), /safe/);
+  assert.ok(await unsettledAttempt(s.deps.stateRoot, 't/r', 'db/002_things.sql', TWO_BLOCKS && (await import('node:crypto')).createHash('sha256').update(TWO_BLOCKS).digest('hex')), 'the attempt stays open');
+});
+
+test('a file that is one begin…commit block is atomic: the refusal is a safe one', async () => {
+  const s = await setup({ files: { 'db/002_things.sql': ONE_BLOCK }, api: { facts: THINGS_FACT, applyStatus: 400 } });
+  assert.equal(await s.apply(), 1);
+  assert.doesNotMatch(s.text(), /NOT one transaction/);
+  assert.match(s.text(), /will run {5}the file's SQL, as one request \(one transaction\)/);
+  assert.match(s.text(), /Running the command again is safe\./);
+});
+
+test('a file with effects that survive a rollback is not dry-run, and says why; a lone SET of a timeout is dropped from the dry run', async () => {
+  const s = await setup({ files: { 'db/002_things.sql': `-- ship:verify table public.things\ncreate table public.things (id int);\nselect setval('public.things_id_seq', 1, false);\n` }, api: { facts: THINGS_FACT } });
+  assert.equal(await s.apply(), 0, s.text());
+  assert.match(s.text(), /dry run {6}skipped: the file uses setval \(a sequence value is not rolled back\)/);
+  assert.match(s.text(), /! this file is NOT one transaction/, 'without a dry run a refusal cannot be called safe');
+  assert.deepEqual(s.supabase.of('dry-run'), []);
+
+  const dump = await setup({ files: { 'db/002_things.sql': `-- ship:verify table public.things\nSET statement_timeout = 0;\nSET lock_timeout = 0;\ncreate table public.things (id int);\n` }, api: { facts: THINGS_FACT } });
+  assert.equal(await dump.apply(), 0, dump.text());
+  const dry = dump.supabase.of('dry-run')[0].sql;
+  assert.doesNotMatch(dry.split('execute')[1], /lock_timeout|statement_timeout/, 'the file cannot switch off the dry run\'s limits');
+  assert.equal(dump.supabase.of('apply')[0].sql.includes('SET lock_timeout = 0;'), true, 'the apply is the file as it is');
+});
+
+test('a request that never left this machine settles its attempt and leaves nothing to warn about', async () => {
+  const s = await setup({ api: { applyThrows: 1, applyThrowsCode: 'ECONNREFUSED' }, answers: ['yes', 'yes'] });
+  assert.equal(await s.apply(), 1);
+  assert.match(s.text(), /✗ the request never left this machine \(no answer from the Supabase API \(ECONNREFUSED\)\): nothing was sent and nothing was changed\./);
+  assert.equal(await unsettledAttempt(s.deps.stateRoot, 't/r', 'db/002_things.sql', await sha(s)), null);
+  s.lines.length = 0;
+  assert.equal(await s.apply(), 0, s.text());
+  assert.doesNotMatch(s.text(), /sent to the database before/);
+});
+
+test('a refusal of a later send does not close an earlier send that may still be running', async () => {
+  const s = await setup({ api: { applyThrows: 1 }, answers: ['yes', 'apply again'] });
+  assert.equal(await s.apply(), 1); // first send: no answer, attempt open
+  // second send (apply again): Postgres refuses it because the first one committed meanwhile
+  s.supabase.state.applied = false;
+  const inner = s.deps.fetch;
+  s.deps.fetch = async (url, init) => {
+    const q = JSON.parse(init.body).query;
+    if (q === THINGS) { s.supabase.state.applied = true; return new Response(JSON.stringify({ message: 'Failed to run sql query: ERROR:  42P07: relation "things" already exists' }), { status: 400 }); }
+    return inner(url, init);
+  };
+  s.lines.length = 0;
+  assert.equal(await s.apply(), 1);
+  assert.ok(await unsettledAttempt(s.deps.stateRoot, 't/r', 'db/002_things.sql', await sha(s)), 'the first attempt is still open');
+});
+
+test('recording a file found in place stops when the conditions no longer hold at that moment', async () => {
+  const facts = FACTS.map((f) => ({ ...f, before: true, after: false }));
+  const s = await setup({ api: { facts }, answers: ['record'] });
+  const inner = s.deps.fetch;
+  let reads = 0;
+  s.deps.fetch = async (url, init) => {
+    // two reads for the plan, two under the lock; the table disappears before the one that decides
+    if (JSON.parse(init.body).query.startsWith('begin read only') && ++reads === 5) s.supabase.state.applied = true;
+    return inner(url, init);
+  };
+  assert.equal(await s.apply(), 1);
+  assert.match(s.text(), /✗ the conditions no longer hold, so nothing was recorded:\n {4}✗ table public\.things/);
+  assert.equal((await s.clearances()).size, 0);
+  assert.doesNotMatch(s.text(), /applied, but NOT cleared/);
 });
