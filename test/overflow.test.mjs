@@ -275,6 +275,21 @@ test('a red run here is still a red check: the verdict is this machine\'s', { ti
   assert.equal((await dispatches(s)).length, 1, 'no second try');
 });
 
+test('a run that has not started shows the workflow\'s name: that is not a stranger', { timeout: 60_000 }, async () => {
+  const s = await setup({ steps: ['exit 9'], github: { usage: LOTS_LEFT, runs: [{ status: 'queued', conclusion: null, display_title: 'ship-check' }, { status: 'in_progress', conclusion: null }, {}] } });
+  assert.equal(await runCheck({ cwd: s.work, github: true, deps: s.deps }), 0);
+  assert.equal((await cancels(s)).length, 0);
+  assert.match((await s.statuses()).at(-1).description, /on GitHub/);
+});
+
+test('a running run under another name is a stranger', { timeout: 60_000 }, async () => {
+  const s = await setup({ github: { usage: LOTS_LEFT, runs: [{ status: 'in_progress', conclusion: null, display_title: 'ship-check' }] } });
+  assert.equal(await runCheck({ cwd: s.work, github: true, deps: s.deps }), 0);
+  assert.equal((await cancels(s)).length, 1);
+  assert.ok(says(s, /is not the run ship started/));
+  assert.doesNotMatch((await s.statuses()).at(-1).description, /on GitHub/);
+});
+
 test('a short wobble in GitHub\'s answers does not end the wait', { timeout: 60_000 }, async () => {
   const s = await setup({ github: { usage: LOTS_LEFT, runReadFails: 2 } });
   assert.equal(await runCheck({ cwd: s.work, github: true, deps: { ...s.deps, githubBlindMs: 60_000 } }), 0);
