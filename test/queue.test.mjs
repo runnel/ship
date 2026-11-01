@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
-import { mkdir, readdir, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { ownerInfo } from '../lib/lock.mjs';
+import { ownerInfo, processStartTime } from '../lib/lock.mjs';
 import { parseLogName, runtimeOf, readHistory, usualFor, readLanes, snapshot, render, runQueue } from '../lib/queue.mjs';
 import { tempDir } from './helpers.mjs';
 
@@ -293,4 +293,24 @@ test('the ship command: `ship queue` reads the lanes of SHIP_TMP, takes no argum
   assert.match(bad.stderr, /^✗ ship queue: .*--now/);
   assert.match(bad.stdout, /^ship queue {3,}who holds each lane/);
   assert.match((await ship([], env)).stdout, /ship queue /);
+});
+
+test('a check on GitHub is listed with its run, not as a lane, and is never called stuck', async () => {
+  const root = await tempDir();
+  const place = join(root, 'tmp', 'lanes', 'github-0');
+  await mkdir(place, { recursive: true });
+  const since = new Date(Date.now() - 18 * 60_000).toISOString();
+  await writeFile(join(place, 'owner.json'), JSON.stringify({ pid: process.pid, startTime: await processStartTime(process.pid), nonce: 'n', since, repo: 'acme/app', pr: 12 }));
+  await writeFile(join(place, 'run.json'), JSON.stringify({ runId: 5, url: 'https://example.com/runs/5' }));
+  const lanes = await snapshot({ tmpRoot: join(root, 'tmp'), logRoot: join(root, 'logs') });
+  const lines = render(lanes);
+  const line = lines.find((l) => l.startsWith('on GitHub: acme/app PR #12'));
+  assert.ok(line, lines.join('\n'));
+  assert.match(line, /for 18m/);
+  assert.match(line, /https:\/\/example\.com\/runs\/5$/);
+  assert.ok(!lines.some((l) => l.includes('github-0') || l.includes('stuck')), lines.join('\n'));
+  assert.ok(lines.includes('heavy lane: free'), 'the lanes are listed as ever');
+  await rm(join(place, 'run.json'));
+  const starting = render(await snapshot({ tmpRoot: join(root, 'tmp'), logRoot: join(root, 'logs') })).find((l) => l.startsWith('on GitHub:'));
+  assert.match(starting, /starting$/, 'between taking the place and GitHub naming the run');
 });

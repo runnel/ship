@@ -33,7 +33,7 @@ const usageError = async (args, problem, usage, { lines = 1 } = {}) => {
 };
 
 test('ship check: a bad flag or an extra argument is a usage error, exit 2', { timeout: 30_000 }, async () => {
-  const usage = /^ship check \[--pr <number>\] {3,}check a pull request/;
+  const usage = /^ship check \[--pr <number>\] \[--github\] {3,}check a pull request/;
   await usageError(['check', '--nope'], 'check: .*--nope', usage);
   await usageError(['check', '42'], 'check: .*42', usage);
   await usageError(['check', '--pr'], 'check: .*--pr', usage);
@@ -112,7 +112,7 @@ test('ship unhold and ship migrations reject what they cannot take with exit 2',
 
 test('the usage lists every command with its description in one column', { timeout: 30_000 }, async () => {
   const rows = (await ship()).stdout.split('\n').filter((l) => l.startsWith('  ship '));
-  assert.equal(rows.length, 12);
+  assert.equal(rows.length, 13);
   assert.equal(new Set(rows.map((l) => l.match(/^ {2}ship .*? {2,}/)[0].length)).size, 1, rows.join('\n'));
 });
 

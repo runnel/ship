@@ -1,0 +1,60 @@
+# The copy of this file on the default branch is what `ship check` starts when the heavy lane's line
+# is long (README, "Overflow to GitHub Actions"). ship always starts it from the default branch, so a
+# pull request cannot change what judges it. Inputs reach the shell only through `env`, never by
+# `${{ }}` inside a script.
+name: ship-check
+run-name: ship check ${{ inputs.nonce }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      head_sha: { description: pull request head, required: true, type: string }
+      main_sha: { description: main the head is merged with, required: true, type: string }
+      tree_sha: { description: tree ship got from that merge, required: true, type: string }
+      groups: { description: check groups to run, required: true, type: string }
+      ship_sha: { description: ship commit to run them with, required: true, type: string }
+      nonce: { description: names this run, required: true, type: string }
+
+# Reading the code is all this run may do. It cannot post a status: ship does that, from its verdict.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # a hung run must not spend the minutes
+    env:
+      HEAD_SHA: ${{ inputs.head_sha }}
+      MAIN_SHA: ${{ inputs.main_sha }}
+      TREE_SHA: ${{ inputs.tree_sha }}
+      CHECK_GROUPS: ${{ inputs.groups }}
+      SHIP_SHA: ${{ inputs.ship_sha }}
+    steps:
+      - name: Runner
+        run: |
+          nproc
+          free -m
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.head_sha }}
+          fetch-depth: 0 # the merge and the list of changed files need the history
+          filter: blob:none # but not every old file
+      - name: Merge main, and compare with what ship got
+        run: |
+          git -c user.name=ship -c user.email=ship@localhost -c commit.gpgsign=false merge --no-edit --quiet "$MAIN_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$TREE_SHA"
+      # No package manager cache: its post step would save into the default branch's cache what the
+      # pull request's code left on this runner. Restore a cache another job saved if you want one.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Get ship
+        run: |
+          mkdir "$RUNNER_TEMP/ship"
+          curl -fsSL "https://codeload.github.com/runnel/ship/tar.gz/$SHIP_SHA" | tar -xz -C "$RUNNER_TEMP/ship" --strip-components=1
+      - name: Run the check groups
+        run: node "$RUNNER_TEMP/ship/bin/ship.mjs" run-groups --groups "$CHECK_GROUPS" --main "$MAIN_SHA" --head "$HEAD_SHA"
+      - name: Log of the failed step
+        if: failure()
+        run: tail -n 300 "$RUNNER_TEMP/ship-groups.log" || true
