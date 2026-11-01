@@ -12,6 +12,16 @@ process.on('exit', () => rmSync(ROOT, { recursive: true, force: true }));
 
 export const tempDir = (prefix = 't-') => mkdtemp(join(ROOT, prefix));
 
+// Polls `fn` until it is true; fails with `what` after `ms`.
+export async function waitUntil(fn, what, ms = 10_000) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    if (await fn()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(`${what}: not reached within ${ms} ms`);
+}
+
 const GIT_ENV = {
   ...process.env,
   GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@localhost',
