@@ -331,8 +331,9 @@ older one is fine.
 
 ### What `ship deploy` does
 
-1. Takes the repo's deploy lock (a second deploy waits), fetches the main branch, opens a fresh
-   worktree at its tip and loads `ship.config.mjs` from it.
+1. Takes the repo's deploy lock (a second deploy joins it or waits, see [One deploy at a
+   time](#one-deploy-at-a-time-and-a-fresh-main)), fetches the main branch, opens a fresh worktree
+   at its tip and loads `ship.config.mjs` from it.
 2. Per deployable: holds, import containment, the live commit (must be an ancestor of main), and
    whether any of its files changed since (minus `ignore` and `docsOnly`). Nothing pending: done.
    A pending deployable whose live commit is known gets `· ships 3 commit(s): #41 #43 + 1 without a
@@ -341,7 +342,9 @@ older one is fine.
    printed before the migration gate, setup, checks and builds, so a deploy says what it will ship
    before it runs anything.
 3. Migration files on main that are not cleared → stop. `requires` not live → stop.
-4. `deploySetup`, then every `onDeploy` check group; red → stop.
+4. `deploySetup`, which waits for the heavy lane: when the slot arrives the deploy reads main
+   again and may move to it (below), and prints `▸ building main@<sha> · ships …`, the final list
+   of what it builds. Then every `onDeploy` check group; red → stop.
 5. Each pending deployable, dependencies first. Both modes refuse, before building, a wrangler
    config whose `name` is not the deployable's `worker`. `versioned`: refuses when a setting only
    `wrangler deploy` applies differs (crons, routes, workers.dev and preview URLs, Durable Object
@@ -360,6 +363,46 @@ older one is fine.
    [Rollbacks](#rollbacks)). A deployable that fails or is held stops the deployables that come
    `after` it; the others go on. Naming a deployable whose `after` dependency has pending changes
    skips it too, unless the dependency is named as well.
+
+### One deploy at a time, and a fresh main
+
+Sessions that merge a pull request each run `ship deploy`, and each build takes the machine's
+heavy slot. So deploys of one repository collapse into one:
+
+- **A late caller joins.** A `ship deploy` that finds another one of the same repository that has
+  not yet fixed what it ships (it is waiting for the deploy lock, or for its slot) does not wait
+  for the lock to deploy what is left. It prints `↪ …: a deploy started at 17:21 (pid 4711) has not
+  begun building; this one joins it, with the same result`, then the other deploy's output, line
+  for line, and exits with its status. It joins only a deploy that was asked for the same
+  deployables and the same `--redeploy`; a `--dry-run` neither joins nor is joined. If the deploy it
+  joined ends before it began building (it stopped at a migration, found nothing pending, was
+  interrupted), the caller says so and deploys for itself.
+- **Once the deploy has its slot, main is read again.** What a deploy ships is decided when it gets
+  the heavy lane for its setup: waiting for that lane can take a long time, and main goes on
+  meanwhile. From that moment no one joins it; a `ship deploy` that arrives later waits for the
+  lock and deploys what is still pending, as before. The deploy then fetches main. If it moved
+  and the new head is safe, the deploy moves to it: it prints `↻ main moved while the deploy
+  waited: 9607018 → 3f2a1b9 (5 new commit(s))`, makes its plan again (the plan lines of the
+  later head follow, the earlier ones stay above) and builds the later head, setup and deploy-time
+  checks included. The `sha:` annotation names the commit that was built. A move is **not** made,
+  and the deploy goes on with the head it planned, saying why, when:
+  - the new commits bring a migration file that is not cleared (a deploy never goes past one:
+    the owner clears it and the next `ship deploy` carries it);
+  - main is not a descendant of the planned head (it was rewritten), or the later head's tree or
+    config cannot be opened;
+  - a deployable that would run on the planned head would be held, blocked or skipped on the later
+    one (an import outside its paths, say), or a deployable name is unknown there;
+  - the later head's config `requires` something the planned one did not, and that is not live.
+  When the deploy keeps its head although main moved, or cannot read main (the read and the
+  judging are given 90 s each, because they run while the deploy holds the heavy lane), it does not
+  answer for the callers that joined it: they deploy for themselves, which gives each of them its
+  own verdict. The same goes for a joined deploy that is interrupted or vanishes.
+  A `requires` the planned head already passed is not asked again. A hold written while the deploy
+  waited stops that deployable whether or not main moved. The heavy lane is taken again for each
+  build, so main is not read a second time: pull requests merged after the deploy has its slot go
+  with the next deploy. A repository without a `deploySetup` has no slot to wait for before the
+  first build, so its deploy reads main again right after it has planned, and does not wait for
+  anything before that.
 
 ### Clearing migrations
 
