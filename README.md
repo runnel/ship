@@ -115,8 +115,8 @@ lane prints `! on battery power` right after the groups line when `pmset` (macOS
 is on battery, because heavy checks time out more often there; it warns and goes on. Times in messages use the
 system time zone; `SHIP_TZ=UTC` (any IANA name) overrides it.
 
-A lane is first come, first served. A check or deploy step that finds its lane taken files a ticket
-in `$SHIP_TMP/lanes` and starts only when its ticket is first, so it cannot lose to a waiter that
+A lane is first come, first served. A check or deploy step that wants a lane files a ticket in
+`$SHIP_TMP/lanes` and starts only when its ticket is first, so it cannot lose to a waiter that
 happens to poll at a luckier moment. Work that `ship deploy` does (its setup, deploy-time checks and
 builds) goes ahead of waiting pull request checks; whoever holds the lane is never interrupted. The
 waiting line says the place: `… waiting for the heavy lane (3rd in line): acme/app PR #12 since 17:21`

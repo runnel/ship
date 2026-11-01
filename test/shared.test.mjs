@@ -84,13 +84,13 @@ test('the lane wait line names who is next when the lane is free for a moment, a
 });
 
 // A lane held by one check, with checks and deploys arriving behind it: deploys go first, the rest in
-// arrival order, and never two inside at once.
+// arrival order, and never two inside at once. Each waiter has its own output, to see what it was told.
 test('a lane serves deploy work before checks and each in arrival order, one at a time', { timeout: 30_000 }, async () => {
   const dir = await tempDir('lane-');
-  const lines = [];
-  const d = { tmpRoot: dir, pollMs: 10, out: (l) => lines.push(l) };
   const laneDir = join(dir, 'lanes', 'heavy');
   const tickets = () => readdirSync(join(dir, 'lanes')).filter((n) => n.endsWith('.json')).length;
+  const said = {};
+  const depsFor = (label) => ({ tmpRoot: dir, pollMs: 10, out: (l) => (said[label] ??= []).push(l) });
   const order = [];
   let inside = 0;
   let maxInside = 0;
@@ -104,26 +104,29 @@ test('a lane serves deploy work before checks and each in arrival order, one at 
   const runs = [];
   const arrive = async (label, start) => {
     const before = tickets();
-    runs.push(start(label));
+    runs.push(start());
     await waitUntil(() => tickets() > before, `${label} to be in line`);
   };
   const check = (label) => async () => { // as check.mjs takes its place
-    const release = await acquireShared(laneDir, await ownerInfo({ repo: 'acme/app', pr: Number(label.slice(2)) }), { pollMs: 10, priority: LANE_PRIORITY.check, onWait: laneWaitReporter(d, 'heavy') });
+    const release = await acquireShared(laneDir, await ownerInfo({ repo: 'acme/app', pr: Number(label.slice(2)) }), {
+      pollMs: 10, priority: LANE_PRIORITY.check, onWait: laneWaitReporter(depsFor(label), 'heavy'),
+    });
     try { await work(label); } finally { await release(); }
   };
-  const deploy = (label) => () => withLane({ d, lane: 'heavy', owner: { repo: 'acme/app', command: label }, fn: () => work(label) });
-  await arrive('PR2', (l) => check(l)());
-  await arrive('PR3', (l) => check(l)());
-  await arrive('deploy-a', (l) => deploy(l)());
-  await arrive('PR4', (l) => check(l)());
-  await arrive('deploy-b', (l) => deploy(l)());
+  const deploy = (label) => () => withLane({ d: depsFor(label), lane: 'heavy', owner: { repo: 'acme/app', command: label }, fn: () => work(label) });
+  await arrive('PR2', check('PR2'));
+  await arrive('PR3', check('PR3'));
+  await arrive('deploy-a', deploy('deploy-a'));
+  await arrive('PR4', check('PR4'));
+  await arrive('deploy-b', deploy('deploy-b'));
+  // Everyone has been told where they stand, now that all have arrived: ahead of the checks that came first.
+  await waitUntil(() => said['PR2']?.at(-1)?.includes('(3rd in line)') && said['PR3']?.at(-1)?.includes('(4th in line)') && said['PR4']?.at(-1)?.includes('(5th in line)'), 'the checks to hear their places');
+  assert.match(said['deploy-a'][0], /^… waiting for the heavy lane \(1st in line\): acme\/app PR #1 since /);
+  assert.match(said['deploy-b'][0], /\(2nd in line\)/);
   await holder();
   await Promise.all(runs);
   assert.deepEqual(order, ['deploy-a', 'deploy-b', 'PR2', 'PR3', 'PR4']);
   assert.equal(maxInside, 1);
   assert.equal(tickets(), 0);
   assert.equal(readdirSync(join(dir, 'lanes')).length, 0);
-  // The waiters were told their place: the first deploy that it was next, the last check that it was behind the rest.
-  assert.ok(lines.some((l) => /heavy lane \(1st in line\): acme\/app PR #1/.test(l)), lines.join('\n'));
-  assert.ok(lines.some((l) => /heavy lane \(5th in line\)/.test(l) || /heavy lane \(4th in line\)/.test(l)), lines.join('\n'));
 });

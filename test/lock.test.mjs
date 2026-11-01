@@ -233,13 +233,16 @@ test('a holder is never pre-empted by a higher priority', { timeout: 30_000 }, a
   await (await urgent)();
 });
 
-test('a waiter that is killed does not block the line', { timeout: 30_000 }, async () => {
+test('a waiter that is killed does not block the line, even if a process is left running in its group', { timeout: 30_000 }, async () => {
   const dir = await lockDir();
   const holder = await acquire(dir, await ownerInfo({ label: 'holder' }));
   const mod = new URL('../lib/lock.mjs', import.meta.url).href;
-  const code = `import { acquire, ownerInfo } from ${JSON.stringify(mod)};
+  // The leftover (a build worker, say) outlives the waiter and keeps its process group alive.
+  const code = `import { spawn } from 'node:child_process';
+    import { acquire, ownerInfo } from ${JSON.stringify(mod)};
+    spawn('sleep', ['30'], { stdio: 'ignore' }).unref();
     await acquire(process.argv[1], await ownerInfo({ label: 'doomed' }), { pollMs: 50, priority: 0 });`;
-  // A group of its own, as a ship process has: a lock or ticket is only stale once its whole group is gone.
+  // A group of its own, as a ship process has.
   const doomed = spawn(process.execPath, ['--input-type=module', '-e', code, dir], { stdio: 'ignore', detached: true });
   const exited = new Promise((r) => doomed.on('exit', r));
   let abort = false;
@@ -260,7 +263,7 @@ test('a waiter that is killed does not block the line', { timeout: 30_000 }, asy
     await (await behind)();
   } finally {
     abort = true;
-    doomed.kill('SIGKILL');
+    try { process.kill(-doomed.pid, 'SIGKILL'); } catch { /* the group is gone */ }
     await holder();
     await behind?.then((r) => r(), () => {});
   }
@@ -379,4 +382,46 @@ test('a ticket needs a priority from 0 to 99', async () => {
     await assert.rejects(acquire(dir, await ownerInfo(), { priority }), RangeError);
   }
   assert.deepEqual(ticketsOf(dir), []);
+});
+
+test('a damaged ticket is swept, a ticket that cannot be read is not, and old half-written leftovers are removed', { timeout: 30_000 }, async () => {
+  const dir = await lockDir();
+  const parent = dirname(dir);
+  const base = `${dir.split('/').pop()}.q-`;
+  const names = () => readdirSync(parent);
+  const holder = await acquire(dir, await ownerInfo({ label: 'holder' }));
+  await writeFile(join(parent, `${base}00-000000000000001-000000-damaged.json`), 'not json');
+  const young = join(parent, `${base}00-000000000000002-000000-young.json.tmp`);
+  const old = join(parent, `${base}00-000000000000003-000000-old.json.tmp`);
+  await writeFile(young, '{');
+  await writeFile(old, '{');
+  const longAgo = new Date(Date.now() - 3_600_000);
+  await utimes(old, longAgo, longAgo);
+  // A ticket of a live process (this one) that happens to be unreadable: it says nothing about its waiter.
+  const unreadable = join(parent, `${base}00-000000000000009-000000-unreadable.json`);
+  await writeFile(unreadable, JSON.stringify(await ownerInfo({ label: 'unreadable' })));
+  await chmod(unreadable, 0o000);
+
+  let abort = false;
+  let got = false;
+  const waiter = acquire(dir, await ownerInfo({ label: 'w' }), { pollMs: 10, priority: 1, isAborted: () => abort })
+    .then((r) => { got = true; return r(); }, () => {});
+  try {
+    await waitUntil(() => !names().some((n) => n.includes('damaged')), 'the damaged ticket to be swept');
+    assert.equal(names().some((n) => n.includes('old.json.tmp')), false);
+    assert.equal(names().some((n) => n.includes('young.json.tmp')), true);
+    assert.equal(names().some((n) => n.includes('unreadable')), true);
+    await holder();
+    await sleep(150); // many polls with the lane free
+    assert.equal(got, false); // the unreadable ticket is still ahead
+    await chmod(unreadable, 0o600);
+    await rm(unreadable);
+    await waiter;
+    assert.equal(got, true);
+  } finally {
+    abort = true;
+    await chmod(unreadable, 0o600).catch(() => {});
+    await holder();
+    await waiter;
+  }
 });
