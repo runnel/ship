@@ -43,7 +43,7 @@ test('with migrations.apply the refusal names apply first and ack for a file tha
   const s = await setupDeploy({ options: { migrationApply: apply }, seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }), change: { 'app/src/a.ts': '2', 'db/002.sql': '' } });
   await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
   assert.equal(await s.deploy(), 1);
-  assert.match(s.lines.join('\n'), /migrations not cleared for deploy: db\/002\.sql\n {2}the owner applies each in their own terminal: ship migrations apply 002\.sql \(one file at a time; applies, proves and clears\)\n {2}one that goes after the deploy instead: ship migrations ack 002\.sql$/);
+  assert.match(s.lines.join('\n'), /migrations not cleared for deploy: db\/002\.sql\n {2}the owner applies each in their own terminal, one command per file \(applies, proves and clears\), in number order:\n {4}ship migrations apply 002\.sql\n {2}one that goes after the deploy instead: ship migrations ack 002\.sql$/);
   assert.deepEqual(await s.cloud.wranglerCalls(), []);
 });
 

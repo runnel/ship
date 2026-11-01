@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { addAcks, addApplied, writeHold } from '../lib/state.mjs';
+import { addAcks, addProof, writeHold } from '../lib/state.mjs';
 import { runStatus } from '../lib/status.mjs';
 import { at, setupDeploy } from './deploy-fixture.mjs';
 
@@ -70,18 +70,18 @@ const APPLY = ", apply: { adapter: 'supabase', project: 'abcdefghijklmnopqrst' }
 test('status tells an applied-and-proven migration from a bare ack, and says how to clear what is left', async () => {
   const s = await setupDeploy({ options: { migrationApply: APPLY }, change: { 'db/002.sql': '', 'db/003.sql': '' }, seed: ({ head }) => ({ 'example-app': at(head), 'example-tick': at(head) }) });
   await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
-  await addApplied(s.deps.stateRoot, 't/r', { file: 'db/002.sql', by: 'owner@laptop', sha256: 'a'.repeat(64), mainSha: s.head, checks: 3 });
+  await addProof(s.deps.stateRoot, 't/r', { kind: 'applied', file: 'db/002.sql', by: 'owner@laptop', sha256: 'a'.repeat(64), mainSha: s.head, checks: 3 });
   assert.equal(await runStatus({ cwd: s.work, deps: s.deps }), 0);
   const text = s.lines.join('\n');
-  assert.match(text, /^! migrations not cleared for deploy: db\/003\.sql\n {2}the owner applies each in their own terminal: ship migrations apply 003\.sql \(one file at a time; applies, proves and clears\)\n {2}one that goes after the deploy instead: ship migrations ack 003\.sql$/m);
-  assert.match(text, /^ {2}proof: 1 applied and proven by ship, 1 acked only \(never checked against the database\)$/m);
-  assert.match(text, /^ {2}newest proven: 002\.sql \(3 post-conditions, owner@laptop, /m);
+  assert.match(text, /^! migrations not cleared for deploy: db\/003\.sql\n {2}the owner applies each in their own terminal, one command per file \(applies, proves and clears\), in number order:\n {4}ship migrations apply 003\.sql\n {2}one that goes after the deploy instead: ship migrations ack 003\.sql$/m);
+  assert.match(text, /^ {2}proof: 1 applied and proven by ship, 0 found in place and recorded, 1 acked only \(never checked against the database\)$/m);
+  assert.match(text, /^ {2}newest applied: 002\.sql \(3 post-conditions, owner@laptop, /m);
   assert.match(text, /^ {2}newest acked only: 001\.sql \(acked /m);
 
   await addAcks(s.deps.stateRoot, 't/r', ['db/003.sql']);
   s.lines.length = 0;
   assert.equal(await runStatus({ cwd: s.work, deps: s.deps }), 0);
-  assert.match(s.lines.join('\n'), /^✓ migrations: all cleared\n {2}proof: 1 applied and proven by ship, 2 acked only/m);
+  assert.match(s.lines.join('\n'), /^✓ migrations: all cleared\n {2}proof: 1 applied and proven by ship, 0 found in place and recorded, 2 acked only/m);
 });
 
 test('a repository without migrations.apply keeps the old hint and prints no proof lines', async () => {
@@ -89,4 +89,10 @@ test('a repository without migrations.apply keeps the old hint and prints no pro
   await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
   assert.equal(await runStatus({ cwd: s.work, deps: s.deps }), 0);
   assert.doesNotMatch(s.lines.join('\n'), /proof:|migrations apply/);
+});
+
+test('with several files left, the hint gives one apply command per file, in number order', async () => {
+  const s = await setupDeploy({ options: { migrationApply: APPLY }, change: { 'db/010.sql': '', 'db/002.sql': '' }, seed: ({ head }) => ({ 'example-app': at(head), 'example-tick': at(head) }) });
+  assert.equal(await runStatus({ cwd: s.work, deps: s.deps }), 0);
+  assert.match(s.lines.join('\n'), /in number order:\n {4}ship migrations apply 001\.sql\n {4}ship migrations apply 002\.sql\n {4}ship migrations apply 010\.sql\n {2}one that goes after the deploy instead: ship migrations ack 001\.sql 002\.sql 010\.sql$/m);
 });

@@ -5,12 +5,14 @@
 //
 //   facts: [{ label, match, before: false, after: true, afterDry: after }]
 //   applyStatus: 400 → the apply is refused (nothing changes), with `applyMessage`
-//   applyThrows: true → the apply request gets no answer; it took effect anyway if `appliedAnyway`
+//   applyThrows: n → the first n apply requests get no answer; each took effect anyway if `appliedAnyway`
+//   refusalCommits: a refused apply has changed the database all the same (a file that commits part of itself)
 //   dryMessage: the dry run fails with that Postgres message (default: the marker with the results)
 //   echoTokenInErrors: every error message repeats the bearer token, as a careless API might
 
-export function fakeSupabase({ project = 'abcdefghijklmnopqrst', token = 'sbp_test_token_0123456789', facts = [], applyStatus = null, applyMessage = 'ERROR:  42P07: relation "x" already exists', applyThrows = false, appliedAnyway = false, dryMessage = null, echoTokenInErrors = false, denyToken = false, unreachable = false } = {}) {
+export function fakeSupabase({ project = 'abcdefghijklmnopqrst', token = 'sbp_test_token_0123456789', facts = [], applyStatus = null, applyMessage = 'ERROR:  42P07: relation "x" already exists', applyThrows = 0, appliedAnyway = false, refusalCommits = false, dryMessage = null, echoTokenInErrors = false, denyToken = false, unreachable = false } = {}) {
   const requests = [];
+  let throwsLeft = applyThrows === true ? 1 : applyThrows;
   const state = { applied: false };
   const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
   const error = (status, message) => json(status, { message: echoTokenInErrors ? `${message} (Bearer ${token})` : message });
@@ -19,7 +21,7 @@ export function fakeSupabase({ project = 'abcdefghijklmnopqrst', token = 'sbp_te
 
   const fetch = async (url, init = {}) => {
     const sql = JSON.parse(init.body).query;
-    const kind = sql.startsWith('begin;') && sql.includes('DRY_RUN_OK') ? 'dry-run' : sql.startsWith('select coalesce((') ? 'check' : 'apply';
+    const kind = sql.startsWith('begin read only;') ? 'check' : sql.startsWith('begin;') && sql.includes('DRY_RUN_OK') ? 'dry-run' : 'apply';
     requests.push({ url, kind, sql, headers: init.headers });
     if (unreachable) throw new TypeError('fetch failed');
     if (!String(url).endsWith(`/v1/projects/${project}/database/query`)) return error(404, 'Not Found');
@@ -33,14 +35,18 @@ export function fakeSupabase({ project = 'abcdefghijklmnopqrst', token = 'sbp_te
     }
     if (kind === 'check') {
       const fact = facts.find((f) => sql.includes(f.match));
-      if (!fact) return error(400, `ERROR:  42703: no fact for ${sql}`);
-      return json(200, [{ ok: state.applied ? fact.after : fact.before }]);
+      if (!fact) return sqlError(400, `ERROR:  42703: no fact for ${sql}`);
+      return sqlError(400, `ERROR:  P0001: CHECK_OK ${JSON.stringify([{ label: fact.label, ok: state.applied ? fact.after : fact.before }])}`);
     }
-    if (applyThrows) {
-      state.applied = appliedAnyway;
+    if (throwsLeft > 0) {
+      throwsLeft--;
+      if (appliedAnyway) state.applied = true;
       throw new TypeError('fetch failed');
     }
-    if (applyStatus) return sqlError(applyStatus, applyMessage);
+    if (applyStatus) {
+      if (refusalCommits) state.applied = true;
+      return sqlError(applyStatus, applyMessage);
+    }
     state.applied = true;
     return json(201, []);
   };

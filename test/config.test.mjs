@@ -127,6 +127,11 @@ test('migrations.apply: a Supabase project, a label, the token key, the dry run;
     assert.throws(() => validateConfig(withApply(bad)), ConfigError, JSON.stringify(bad));
   }
   assert.throws(() => validateConfig({ ...base, migrations: { paths: ['db/*.sql'], apply } }), /migrations\.apply needs credentials/);
+  const creds = (map) => ({ credentials: { file: '/x', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A', ...map } } });
+  assert.doesNotThrow(() => validateConfig(withApply(apply, creds({ SOME_OTHER: 'KEY' }))));
+  for (const map of [{ SUPABASE_ACCESS_TOKEN: 'SUPABASE_ACCESS_TOKEN' }, { DB: 'SUPABASE_ACCESS_TOKEN' }, { SUPABASE_ACCESS_TOKEN: 'ANOTHER' }]) {
+    assert.throws(() => validateConfig(withApply(apply, creds(map))), /which would hand the database token to every deploy step/, JSON.stringify(map));
+  }
 });
 
 test('wrong shapes are ConfigErrors, never TypeErrors', () => {

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { conditionExpression, conditionQuery, dryRunSql, findTransactionControl, nonTransactional, parseConditions, parseDryRun, stripTransaction } from '../lib/postconditions.mjs';
+import { readFileSync } from 'node:fs';
+import { conditionExpression, dryRunSql, nonTransactional, parseConditions, parseDryRun, parseProbe, probeSql, stripTransaction } from '../lib/postconditions.mjs';
 
 const one = (line, opts) => parseConditions(`-- ship:verify ${line}\n`, opts);
 const sqlOf = (line) => conditionExpression(one(line).conditions[0]);
@@ -34,6 +35,10 @@ test('only comment lines of a migration count; a .verify file may leave the dash
 test('what cannot be understood is an error with its line, never a silent skip', () => {
   const bad = (line) => one(line, { source: 'm.sql' }).errors;
   assert.deepEqual(bad(''), ['m.sql line 1: empty ship:verify line']);
+  assert.match(bad('sql (1 = 1')[0], /balanced parentheses/);
+  assert.match(bad('sql 1 = 1)')[0], /balanced parentheses/);
+  assert.match(bad("sql 'open = 1")[0], /balanced parentheses and closed quotes/);
+  assert.match(bad('sql false), true) as ok, (select 1')[0], /balanced parentheses/);
   assert.match(bad('table things')[0], /^m\.sql line 1: not a valid table target: table things$/);
   assert.match(bad('table Public.Things')[0], /not a valid table target/);
   assert.match(bad('table public.a public.b')[0], /^m\.sql line 1: expected table <target>/);
@@ -50,8 +55,8 @@ test('what cannot be understood is an error with its line, never a silent skip',
   assert.match(bad('frobnicate')[0], /unknown condition: frobnicate/);
 });
 
-test('conditions become read-only SELECTs of one boolean; a missing object reads as "does not hold"', () => {
-  assert.equal(conditionQuery(one('table public.things').conditions[0]), "select coalesce((to_regclass('public.things') is not null), false) as ok");
+test('conditions become boolean expressions; a missing object reads as "does not hold"', () => {
+  assert.equal(sqlOf('table public.things'), "to_regclass('public.things') is not null");
   assert.match(sqlOf('column public.things.owner_id'), /from pg_attribute where attrelid = to_regclass\('public\.things'\) and attname = 'owner_id'/);
   assert.equal(sqlOf('function public.f(uuid, text)'), "to_regprocedure('public.f(uuid, text)') is not null");
   assert.match(sqlOf('rls public.things'), /relrowsecurity from pg_class where oid = to_regclass\('public\.things'\)/);
@@ -64,23 +69,35 @@ test('conditions become read-only SELECTs of one boolean; a missing object reads
   assert.equal(sqlOf('sql 1 = 1'), '1 = 1');
 });
 
-test('the dry run wraps the file and the conditions in one transaction that always ends in the marker', () => {
+test('the dry run runs the file as a string inside a DO block in one transaction that always ends in the marker', () => {
   const conditions = parseConditions('-- ship:verify table public.a\n-- ship:verify rls public.a\n').conditions;
   const sql = dryRunSql('begin;\ncreate table public.a (id int)\nnotify pgrst, \'reload schema\';\ncommit;\n', conditions, 'dx1');
-  assert.match(sql, /^begin;\ncreate table public\.a \(id int\)\n;\ndo \$dx1\$ begin raise exception 'DRY_RUN_OK %', \(jsonb_build_array\(jsonb_build_object\('label', 'table public\.a', 'ok', coalesce\(\(/);
-  assert.ok(sql.endsWith("::text; end $dx1$;"));
+  assert.match(sql, /^begin;\nset local lock_timeout = '5s';\nset local statement_timeout = '120s';\ndo \$dx1\$ begin execute \$dx1b\$create table public\.a \(id int\)\n\$dx1b\$; raise exception 'DRY_RUN_OK %', \(jsonb_build_array\(jsonb_build_object\('label', 'table public\.a', 'ok', coalesce\(\(/);
+  assert.ok(sql.endsWith('::text; end $dx1$;'));
   assert.equal(sql.match(/^begin;$/gm).length, 1, "the file's own begin is removed");
   assert.doesNotMatch(sql, /commit;|notify/);
+  assert.match(dryRunSql('select 1', conditions, 'dx1', { lockTimeout: '1s', statementTimeout: '9s' }), /lock_timeout = '1s';\nset local statement_timeout = '9s';/);
 });
 
-test('a file that would end the dry run early cannot be dry-run', () => {
+test('whatever the file does with transactions stays inside the EXECUTE string, so it cannot end the dry run early', () => {
   const conditions = parseConditions('-- ship:verify table public.a\n').conditions;
-  for (const stray of ['commit work;', 'rollback;', 'abort;', 'end transaction;', 'commit; -- later']) {
-    assert.throws(() => dryRunSql(`create table public.a (id int);\n${stray}\n`, conditions, 'dx1'), /would commit or abandon part of the dry run/, stray);
+  for (const stray of ['create table public.a (id int); commit;', 'create table public.a (id int);\nend;', '/* x */ commit;', 'commit work;', 'rollback;', 'abort;', 'end transaction;', 'commit; -- later']) {
+    const sql = dryRunSql(stray, conditions, 'dx1');
+    const outside = sql.slice(0, sql.indexOf('execute $dx1b$')) + sql.slice(sql.lastIndexOf('$dx1b$') + '$dx1b$'.length);
+    assert.doesNotMatch(outside, /commit|rollback|abort|\bend (transaction|work)|\bend;/i, `${JSON.stringify(stray)} appears outside the string`);
   }
-  assert.doesNotThrow(() => dryRunSql('create function f() returns int language plpgsql as $$ begin return 1; end; $$;\n', conditions, 'dx1'), 'a plpgsql block end is fine');
-  assert.equal(findTransactionControl('select 1;\nend if;'), null);
+  assert.throws(() => dryRunSql('select \'$dx1b$\'', conditions, 'dx1'), /own quoting tag/);
   assert.equal(stripTransaction('begin;\nselect 1;\nCOMMIT;'), 'select 1;');
+  assert.equal(stripTransaction('create function f() returns int language plpgsql as $$ begin return 1; end; $$;'), 'create function f() returns int language plpgsql as $$ begin return 1; end; $$;', 'a plpgsql block end is not a transaction line');
+});
+
+test('a probe reads one condition in a read-only transaction that always ends in the marker', () => {
+  const c = one('table public.things').conditions[0];
+  assert.equal(probeSql(c, 'p1'), "begin read only;\ndo $p1$ begin raise exception 'CHECK_OK %', (jsonb_build_array(jsonb_build_object('label', 'table public.things', 'ok', coalesce((to_regclass('public.things') is not null), false))))::text; end $p1$;");
+  const answer = (marker) => ({ status: 400, body: { message: `Failed to run sql query: ERROR:  P0001: ${marker} [{"label":"table public.things","ok":true}]\nCONTEXT: x` } });
+  assert.deepEqual(parseProbe(answer('CHECK_OK')), { passed: true, results: [{ label: 'table public.things', ok: true }] });
+  assert.equal(parseProbe(answer('DRY_RUN_OK')).passed, false, 'a probe only trusts its own marker');
+  assert.match(parseProbe({ status: 400, body: { message: 'ERROR:  25006: cannot execute nextval() in a read-only transaction' } }).detail, /read-only/);
 });
 
 test('only the first line of the answer can be the marker: an echo of our own SQL is not a pass', () => {
@@ -99,4 +116,21 @@ test('statements a transaction cannot hold are recognised', () => {
   assert.equal(nonTransactional('create index concurrently i on t (c);'), 'CONCURRENTLY');
   assert.equal(nonTransactional('vacuum analyze t;'), 'VACUUM');
   assert.equal(nonTransactional('create table t (c int);'), null);
+});
+
+test('a trailing note is ignored on every form but sql', () => {
+  const { conditions, errors } = parseConditions('-- ship:verify table public.a    -- the table\n-- ship:verify function public.f(uuid, text) -- (arguments)\n-- ship:verify sql (select 1) = 1\n');
+  assert.deepEqual(errors, []);
+  assert.deepEqual(conditions.map((c) => c.label), ['table public.a', 'function public.f(uuid, text)', 'sql (select 1) = 1']);
+  assert.match(parseConditions('-- ship:verify sql 1 = 1 -- note\n').errors[0], /one expression/);
+  assert.equal(parseConditions("-- ship:verify sql (select ')') = ')'\n").errors.length, 0, 'parentheses inside quotes do not count');
+});
+
+test('the example in the README parses', () => {
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const block = readme.match(/```sql\n((?:-- ship:verify[^\n]*\n)+)```/)?.[1];
+  assert.ok(block, 'the README has a ship:verify example block');
+  const { conditions, errors } = parseConditions(block);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(new Set(conditions.map((c) => c.kind)), new Set(['table', 'column', 'function', 'rls', 'no-access', 'no-execute', 'access', 'execute', 'absent', 'sql']));
 });
