@@ -112,7 +112,7 @@ test('ship unhold and ship migrations reject what they cannot take with exit 2',
 
 test('the usage lists every command with its description in one column', { timeout: 30_000 }, async () => {
   const rows = (await ship()).stdout.split('\n').filter((l) => l.startsWith('  ship '));
-  assert.equal(rows.length, 11);
+  assert.equal(rows.length, 12);
   assert.equal(new Set(rows.map((l) => l.match(/^ {2}ship .*? {2,}/)[0].length)).size, 1, rows.join('\n'));
 });
 
