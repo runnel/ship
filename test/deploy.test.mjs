@@ -38,6 +38,15 @@ test('an unacked migration stops everything before any work', async () => {
   assert.equal(await s.deploy(), 0, s.lines.join('\n'));
 });
 
+test('with migrations.apply the refusal names apply first and ack for a file that goes after the deploy', async () => {
+  const apply = ", apply: { adapter: 'supabase', project: 'abcdefghijklmnopqrst' }";
+  const s = await setupDeploy({ options: { migrationApply: apply }, seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }), change: { 'app/src/a.ts': '2', 'db/002.sql': '' } });
+  await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
+  assert.equal(await s.deploy(), 1);
+  assert.match(s.lines.join('\n'), /migrations not cleared for deploy: db\/002\.sql\n {2}the owner applies each in their own terminal: ship migrations apply 002\.sql \(one file at a time; applies, proves and clears\)\n {2}one that goes after the deploy instead: ship migrations ack 002\.sql$/);
+  assert.deepEqual(await s.cloud.wranglerCalls(), []);
+});
+
 test('the ack hint names the path of a migration whose file name is not unique', async () => {
   const s = await setupDeploy({
     options: { migrationPaths: "['db/**']" },

@@ -117,6 +117,18 @@ test('migrations, requires, deploySetup shapes', () => {
   assert.throws(() => validateConfig(withDeploy({ deploySetup: [{ run: 'x', cwd: '../up' }] })), /deploySetup/);
 });
 
+test('migrations.apply: a Supabase project, a label, the token key, the dry run; it needs credentials', () => {
+  const apply = { adapter: 'supabase', project: 'abcdefghijklmnopqrst' };
+  const withApply = (a, extra = {}) => withDeploy({ migrations: { paths: ['db/*.sql'], apply: a }, ...extra });
+  assert.deepEqual(validateConfig(withApply(apply)).migrations.apply, { adapter: 'supabase', project: 'abcdefghijklmnopqrst', label: null, tokenKey: 'SUPABASE_ACCESS_TOKEN', dryRun: true });
+  assert.deepEqual(validateConfig(withApply({ ...apply, label: 'production', tokenKey: 'DB_TOKEN', dryRun: false })).migrations.apply, { adapter: 'supabase', project: 'abcdefghijklmnopqrst', label: 'production', tokenKey: 'DB_TOKEN', dryRun: false });
+  assert.equal('apply' in validateConfig(withDeploy({ migrations: { paths: ['db/*.sql'] } })).migrations, false, 'no apply key unless configured');
+  for (const bad of [null, 'supabase', { ...apply, adapter: 'postgres' }, { ...apply, project: 'Not A Ref' }, { ...apply, project: undefined }, { ...apply, label: '' }, { ...apply, tokenKey: 'lower' }, { ...apply, dryRun: 'yes' }, { ...apply, extra: 1 }]) {
+    assert.throws(() => validateConfig(withApply(bad)), ConfigError, JSON.stringify(bad));
+  }
+  assert.throws(() => validateConfig({ ...base, migrations: { paths: ['db/*.sql'], apply } }), /migrations\.apply needs credentials/);
+});
+
 test('wrong shapes are ConfigErrors, never TypeErrors', () => {
   const badDep = (patch) => assert.throws(() => validateConfig(withDeploy({ deployables: [{ ...app, ...patch }] })), ConfigError);
   badDep({ probes: 'GET /' });

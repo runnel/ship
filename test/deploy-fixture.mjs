@@ -7,7 +7,7 @@ import { fakeCloud } from './fake-cloud.mjs';
 // `builtSha` is a file path: the app's build writes the commit it was run at into it.
 // `third: true` adds `job`, a direct deployable that depends on nothing (its files and Worker are
 // added by setupDeploy; the seed must name example-job).
-export const configText = (bin, { guard = 'test -x tools/wrangler', tickPaths = "['workers/tick/**']", requires = '[]', migrationPaths = "['db/*.sql']", third = false, docsOnly = '[]', appIgnore = '[]', builtSha = null } = {}) => `export default {
+export const configText = (bin, { guard = 'test -x tools/wrangler', tickPaths = "['workers/tick/**']", requires = '[]', migrationPaths = "['db/*.sql']", migrationApply = '', third = false, docsOnly = '[]', appIgnore = '[]', builtSha = null } = {}) => `export default {
   repo: 't/r',
   docsOnly: ${docsOnly},
   checks: [
@@ -24,7 +24,7 @@ export const configText = (bin, { guard = 'test -x tools/wrangler', tickPaths = 
     { name: 'job', worker: 'example-job', cwd: 'workers/job', paths: ['workers/job/**'], mode: 'direct', wrangler: 'tools/wrangler',
       probes: [{ path: '/', status: 403 }], liveHost: 'https://job.example.com' },` : ''}
   ],
-  migrations: { paths: ${migrationPaths} },
+  migrations: { paths: ${migrationPaths}${migrationApply} },
   requires: ${requires},
   credentials: { file: '/unused/creds.env', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } },
 };\n`;

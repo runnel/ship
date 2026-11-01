@@ -63,6 +63,9 @@ test('missing arguments and malformed values are usage errors in the same style'
   await usageError(['unhold'], 'unhold: missing deployable name', /^ship unhold <deployable> /);
   await usageError(['unhold', '../x'], 'unhold: "../x" is not a deployable name', /^ship unhold <deployable> /);
   await usageError(['migrations', 'ack'], 'migrations ack: missing migration file names', /^ship migrations ack <file>… /);
+  await usageError(['migrations', 'apply'], 'migrations apply: missing migration file name', /^ship migrations apply <file> /);
+  await usageError(['migrations', 'apply', 'a.sql', 'b.sql'], 'migrations apply: unexpected argument: b.sql', /^ship migrations apply <file> /);
+  await usageError(['migrations', 'apply', 'a.sql', '--yes'], 'migrations apply: .*--yes', /^ship migrations apply <file> /);
   await usageError(['frobnicate'], 'frobnicate: unknown command', /^usage:\n {2}ship check /, { lines: 0 });
 });
 
@@ -94,10 +97,10 @@ test('ship unhold and ship migrations reject what they cannot take with exit 2',
   const two = await ship('unhold', 'app', 'tick');
   assert.equal(two.code, 2, two.stderr);
   assert.match(two.stderr, /^✗ ship unhold: unexpected argument: tick/);
-  const sub = await ship('migrations', 'apply');
+  const sub = await ship('migrations', 'nope');
   assert.equal(sub.code, 2, sub.stderr);
-  assert.match(sub.stderr, /^✗ ship migrations: unknown subcommand: apply/);
-  assert.match(sub.stdout, /^ship migrations ack <file>… {3,}mark migration files as cleared for deploy\n$/);
+  assert.match(sub.stderr, /^✗ ship migrations: unknown subcommand: nope/);
+  assert.match(sub.stdout, /^ship migrations apply <file> \[--dry-run\] {3,}.*\n {2}ship migrations ack <file>… {3,}mark migration files as cleared for deploy\n$/);
   assert.equal((await ship('migrations')).code, 2);
   const flag = await ship('migrations', 'ack', '--nope');
   assert.equal(flag.code, 2, flag.stderr);
@@ -108,4 +111,12 @@ test('the usage lists every command with its description in one column', { timeo
   const rows = (await ship()).stdout.split('\n').filter((l) => l.startsWith('  ship '));
   assert.equal(rows.length, 10);
   assert.equal(new Set(rows.map((l) => l.match(/^ {2}ship .*? {2,}/)[0].length)).size, 1, rows.join('\n'));
+});
+
+test('ship migrations apply refuses to run without a terminal, before it reads or sends anything', { timeout: 30_000 }, async () => {
+  // The helper runs ship with pipes for stdin and stdout, as a session's shell does.
+  const r = await ship('migrations', 'apply', 'db/001.sql');
+  assert.equal(r.code, 2, r.stderr);
+  assert.match(r.stdout, /^✗ ship migrations apply changes the production database, so it only runs where the owner can read the plan and type "yes": in their own terminal\. Nothing was read or changed\.\n/);
+  assert.match(r.stdout, /--dry-run/);
 });

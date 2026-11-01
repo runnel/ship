@@ -234,10 +234,13 @@ dependency order, from a fresh worktree of the main branch, on your machine.
 | `ship rollback <name>` | Show what a rollback would do and print the command for it. Read-only. | no |
 | `ship rollback <name> --to <version> [--revert-secrets]` | Set a hold, promote an earlier version (its id: at least 6 hex digits, the first 8 are enough; any version among the last 200 whose commit is known) and probe it. `--revert-secrets` sends the deployment with `?force=true`, so the rollback also undoes secret changes made since that version; without it Cloudflare refuses (error 10220). See [Rollbacks](#rollbacks). | no |
 | `ship unhold <name>` | Clear a hold. It works from the state directory alone (offline), so it cannot know the config's names: a name without a hold is reported as "no hold" (with the names that are held) and exits 0. | no |
-| `ship migrations ack <file>…` | Mark migration files on main as cleared for deploy. A file may be named as a repository path, a path from the current directory, a path from another checkout, or a bare file name; see [Clearing migrations](#clearing-migrations). | no |
+| `ship migrations apply <file> --dry-run` | Run the migration and its post-conditions inside a transaction that is always rolled back, and print the plan. Changes nothing, needs no terminal. See [Applying migrations](#applying-migrations). | yes |
+| `ship migrations apply <file>` | Show the plan, ask for a typed `yes`, apply the file as merged on main, check its declared post-conditions in the database, and only then clear it for deploy, recording who applied it. Refuses without a terminal. See [Applying migrations](#applying-migrations). | no |
+| `ship migrations ack <file>…` | Mark migration files on main as cleared for deploy, without applying or checking anything (a file that goes after the deploy, or one applied some other way). A file may be named as a repository path, a path from the current directory, a path from another checkout, or a bare file name; see [Clearing migrations](#clearing-migrations). | no |
 
 The commands that are not allowlisted are the owner's: the permission prompt is the confirmation.
-ship itself never asks interactively. Every usage error (an unknown flag, an extra or missing
+ship asks interactively in one place only: `ship migrations apply` (without `--dry-run`) waits for a
+typed `yes`, and refuses to run when standard input or output is not a terminal. Every usage error (an unknown flag, an extra or missing
 argument, a malformed value such as `--at zz`, `--redeploy` without names, an unknown deployable) prints
 `✗ ship <command>: <what is wrong>` on stderr and the command's usage line on stdout, and exits 2.
 A refusal that needs the repository (a commit that is not on main, a version that does not exist)
@@ -271,7 +274,8 @@ export default {
       after: ['web'],
     },
   ],
-  migrations: { paths: ['db/migrations/*.sql'] },
+  migrations: { paths: ['db/migrations/*.sql'],
+                apply: { adapter: 'supabase', project: 'abcdefghijklmnopqrst', label: 'production' } }, // optional
   requires: [{ repo: 'acme/api', deployable: 'api' }], // must be live at its main branch first
   credentials: { file: '/abs/path/to/credentials.env',
                  map: { CLOUDFLARE_API_TOKEN: 'CF_TOKEN', CLOUDFLARE_ACCOUNT_ID: 'CF_ACCOUNT' } },
@@ -294,6 +298,13 @@ stay inside its `paths` and must not reach a file its `ignore` or the repo's `do
 change there would never make it pending): `ship check` and `ship deploy` both enforce it, so a
 change to an imported file is never missed.
 
+`migrations.apply` is optional and turns on `ship migrations apply`: `adapter` (`supabase`, the only
+one), `project` (the project reference), `label` [none; shown in the plan and the prompt],
+`tokenKey` [`SUPABASE_ACCESS_TOKEN`, the key to read from `credentials.file`] and `dryRun` [true].
+The token is read from `credentials.file` only when a migration is applied, by that one key; it is
+not in `credentials.map`, so no deploy step ever sees it. `ship.config.mjs` is read from main, so a
+pull request cannot point the command at another database.
+
 `credentials.file` is parsed (`KEY=value` lines), never sourced. `map` names the environment
 variables wrangler reads (`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are required) and the
 file keys they come from; only those reach wrangler, and no build or check step of ship sees them.
@@ -306,7 +317,7 @@ is not an object, a malformed `liveHost`) is refused with a message naming the k
 Unknown keys are refused at every level of the file, not only at the top: in a check and its
 `{ run, env }` steps, a deployable, a probe, a `deploySetup` or `preDeploy` step (`run`, `env`,
 `cwd`), an `envFiles` entry (`from`, `to`), `bundleCheck` (`file`, `pattern`, `allow`), `liveMarker`
-(`path`, `file`), `migrations` (`paths`), a `requires` entry (`repo`, `deployable`) and `credentials`
+(`path`, `file`), `migrations` (`paths`, `apply`; and inside `apply`: `adapter`, `project`, `label`, `tokenKey`, `dryRun`), a `requires` entry (`repo`, `deployable`) and `credentials`
 (`file`, `map`). `liveHost` is checked whenever it is present, also on a deployable without `probes`.
 
 ### The live commit
@@ -420,6 +431,61 @@ A rule that finds several files makes the argument ambiguous: ship does not try 
 prints the candidate paths so that you can give one. A miss prints the repository, branch and commit
 it looked at and the globs it searched, and says that a migration that is not merged yet cannot be
 cleared. Either way ship exits 2 and records nothing, not even the arguments before the failing one.
+
+### Applying migrations
+
+`ship migrations ack` is the owner's word that a file may be deployed past; it checks nothing, so an
+acked file can be missing from the database. `ship migrations apply <file>` replaces the word with a
+proof, for a repository with `migrations.apply`. It reads the file as merged on main (the bytes that
+are hashed, shown, dry-run and applied are those of one commit) and then:
+
+1. refuses unless standard input and output are a terminal, before it reads or sends anything;
+2. reads the database: if every declared post-condition already holds, the SQL is **not** run again
+   and only the proof is recorded (this also makes a re-run after a lost answer safe);
+3. runs the file and the post-conditions in one transaction that always ends in an error, so
+   nothing commits: a file that fails, or whose post-conditions do not hold at its end, stops here.
+   A file with `CONCURRENTLY`, `VACUUM`, `ALTER SYSTEM` or `CREATE DATABASE` cannot run in a
+   transaction; the dry run is skipped and the plan says so;
+4. prints the plan (commit, file, size and hash, project, post-conditions with their state now,
+   earlier migrations not yet cleared, the SQL) and waits. `yes` goes on, `v` shows all of the SQL,
+   anything else cancels;
+5. sends the file as one request, then **reads the database again**: the post-conditions, not the
+   answer to the apply, decide. All hold: the file is cleared for deploy and the ledger line records
+   `applied`, who (`user@host`), when, the file's sha256, main's commit and the number of
+   post-conditions. One fails: the failed ones are named and nothing is cleared. After a failed or
+   unanswered apply the same reading says whether anything took effect.
+
+`ship status` then tells the two kinds of clearance apart (`proof: N applied and proven by ship, M
+acked only`, and the newest of each); `ship deploy` treats both as cleared. Keep `ack` for a file that
+goes after the deploy.
+
+**Post-conditions** are declared in the migration as comment lines, or one per line in a
+`<name>.verify` file beside it (the `--` is optional there). A file that declares none cannot be
+applied by ship. Names are lower-case and schema-qualified.
+
+```sql
+-- ship:verify table public.things                       -- the relation exists
+-- ship:verify column public.things.owner_id
+-- ship:verify function public.record_scan(uuid, text)    -- argument types, as in \df
+-- ship:verify rls public.things                          -- row level security is enabled
+-- ship:verify no-access anon,authenticated public.things -- no table or column privilege at all
+-- ship:verify no-execute anon public.record_scan(uuid, text)
+-- ship:verify access service_role select,insert public.things
+-- ship:verify execute service_role public.record_scan(uuid, text)
+-- ship:verify absent table public.old_things             -- also: absent column, absent function
+-- ship:verify sql (select count(*) from public.things) = 0   -- one boolean expression
+```
+
+Each form becomes one read-only `SELECT`; an object that does not exist reads as "does not hold".
+A `sql` condition is a single expression (no `;`, `$` or comments) that should only read.
+
+`--dry-run` stops after step 3 and prints the plan: no terminal needed, nothing applied or recorded,
+so a session can check a migration and its declarations before asking the owner to apply it.
+
+What this does not defend against: a process that is given the owner's keystrokes (it can type
+`yes`). The prompt keeps a script that merely runs the command, or pipes an answer into it, out.
+The ledger is a file in ship's state directory on this machine, next to the acks, not a table in the
+database.
 
 ### Holds
 
