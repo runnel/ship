@@ -33,7 +33,7 @@ test('prInfo, defaultBranch, postStatus and nightlyFailures call gh as expected'
   assert.equal(desc.length - 'description='.length, 140);
 });
 
-test('commitStatus picks one context out of the combined status; mergedSha reads the merge commit', async () => {
+test('commitStatus picks one context out of the statuses and says who posted it; mergedSha reads the merge commit', async () => {
   const sha = 'c'.repeat(40);
   const statuses = {
     [sha]: [
@@ -43,7 +43,7 @@ test('commitStatus picks one context out of the combined status; mergedSha reads
   };
   const pr = { number: 5, headRefOid: sha, headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'MERGED', mergeCommit: { oid: 'd'.repeat(40) } };
   const fake = await fakeGh(await tempDir(), { pr, statuses });
-  assert.deepEqual(await commitStatus({ repo: 'acme/app', sha, gh: fake.gh }), { state: 'success', description: 'app · vs main@52d4c19 · 4s' });
+  assert.deepEqual(await commitStatus({ repo: 'acme/app', sha, gh: fake.gh }), { state: 'success', description: 'app · vs main@52d4c19 · 4s', postedBy: null, bot: false });
   assert.equal(await commitStatus({ repo: 'acme/app', sha, context: 'nope', gh: fake.gh }), null);
   assert.equal(await mergedSha({ repo: 'acme/app', pr: 5, gh: fake.gh }), 'd'.repeat(40));
   assert.equal(await commitStatus({ repo: 'acme/app', sha: 'e'.repeat(40), gh: fake.gh }), null, 'another commit has no status');
@@ -51,5 +51,5 @@ test('commitStatus picks one context out of the combined status; mergedSha reads
   assert.equal(await mergedSha({ repo: 'acme/app', pr: 5, gh: unmerged.gh }), null);
   assert.equal(await commitStatus({ repo: 'acme/app', sha, gh: unmerged.gh }), null);
   const api = (await fake.calls()).find((c) => c[0] === 'api');
-  assert.equal(api[1], `repos/acme/app/commits/${sha}/status?per_page=100`);
+  assert.equal(api[1], `repos/acme/app/commits/${sha}/statuses?per_page=100`);
 });

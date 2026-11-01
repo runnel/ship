@@ -79,6 +79,7 @@ EOF
 ```bash
 ship check            # the PR of the current branch
 ship check --pr 42
+ship check --pr 42 --github   # run it on GitHub now (see Overflow to GitHub Actions)
 ship merge --pr 42    # merge a PR that passed, unless main changed under its check
 ship queue            # who holds each lane, who waits, and for how long
 ```
@@ -198,6 +199,57 @@ does for `gh pr merge`. Main can still move on GitHub between ship's fetch and t
 Exit codes: 0 merged (also when gh reported an error after the merge landed); 1 failed: GitHub
 refused the merge, the merge got no answer, or any other error (no network, a config on main that
 does not load); 2 refused by ship, or a usage error.
+
+### Overflow to GitHub Actions
+
+A repository whose config has `overflow` can send a check to GitHub Actions when the heavy lane's
+line is long, instead of waiting here. It is a way around a queue, not a second gate: the same groups
+run with the same code, and `ship check` on this machine stays the only thing that posts `local-ci`.
+
+```js
+overflow: {
+  workflow: 'ship-check.yml',  // in .github/workflows on main; start from examples/ship-check.yml
+  includedMinutes: 3000,       // what the account's plan includes per month
+  reservePerDay: 60,           // kept free per day left in the month, for everything else on Actions
+  reserveFloor: 300,           // kept free on top of that
+  minAhead: 4,                 // waiters ahead of a check before it goes (default 4)
+  maxRunning: 2,               // runs at once, on this machine (default 2)
+  runMinutes: 20,              // what a run counts as until the usage report shows it (default 20)
+  timeoutMin: 40,              // ship gives a run up after this long (default 40)
+  groups: ['app', 'workers'],  // only checks made of these groups go (default: any)
+},
+```
+
+**When a check goes.** Only a check in the heavy lane, never a deploy, and only when main's own config
+says so. It goes when `minAhead` waiters are ahead of it and a place is free. The line is looked at
+when the check arrives and once a minute while it waits, so a place that comes free does not stay
+empty. `ship check --github` goes without looking at the line, to measure a run; every other rule
+holds. A check goes at most once.
+
+**The reserve.** The minutes are shared with everything else the account runs on Actions, and if they
+run out, that stops too. So a run starts only if
+`includedMinutes - used - 20 x (recent runs + this one) >= reserveFloor + reservePerDay x days left`.
+`used` comes from the account's usage report for the current UTC month. Recent runs are those started
+from this machine in the last 24 hours, counted again on top of the report because it may not show
+them yet (`~/.ship/overflow/runs.jsonl`). If the report cannot be read or has no Actions row, or that
+file cannot be read, the check stays here. The reason is printed as a `· stays on this machine` line.
+ship never reads or changes a budget. To stop all overflow at once: `gh workflow disable ship-check.yml`.
+
+**What runs.** ship starts the workflow from `main`, never from the pull request's branch, so a pull
+request cannot change what judges it. The workflow merges main into the head and fails unless that
+gives the tree ship got from the same merge here, then runs `ship run-groups`, which takes the groups
+from `ship.config.mjs` on main. Its token can only read. Copy `examples/ship-check.yml`; it may need
+more for your groups (a database, say).
+
+**The verdict.** Only green is taken from GitHub: when the run that ship started, from that workflow on
+main, ends in success, ship posts `local-ci` with `· on GitHub` in the description and a link to the
+run. Anything else (a red run, a cancelled one, one that is not started after 5 minutes or has no result
+after `timeoutMin`, GitHub not answering, a failed start) sends the check back to its old place in
+line, with a `! … back in line on this machine` line, and this machine gives the verdict. A red on
+GitHub may be GitHub's, so it never reads as a red check. Ctrl-C cancels the run.
+
+`ship merge` refuses a `local-ci` posted by a bot: a workflow's token can post a status, and only
+`ship check` may.
 
 ## Leak guard (for this repository)
 

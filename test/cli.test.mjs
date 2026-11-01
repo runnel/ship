@@ -33,7 +33,7 @@ const usageError = async (args, problem, usage, { lines = 1 } = {}) => {
 };
 
 test('ship check: a bad flag or an extra argument is a usage error, exit 2', { timeout: 30_000 }, async () => {
-  const usage = /^ship check \[--pr <number>\] {3,}check a pull request/;
+  const usage = /^ship check \[--pr <number>\] \[--github\] {3,}check a pull request/;
   await usageError(['check', '--nope'], 'check: .*--nope', usage);
   await usageError(['check', '42'], 'check: .*42', usage);
   await usageError(['check', '--pr'], 'check: .*--pr', usage);

@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile, mkdir, chmod, utimes, rm } from 'node:fs/promises';
+import { writeFile, mkdir, chmod, utimes, rm, readdir } from 'node:fs/promises';
 import { readdirSync } from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dirname, join } from 'node:path';
-import { acquire, ownerInfo, isStale, readOwner, processStartTime } from '../lib/lock.mjs';
+import { acquire, tryLock, ownerInfo, isStale, readOwner, processStartTime } from '../lib/lock.mjs';
 import { tempDir, waitUntil } from './helpers.mjs';
 
 const lockDir = async () => join(await tempDir('lock-'), 'l');
@@ -424,4 +424,47 @@ test('a damaged ticket is swept, a ticket that cannot be read is not, and old ha
     await holder();
     await waiter;
   }
+});
+
+test('tryLock takes a free lock, answers null while it is held, and takes one whose holder is gone', async () => {
+  const dir = join(await tempDir(), 'locks', 'one');
+  const release = await tryLock(dir, await ownerInfo());
+  assert.equal(typeof release, 'function');
+  assert.equal(await tryLock(dir, await ownerInfo()), null);
+  await release();
+  const again = await tryLock(dir, await ownerInfo());
+  assert.equal(typeof again, 'function');
+  await again();
+  await mkdir(dir);
+  await writeFile(join(dir, 'owner.json'), JSON.stringify({ pid: 99999999, pgid: 99999999, startTime: 'x', nonce: 'gone' }));
+  const taken = await tryLock(dir, await ownerInfo());
+  assert.equal(typeof taken, 'function');
+  await taken();
+});
+
+test('leaveWhen ends the wait with null, withdraws the ticket and does not take the lock', async () => {
+  const root = await tempDir();
+  const dir = join(root, 'lanes', 'one');
+  const holder = await acquire(dir, await ownerInfo());
+  const asked = [];
+  const left = await acquire(dir, await ownerInfo(), { priority: 1, pollMs: 5, leaveWhen: async (line) => { asked.push(line.position); return asked.length === 3; } });
+  assert.equal(left, null);
+  assert.deepEqual(asked, [1, 1, 1]);
+  assert.deepEqual((await readdir(join(root, 'lanes'))).filter((n) => n.includes('.q-')), []);
+  await holder();
+});
+
+test('arrivedAt is the place in line: a waiter that comes back goes ahead of a later arrival', async () => {
+  const dir = join(await tempDir(), 'lanes', 'one');
+  const holder = await acquire(dir, await ownerInfo());
+  const order = [];
+  const take = (name, opts) => acquire(dir, ownerOf[name], { priority: 1, pollMs: 5, ...opts }).then(async (release) => { order.push(name); await release(); });
+  const ownerOf = { later: await ownerInfo(), back: await ownerInfo() };
+  const later = take('later', {});
+  await new Promise((r) => setTimeout(r, 30));
+  const back = take('back', { arrivedAt: Date.now() - 60_000 });
+  await new Promise((r) => setTimeout(r, 30));
+  await holder();
+  await Promise.all([later, back]);
+  assert.deepEqual(order, ['back', 'later']);
 });

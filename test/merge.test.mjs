@@ -29,6 +29,10 @@ test('only a success on the head, naming its main, allows a merge', () => {
     assert.equal(r.ok, false);
     assert.match(r.reason, new RegExp(`^local-ci is ${state} on aaaaaaa \\(unit: npm test failed`));
   }
+  const bot = judgeStatus({ state: 'success', description: 'app · vs main@52d4c19 · 4s', postedBy: 'github-actions[bot]', bot: true }, { pr: 7, headSha: HEAD });
+  assert.match(bot.reason, /^local-ci on aaaaaaa was posted by github-actions\[bot\], not by ship check; run ship check --pr 7$/, 'a workflow token can post a status: it is not a check');
+  assert.equal(judgeStatus({ state: 'failure', description: 'x', bot: true }, { pr: 7, headSha: HEAD }).ok, false);
+  assert.equal(judgeStatus({ state: 'success', description: 'app · vs main@52d4c19 · 18m · on GitHub', postedBy: 'someone', bot: false }, { pr: 7, headSha: HEAD }).sha, '52d4c19', 'a check that ran on GitHub merges like any other');
   const odd = judgeStatus({ state: 'success', description: 'done' }, { pr: 7, headSha: HEAD });
   assert.equal(odd.ok, false);
   assert.match(odd.reason, /cannot tell which main local-ci checked \("done"\); run ship check --pr 7 again$/);
@@ -102,7 +106,7 @@ test('a checked PR on an unchanged main is squash-merged, pinned to the head tha
   assert.deepEqual(r.merges[0], ['pr', 'merge', '7', '--repo', 't/r', '--squash', '--match-head-commit', r.head, '--delete-branch']);
   assert.ok(r.lines.includes(`✓ merged PR #7 into main as ${r.merged}`), r.lines.join('\n'));
   // the status of the head that is being merged, and no other commit's
-  assert.deepEqual(r.statusCalls, [`repos/t/r/commits/${r.head}/status?per_page=100`]);
+  assert.deepEqual(r.statusCalls, [`repos/t/r/commits/${r.head}/statuses?per_page=100`]);
 });
 
 test('only an older head is green: the PR head has no local-ci, so nothing is merged', async () => {
@@ -110,7 +114,7 @@ test('only an older head is green: the PR head has no local-ci, so nothing is me
   assert.equal(r.code, 2);
   assert.equal(r.merges.length, 0);
   assert.match(r.lines.at(-1), /^✗ no local-ci status on [0-9a-f]{7}; run ship check --pr 7$/);
-  assert.equal(r.statusCalls[0], `repos/t/r/commits/${r.head}/status?per_page=100`);
+  assert.equal(r.statusCalls[0], `repos/t/r/commits/${r.head}/statuses?per_page=100`);
 });
 
 test('main gained files outside recheckOnMainChange: the merge goes ahead and says so', async () => {
