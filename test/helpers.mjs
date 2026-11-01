@@ -65,6 +65,8 @@ export async function makeOrigin(files) {
 // that commit (an empty list for any other sha, as GitHub does for a commit without statuses).
 // mergeFail = 'reason': `gh pr merge` fails (exit 1) with that reason on stderr, as gh does when GitHub refuses.
 // mergeDelayMs: `gh pr merge` answers only after that long (a hung call).
+// The pull request can also change while a check runs: every `gh pr view` merges the JSON in
+// `<dir>/pr-live.json` (when it exists) over its answer, last (see setPr in setupCheck).
 export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false, statuses = null, mergeFail = null, mergeDelayMs = 0 }) {
   const log = join(dir, 'gh.log');
   const script = join(dir, 'gh');
@@ -83,7 +85,9 @@ if (args[0] === 'pr' && args[1] === 'view') {
   }
   const entry = sequence.length > 0 ? sequence[Math.min(i, sequence.length - 1)] : {};
   if (entry.fail) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
-  reply({ ...${JSON.stringify(pr)}, ...entry });
+  let live = {};
+  try { live = JSON.parse(fs.readFileSync(${JSON.stringify(join(dir, 'pr-live.json'))}, 'utf8')); } catch { /* the pull request is as it was */ }
+  reply({ ...${JSON.stringify(pr)}, ...entry, ...live });
 }
 if (args[0] === 'pr' && args[1] === 'list') {
   if (${JSON.stringify(prListFail)}) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
@@ -150,7 +154,9 @@ export async function setupCheck({
     onBattery: async () => false, // never ask the real pmset: a test that wants the warning injects its own
   };
   const statuses = async () => statusesOf(await fake.calls());
-  return { work, deps, statuses, lines, origin, root, gh: fake.gh, calls: fake.calls };
+  // The pull request as GitHub shows it from now on: setPr({ state: 'MERGED' }), setPr({ headRefOid: … }).
+  const setPr = (overrides) => writeFile(join(root, 'pr-live.json'), JSON.stringify(overrides));
+  return { work, deps, statuses, lines, origin, root, gh: fake.gh, calls: fake.calls, setPr };
 }
 
 // runCheck in a child process that leads its own process group, as bin/ship.mjs makes ship do.
