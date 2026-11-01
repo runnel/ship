@@ -363,11 +363,16 @@ heavy slot. So deploys of one repository collapse into one:
   - a deployable that would run on the planned head would be held, blocked or skipped on the later
     one (an import outside its paths, say), or a deployable name is unknown there;
   - the later head's config `requires` something the planned one did not, and that is not live.
+  When the deploy keeps its head although main moved, or cannot read main (the read and the
+  judging are given 90 s each, because they run while the deploy holds the heavy lane), it does not
+  answer for the callers that joined it: they deploy for themselves, which gives each of them its
+  own verdict. The same goes for a joined deploy that is interrupted or vanishes.
   A `requires` the planned head already passed is not asked again. A hold written while the deploy
   waited stops that deployable whether or not main moved. The heavy lane is taken again for each
   build, so main is not read a second time: pull requests merged after the deploy has its slot go
   with the next deploy. A repository without a `deploySetup` has no slot to wait for before the
-  first build: its target is the main the deploy read when it took the lock.
+  first build, so its deploy reads main again right after it has planned, and does not wait for
+  anything before that.
 
 ### Clearing migrations
 

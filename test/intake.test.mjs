@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readdir, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tempDir } from './helpers.mjs';
 import { enterDeploy, followDeploy } from '../lib/intake.mjs';
@@ -87,7 +87,7 @@ test('a leader that ended before freezing leaves its followers to deploy for the
   const following = followDeploy({ d: s.d, repo: REPO, leader: follow });
   lead.out('✗ migrations not cleared for deploy: db/002.sql');
   await lead.end({ code: 1 });
-  assert.deepEqual(await following, { code: null });
+  assert.deepEqual(await following, { code: null, why: 'ended before it began building' });
 });
 
 test('a leader that vanished leaves its followers to deploy for themselves', async () => {
@@ -97,6 +97,42 @@ test('a leader that vanished leaves its followers to deploy for themselves', asy
   const feed = join(dir, '000000000000001-gone.out');
   await writeFile(feed, `${JSON.stringify({ line: 'half a deploy' })}\n`);
   const leader = { id: 'gone', key: '{}', phase: 'open', pid: 2 ** 22 + 54321, pgid: null, startTime: null, since: new Date().toISOString(), feed };
-  assert.deepEqual(await followDeploy({ d: s.d, repo: REPO, leader }), { code: null });
+  assert.deepEqual(await followDeploy({ d: s.d, repo: REPO, leader }), { code: null, why: 'ended without a result' });
   assert.ok(s.lines.includes('half a deploy'));
+});
+
+test('a leader that ships another head than main has is not answered for: its followers deploy for themselves', async () => {
+  const s = await setup();
+  const { lead } = await s.enter();
+  const { follow } = await s.enter();
+  const following = followDeploy({ d: s.d, repo: REPO, leader: follow });
+  await lead.freeze();
+  lead.disown();
+  await lead.end({ code: 0 });
+  assert.deepEqual(await following, { code: null, why: 'did not carry what was merged after it was planned' });
+});
+
+test('a leader that was interrupted gives no verdict either', async () => {
+  const s = await setup();
+  const { lead } = await s.enter();
+  const { follow } = await s.enter();
+  const following = followDeploy({ d: s.d, repo: REPO, leader: follow });
+  await lead.freeze();
+  await lead.end({ code: 130 });
+  assert.deepEqual(await following, { code: null, why: 'was interrupted' });
+});
+
+test('a line still being written is read when it is complete, and the end after it is not lost', async () => {
+  const s = await setup();
+  const { lead } = await s.enter();
+  const { follow } = await s.enter();
+  await appendFile(follow.feed, '{"line":"half');
+  const following = followDeploy({ d: s.d, repo: REPO, leader: follow });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(s.lines.length, 1, 'only the join line: the half line is not printed');
+  await appendFile(follow.feed, ' a line"}\n');
+  await lead.freeze();
+  await lead.end({ code: 0 });
+  assert.deepEqual(await following, { code: 0 });
+  assert.ok(s.lines.includes('half a line'));
 });

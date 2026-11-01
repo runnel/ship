@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, mkdirSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { chmod, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { commitFiles, git, tempDir, waitUntil } from './helpers.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
@@ -210,4 +210,48 @@ test('a dry run neither joins nor is joined', async () => {
   assert.doesNotMatch(linesB.join('\n'), /↪/);
   assert.match(linesB.join('\n'), /\(dry run\)\n✓ app: already live/, 'it planned for itself, after the other deploy was over');
   assert.equal((await uploads(s)).length, 1, 'and uploaded nothing');
+});
+
+test('a deploy that keeps its head although main moved does not answer for the caller that joined it', async () => {
+  const s = await setupDeploy({ seed, change: { 'app/src/a.ts': '2' } });
+  await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
+  const releaseLane = await hold(s, 'lanes', 'heavy');
+  const a = s.deploy();
+  await waitFor(s.lines, 'waiting for the heavy lane');
+  await mainMoves(s, { 'db/002.sql': '' }, 'someone adds a migration (#10)');
+  await mainMoves(s, { 'app/src/b.ts': '3' }, 'the second caller merges (#11)');
+  const linesB = [];
+  const b = second(s, linesB);
+  await waitFor(linesB, '↪ t/r: a deploy started at');
+  await releaseLane();
+  assert.equal(await a, 0, s.lines.join('\n'));
+  assert.equal(await b, 1, linesB.join('\n'));
+
+  const text = linesB.join('\n');
+  assert.match(text, /! the deploy this one joined did not carry what was merged after it was planned; deploying now/);
+  assert.match(text, /✗ migrations not cleared for deploy: db\/002.sql/, 'its own verdict, from its own plan');
+  assert.equal((await uploads(s)).length, 1);
+  assert.match(await deployMessage(s), new RegExp(`^sha:${s.head} `), 'the first deploy shipped what it had planned');
+});
+
+test('a re-read of main that hangs does not hold the slot: the deploy goes on with its planned head', async () => {
+  const dir = await tempDir('gh-');
+  const hanging = join(dir, 'gh');
+  const s = await setupDeploy({ seed, change: { 'app/src/a.ts': '2' } });
+  await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
+  // The first `gh repo view` (the deploy's start) answers; later ones hang for a while.
+  await writeFile(hanging, `#!/bin/sh
+if [ "$1" = repo ]; then
+  n=$(cat '${dir}/count' 2>/dev/null || echo 0)
+  echo $((n + 1)) > '${dir}/count'
+  [ "$n" -ge 1 ] && sleep 3
+fi
+exec '${s.deps.gh}' "$@"
+`);
+  await chmod(hanging, 0o755);
+  s.deps.gh = hanging;
+  s.deps.settleMs = 300;
+  assert.equal(await s.deploy(), 0, s.lines.join('\n'));
+  assert.match(s.lines.join('\n'), /! could not re-read main \(reading main again took longer than 300 ms\): deploying main@\w+ as planned/);
+  assert.match(await deployMessage(s), new RegExp(`^sha:${s.head} `));
 });
