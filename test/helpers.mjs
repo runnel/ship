@@ -67,11 +67,12 @@ export async function makeOrigin(files) {
 // mergeDelayMs: `gh pr merge` answers only after that long (a hung call).
 // The pull request can also change while a check runs: every `gh pr view` merges the JSON in
 // `<dir>/pr-live.json` (when it exists) over its answer, last (see setPr in setupCheck).
+// apiFailTimes = { match, times }: the first `times` `gh api` calls whose arguments contain `match` fail.
 // github = { usage, dispatchFail, runs, runReadFails, jobs, jobLog }: the Actions side. `usage` answers
 // the billing report (undefined: gh fails); `dispatchFail` makes the dispatch fail; `runs` = [overrides…]
 // is what the Nth read of the run says on top of a run of the workflow that was dispatched, the last one
 // repeating; `runReadFails` makes the first reads fail.
-export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false, statuses = null, mergeFail = null, mergeDelayMs = 0, github = null }) {
+export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false, statuses = null, mergeFail = null, mergeDelayMs = 0, github = null, apiFailTimes = null }) {
   const log = join(dir, 'gh.log');
   const script = join(dir, 'gh');
   const viewCount = join(dir, 'gh-pr-view.count');
@@ -120,7 +121,11 @@ if (github && args[0] === 'api') {
   }
   if (path.endsWith('/actions/runs/555/cancel')) reply({});
   if (path.endsWith('/actions/runs/555/jobs')) reply({ jobs: github.jobs ?? [] });
-  if (/\\/actions\\/jobs\\/\\d+\\/logs$/.test(path)) { process.stdout.write(github.jobLog ?? ''); process.exit(0); }
+  if (/\\/actions\\/jobs\\/\\d+\\/logs$/.test(path)) {
+    if (!args.includes('--allow-escape-sequences')) { process.stderr.write('the response contains terminal escape sequences\\n'); process.exit(1); }
+    process.stdout.write(github.jobLog ?? '');
+    process.exit(0);
+  }
   if (path.endsWith('/actions/runs/555')) {
     let i = 0;
     try { i = Number(fs.readFileSync(reads, 'utf8')) || 0; } catch { /* first read */ }
@@ -133,6 +138,14 @@ if (github && args[0] === 'api') {
 if (args[0] === 'repo' && args[1] === 'view') reply(${JSON.stringify(repo)});
 if (args[0] === 'run' && args[1] === 'list') reply(${JSON.stringify(runs)});
 if (args[0] === 'api') {
+  const failTimes = ${JSON.stringify(apiFailTimes)};
+  if (failTimes && args.join(' ').includes(failTimes.match)) {
+    const counter = ${JSON.stringify(join(dir, 'gh-api-fail.count'))};
+    let n = 0;
+    try { n = Number(fs.readFileSync(counter, 'utf8')) || 0; } catch { /* first call */ }
+    fs.writeFileSync(counter, String(n + 1));
+    if (n < failTimes.times) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
+  }
   const fail = ${JSON.stringify(apiFail)};
   if (fail && args.join(' ').includes(fail.match)) { process.stderr.write('fake gh: forced failure'); process.exit(1); }
   const delay = ${JSON.stringify(apiDelay)};
@@ -180,7 +193,7 @@ export async function setupCheck({
   const deps = {
     gh: fake.gh, remoteUrl: () => origin,
     mirrorRoot: join(root, 'mirrors'), tmpRoot: join(root, 'tmp'), logRoot: join(root, 'logs'),
-    overflowRoot: join(root, 'overflow'), overflowAskMs: 0, githubPollMs: 5, shipSha: async () => 'c'.repeat(40),
+    overflowRoot: join(root, 'overflow'), overflowAskMs: 0, githubPollMs: 5, verdictRetryMs: 5, shipSha: async () => 'c'.repeat(40),
     out: (s) => lines.push(s), pollMs: 10,
     onBattery: async () => false, // never ask the real pmset: a test that wants the warning injects its own
   };
@@ -193,7 +206,7 @@ export async function setupCheck({
 // runCheck in a child process that leads its own process group, as bin/ship.mjs makes ship do.
 // Printed lines go to `out.text`; `exited` resolves with the exit code; `kill()` ends the whole
 // group (the test's cleanup: nothing may outlive it).
-export async function spawnCheckLeader(s, dir, { env = process.env, pollMs = 10, unwindPostTimeoutMs, github = false } = {}) {
+export async function spawnCheckLeader(s, dir, { env = process.env, pollMs = 10, unwindPostTimeoutMs, github = false, githubPollMs = 5 } = {}) {
   const script = join(dir, 'check.mjs');
   const mod = new URL('../lib/check.mjs', import.meta.url).href;
   await writeFile(script, `
@@ -202,7 +215,7 @@ import { isInterrupted } from ${JSON.stringify(new URL('../lib/interrupt.mjs', i
 const a = JSON.parse(process.argv[2]);
 const deps = { gh: a.gh, remoteUrl: () => a.origin, mirrorRoot: a.mirrorRoot, tmpRoot: a.tmpRoot, logRoot: a.logRoot, pollMs: a.pollMs, out: (l) => process.stdout.write(l + '\\n') };
 if (a.unwindPostTimeoutMs) deps.unwindPostTimeoutMs = a.unwindPostTimeoutMs;
-if (a.github) Object.assign(deps, { overflowRoot: a.overflowRoot, githubPollMs: 5, shipSha: async () => 'c'.repeat(40) });
+if (a.github) Object.assign(deps, { overflowRoot: a.overflowRoot, githubPollMs: a.githubPollMs, shipSha: async () => 'c'.repeat(40) });
 // Like lib/cli.mjs: an interrupt that makes a call fail is exit 130, anything else a plain failure.
 let code;
 try {
@@ -214,7 +227,7 @@ try {
 process.stdout.write('RETURNED ' + code + '\\n');
 process.exitCode = code;
 `);
-  const arg = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot, pollMs, unwindPostTimeoutMs, github, overflowRoot: s.deps.overflowRoot });
+  const arg = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot, pollMs, unwindPostTimeoutMs, github, githubPollMs, overflowRoot: s.deps.overflowRoot });
   const child = spawn(process.execPath, [script, arg], { detached: true, stdio: ['ignore', 'pipe', 'inherit'], env });
   const out = { text: '' };
   child.stdout.on('data', (b) => { out.text += b; });

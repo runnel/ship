@@ -43,9 +43,12 @@ jobs:
         run: |
           git -c user.name=ship -c user.email=ship@localhost -c commit.gpgsign=false merge --no-edit --quiet "$MAIN_SHA"
           test "$(git rev-parse 'HEAD^{tree}')" = "$TREE_SHA"
+      # No package manager cache: its post step would save into the default branch's cache what the
+      # pull request's code left on this runner. Restore a cache another job saved if you want one.
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
+          package-manager-cache: false
       - name: Get ship
         run: |
           mkdir "$RUNNER_TEMP/ship"

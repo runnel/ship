@@ -200,6 +200,18 @@ test('closed, forked and wrongly based PRs are refused', async () => {
   }
 });
 
+test('a local-ci posted by a bot is refused, nothing merged: a workflow token can post a status', async () => {
+  const s = await setup({ configText: CONFIG_TEXT });
+  const head = (await git(['rev-parse', 'feat'], s.work)).trim();
+  const main = (await git(['--git-dir', s.origin, 'rev-parse', 'refs/heads/main'], s.work)).trim();
+  const pr = { number: 7, headRefOid: head, headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'OPEN' };
+  const statuses = { [head]: [{ context: 'local-ci', state: 'success', description: `unit · vs main@${main.slice(0, 7)} · 4s`, creator: { login: 'github-actions[bot]', type: 'Bot' } }] };
+  const fake = await fakeGh(await tempDir(), { pr, statuses });
+  assert.equal(await runMerge({ cwd: s.work, pr: '7', deps: { ...s.deps, gh: fake.gh } }), 2);
+  assert.equal((await fake.calls()).filter((c) => c[1] === 'merge').length, 0);
+  assert.match(s.lines.at(-1), /posted by github-actions\[bot\], not by ship check/);
+});
+
 test('--keep-branch leaves the branch to GitHub; --admin is never passed', async () => {
   const s = await setup({ configText: CONFIG_TEXT });
   const head = (await git(['rev-parse', 'feat'], s.work)).trim();

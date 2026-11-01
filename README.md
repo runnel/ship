@@ -214,7 +214,7 @@ overflow: {
   reserveFloor: 300,           // kept free on top of that
   minAhead: 4,                 // waiters ahead of a check before it goes (default 4)
   maxRunning: 2,               // runs at once, on this machine (default 2)
-  runMinutes: 20,              // what a run counts as until the usage report shows it (default 20)
+  runMinutes: 20,              // what a run counts as until the usage report shows it; set it to what a run takes (default 20)
   timeoutMin: 40,              // ship gives a run up after this long (default 40)
   groups: ['app', 'workers'],  // only checks made of these groups go (default: any)
 },
@@ -228,10 +228,11 @@ holds. A check goes at most once.
 
 **The reserve.** The minutes are shared with everything else the account runs on Actions, and if they
 run out, that stops too. So a run starts only if
-`includedMinutes - used - 20 x (recent runs + this one) >= reserveFloor + reservePerDay x days left`.
-`used` comes from the account's usage report for the current UTC month. Recent runs are those started
-from this machine in the last 24 hours, counted again on top of the report because it may not show
-them yet (`~/.ship/overflow/runs.jsonl`). If the report cannot be read or has no Actions row, or that
+`includedMinutes - used - runMinutes x (recent runs + this one) >= reserveFloor + reservePerDay x days left`.
+`used` comes from the account's usage report for the current UTC month. Recent runs are those decided
+on this machine in the last 24 hours, counted again on top of the report because it may not show them
+yet (`~/.ship/overflow/runs.jsonl`). Two checks at once take turns at this, so they cannot both spend
+the last room. If the report cannot be read or has no Actions row, or that
 file cannot be read, the check stays here. The reason is printed as a `· stays on this machine` line.
 ship never reads or changes a budget. To stop all overflow at once: `gh workflow disable ship-check.yml`.
 

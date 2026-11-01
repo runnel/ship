@@ -1,13 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { runCheck } from '../lib/check.mjs';
+import { capture } from '../lib/proc.mjs';
 import { acquire, ownerInfo, tryLock } from '../lib/lock.mjs';
-import { minutesUsed, daysLeftInMonth, reserveVerdict, recentRuns, PENDING_WINDOW_MS } from '../lib/overflow.mjs';
+import { minutesUsed, daysLeftInMonth, reserveVerdict, recentRuns, overflowGate, PENDING_WINDOW_MS } from '../lib/overflow.mjs';
 import { runGroupsHere } from '../lib/run-groups.mjs';
 import { validateConfig, ConfigError } from '../lib/config.mjs';
-import { commitFiles, git, killQuietly, makeOrigin, setupCheck, spawnCheckLeader, tempDir, waitUntil } from './helpers.mjs';
+import { commitFiles, fakeGh, git, killQuietly, makeOrigin, setupCheck, spawnCheckLeader, tempDir, waitUntil } from './helpers.mjs';
 
 const actionsRow = (quantity, sku = 'Actions Linux') => ({ product: 'actions', unitType: 'Minutes', sku, quantity, repositoryName: 'r' });
 const USAGE = (quantity) => ({ usageItems: [actionsRow(quantity)] });
@@ -35,6 +36,15 @@ const dispatches = async (s) => (await s.calls()).filter((c) => c[0] === 'api' &
 const billingReads = async (s) => (await s.calls()).filter((c) => c[0] === 'api' && c[1]?.includes('/billing/'));
 const cancels = async (s) => (await s.calls()).filter((c) => c[0] === 'api' && c[3]?.endsWith('/cancel'));
 const says = (s, re) => s.lines.some((l) => re.test(l));
+// The pull request a setup's fake answers with, for a fake that behaves differently on top of it.
+const readPr = async (s) => JSON.parse(await capture(s.gh, ['pr', 'view', '7']));
+const ledgerLines = async (s) => (await readFile(join(s.deps.overflowRoot, 'runs.jsonl'), 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+// Held by this live process, a place that was not given back cannot be taken.
+const assertPlaceFree = async (s, n = 0) => {
+  const free = await tryLock(join(s.deps.tmpRoot, 'lanes', `github-${n}`), await ownerInfo());
+  assert.ok(free, 'the place is free again');
+  await free();
+};
 
 // --- the arithmetic that keeps the minutes from running out -------------------------------------
 
@@ -94,7 +104,7 @@ test('a long line: the check runs on GitHub, ship posts the green, nothing runs 
   assert.equal(field('ref'), 'main', 'always the workflow on main, never the copy on the pull request\'s branch');
   assert.equal(field('inputs[head_sha]').length, 40);
   assert.equal(field('inputs[main_sha]').length, 40);
-  assert.match(field('inputs[tree_sha]'), /^[0-9a-f]{40}$/);
+  assert.equal(field('inputs[tree_sha]'), (await git(['merge-tree', '--write-tree', 'feat', 'main'], s.work)).trim(), 'the tree of the head merged with main');
   assert.equal(field('inputs[groups]'), 'unit');
   assert.equal(field('inputs[ship_sha]'), 'c'.repeat(40));
   const st = await s.statuses();
@@ -103,10 +113,10 @@ test('a long line: the check runs on GitHub, ship posts the green, nothing runs 
   assert.equal(last.state, 'success');
   assert.match(last.description, /^unit · vs main@[0-9a-f]{7} · \d+\S* · on GitHub$/, 'ship merge reads the main out of it');
   assert.equal(last.target_url, 'https://example.com/runs/555');
-  const ledger = (await readFile(join(s.deps.overflowRoot, 'runs.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+  const ledger = await ledgerLines(s);
   assert.equal(ledger.length, 1);
   assert.equal(ledger[0].pr, 7);
-  assert.equal(await tryLock(join(s.deps.tmpRoot, 'lanes', 'github-0'), await ownerInfo()).then((r) => r?.()), undefined, 'the place is free again');
+  await assertPlaceFree(s);
 });
 
 test('a short line: the check waits here, and the minutes are not even looked at', { timeout: 60_000 }, async () => {
@@ -227,15 +237,58 @@ test('no free place: the check stays in line and takes one when it comes free', 
   }
 });
 
+test('the usage report is read for this UTC month', { timeout: 60_000 }, async () => {
+  const s = await setup();
+  const now = Date.parse('2026-11-30T23:30:00Z');
+  const gate = overflowGate({ d: { ...s.deps, now: () => now, out: () => {} }, owner: { repo: 'acme/app', pr: 7, sha: 'abc1234' }, overflow: { ...OVERFLOW, runMinutes: 20 } });
+  await mkdir(s.deps.tmpRoot, { recursive: true, mode: 0o700 });
+  await gate.claim();
+  await gate.release();
+  const [read] = await billingReads(s);
+  assert.equal(read[1], '/users/acme/settings/billing/usage?year=2026&month=11');
+  const late = Date.parse('2026-12-31T23:30:00Z');
+  const again = overflowGate({ d: { ...s.deps, now: () => late, out: () => {} }, owner: { repo: 'acme/app', pr: 7, sha: 'abc1234' }, overflow: { ...OVERFLOW, runMinutes: 20 } });
+  await again.claim();
+  await again.release();
+  assert.equal((await billingReads(s)).at(-1)[1], '/users/acme/settings/billing/usage?year=2026&month=12');
+});
+
+for (const [name, github] of [['at the reserve', { usage: AT_THE_RESERVE }], ['the usage unreadable', {}]]) {
+  test(`${name}: a check that stays gives its place back at once`, { timeout: 60_000 }, async () => {
+    const s = await setup({ github });
+    await mkdir(s.deps.tmpRoot, { recursive: true, mode: 0o700 });
+    const gate = overflowGate({ d: s.deps, owner: { repo: 't/r', pr: 7, sha: 'abc1234' }, overflow: { ...OVERFLOW, runMinutes: 20 } });
+    assert.equal(await gate.claim(), false);
+    await assertPlaceFree(s);
+    assert.equal((await ledgerLines(s)).length, 0, 'nothing is spent');
+  });
+}
+
+test('two checks at once with room for one: only one goes', { timeout: 60_000 }, async () => {
+  const now = Date.parse('2026-11-01T12:00:00Z'); // 30 days left: 2100 kept; 3000 - 880 - 20 = 2100
+  const fits = await setup({ github: { usage: USAGE(880) } });
+  await mkdir(fits.deps.tmpRoot, { recursive: true, mode: 0o700 });
+  const overflow = { ...OVERFLOW, maxRunning: 4, runMinutes: 20 };
+  const deps = { ...fits.deps, now: () => now, out: () => {} };
+  const gates = Array.from({ length: 4 }, (_, i) => overflowGate({ d: deps, owner: { repo: 't/r', pr: i, sha: 'abc1234' }, overflow }));
+  const won = await Promise.all(gates.map((g) => g.claim()));
+  assert.equal(won.filter(Boolean).length, 1, JSON.stringify(won));
+  assert.equal((await ledgerLines(fits)).length, 1);
+  await Promise.all(gates.map((g) => g.release()));
+});
+
 // --- when GitHub does not say green ----------------------------------------------------------------
 
-const backHere = (name, github, { why, cancelled = false } = {}) =>
+const backHere = (name, github, { why, cancelled = false, overflow = OVERFLOW } = {}) =>
   test(`${name}: the check goes back in line and this machine gives the verdict`, { timeout: 60_000 }, async () => {
-    const s = await setup({ github: { usage: LOTS_LEFT, ...github } });
+    const s = await setup({ overflow, github: { usage: LOTS_LEFT, ...github } });
     const line = await longLine(s);
     const deps = { ...s.deps, githubQueueMs: 30, githubBlindMs: 30 };
     const check = runCheck({ cwd: s.work, deps });
     await waitUntil(() => says(s, /back in line on this machine/), 'it comes back');
+    await new Promise((r) => setTimeout(r, 200)); // the line is still long: it must not go a second time
+    assert.equal((await dispatches(s)).length, 1, 'one try per check');
+    await assertPlaceFree(s);
     await line.free();
     assert.equal(await check, 0);
     const st = await s.statuses();
@@ -244,18 +297,19 @@ const backHere = (name, github, { why, cancelled = false } = {}) =>
     assert.doesNotMatch(st.at(-1).description, /on GitHub/);
     assert.equal(st.at(-1).target_url, undefined);
     assert.ok(says(s, why), s.lines.join('\n'));
-    assert.equal((await dispatches(s)).length, 1, 'one try per check');
     assert.equal((await cancels(s)).length, cancelled ? 1 : 0);
+    assert.equal((await ledgerLines(s)).length, 1, 'entered before it was asked for, whatever came of it');
   });
 
 backHere('the dispatch fails', { dispatchFail: 'HTTP 404: workflow not found' }, { why: /could not be started \(HTTP 404/ });
 backHere('the run is cancelled', { runs: [{ conclusion: 'cancelled' }] }, { why: /ended as cancelled/ });
 backHere('the run times out on GitHub', { runs: [{ conclusion: 'timed_out' }] }, { why: /ended as timed_out/ });
+backHere('the run has no result in time', { runs: [{ status: 'in_progress', conclusion: null }] }, { why: /no result after/, cancelled: true, overflow: { ...OVERFLOW, timeoutMin: 0.001 } });
 backHere('the run never starts', { runs: [{ status: 'queued', conclusion: null }] }, { why: /had not started/, cancelled: true });
 backHere('GitHub stops answering', { runReadFails: 1e6 }, { why: /has not answered/, cancelled: true });
 backHere('the run is red', {
   runs: [{ conclusion: 'failure' }], jobs: [{ id: 9, conclusion: 'failure', steps: [{ name: 'Run the check groups', conclusion: 'failure' }] }],
-  jobLog: '2026-11-01T01:00:00Z ok\n2026-11-01T01:00:01Z ✗ unit: npm test (3s)\n',
+  jobLog: '2026-11-01T01:00:00Z ok\n2026-11-01T01:00:01Z \x1b[31m✗ unit: npm test (3s)\x1b[0m\n',
 }, { why: /GitHub run was red \(unit: npm test \(3s\)\)/ });
 for (const [name, run] of [
   ['another workflow', { path: '.github/workflows/other.yml' }],
@@ -290,6 +344,39 @@ test('a running run under another name is a stranger', { timeout: 60_000 }, asyn
   assert.doesNotMatch((await s.statuses()).at(-1).description, /on GitHub/);
 });
 
+test('a green run whose verdict post fails once: posted on the second try, no error', { timeout: 60_000 }, async () => {
+  const s = await setup({ steps: ['exit 9'], github: { usage: LOTS_LEFT } });
+  const fake = await fakeGh(s.root, { pr: await readPr(s), github: { usage: LOTS_LEFT }, apiFailTimes: { match: 'state=success', times: 1 } });
+  assert.equal(await runCheck({ cwd: s.work, github: true, deps: { ...s.deps, gh: fake.gh } }), 0);
+  const st = await s.statuses();
+  assert.equal(st.at(-1).state, 'success');
+  assert.equal(st.filter((x) => x.state === 'error' || x.state === 'failure').length, 0);
+});
+
+test('a verdict GitHub will not take is not turned into an error status', { timeout: 60_000 }, async () => {
+  const s = await setup({ steps: ['exit 9'], github: { usage: LOTS_LEFT } });
+  const fake = await fakeGh(s.root, { pr: await readPr(s), github: { usage: LOTS_LEFT }, apiFailTimes: { match: 'state=success', times: 99 } });
+  assert.equal(await runCheck({ cwd: s.work, github: true, deps: { ...s.deps, gh: fake.gh } }), 1);
+  assert.ok(says(s, /GitHub did not take the status/));
+  assert.equal((await s.statuses()).filter((x) => x.state === 'error' || x.state === 'failure').length, 0);
+});
+
+test('a pending post that fails after coming back does not end the check', { timeout: 60_000 }, async () => {
+  const s = await setup({ github: { usage: LOTS_LEFT, runs: [{ conclusion: 'cancelled' }] } });
+  const fake = await fakeGh(s.root, { pr: await readPr(s), github: { usage: LOTS_LEFT, runs: [{ conclusion: 'cancelled' }] }, apiFailTimes: { match: 'description=running unit', times: 99 } });
+  assert.equal(await runCheck({ cwd: s.work, github: true, deps: { ...s.deps, gh: fake.gh } }), 0);
+  const st = await s.statuses();
+  assert.equal(st.at(-1).state, 'success');
+  assert.equal(st.filter((x) => x.state === 'error' || x.state === 'failure').length, 0);
+});
+
+test('a hung pending post does not stop the watching', { timeout: 60_000 }, async () => {
+  const s = await setup({ steps: ['exit 9'], github: { usage: LOTS_LEFT } });
+  const fake = await fakeGh(s.root, { pr: await readPr(s), github: { usage: LOTS_LEFT }, apiDelay: { ms: 30_000, match: 'on GitHub' } });
+  assert.equal(await runCheck({ cwd: s.work, github: true, deps: { ...s.deps, gh: fake.gh, progressPostTimeoutMs: 100 } }), 0);
+  assert.match((await s.statuses()).at(-1).description, /on GitHub$/);
+});
+
 test('a short wobble in GitHub\'s answers does not end the wait', { timeout: 60_000 }, async () => {
   const s = await setup({ github: { usage: LOTS_LEFT, runReadFails: 2 } });
   assert.equal(await runCheck({ cwd: s.work, github: true, deps: { ...s.deps, githubBlindMs: 60_000 } }), 0);
@@ -317,16 +404,15 @@ test('it comes back to the place it had, ahead of whoever arrived while it was a
 test('Ctrl-C while on GitHub cancels the run, says error, and frees the place', { timeout: 60_000 }, async () => {
   const dir = await tempDir('overflow-int-');
   const s = await setup({ github: { usage: LOTS_LEFT, runs: [{ status: 'in_progress', conclusion: null }] } });
-  const run = await spawnCheckLeader(s, dir, { github: true });
+  // The flow sleeps between looks, as it does for 20 s in use: the cancel has to come from the unwind.
+  const run = await spawnCheckLeader(s, dir, { github: true, githubPollMs: 120_000 });
   try {
     await waitUntil(() => run.out.text.includes('GitHub run:'), 'the run has started', 30_000);
     process.kill(-run.child.pid, 'SIGINT');
     await run.exited;
     assert.equal((await cancels(s)).length, 1);
     assert.equal((await s.statuses()).at(-1).state, 'error');
-    const free = await tryLock(join(s.deps.tmpRoot, 'lanes', 'github-0'), await ownerInfo());
-    assert.ok(free, 'the place is free again');
-    await free();
+    await assert.rejects(stat(join(s.deps.tmpRoot, 'lanes', 'github-0')), { code: 'ENOENT' }, 'given back, not left for the next to take over');
   } finally {
     run.kill();
     killQuietly(run.child.pid);
@@ -392,7 +478,23 @@ test('the example workflow takes what ship sends, can only read, and starts noth
   assert.match(text, /^on:\n {2}workflow_dispatch:/m);
   assert.doesNotMatch(text, /^ {2}(push|pull_request|schedule):/m);
   // Inputs reach a shell only through env: `${{ }}` inside a script would run what it contains.
-  for (const script of text.matchAll(/run: \|?\n?((?:.*\n)*?)(?=^ {6}- |\Z)/gm)) assert.doesNotMatch(script[1], /\$\{\{/);
+  const lines = text.split('\n');
+  let scripts = 0;
+  lines.forEach((line, i) => {
+    const m = /^( *)(?:- )?run: (.*)$/.exec(line);
+    if (!m) return;
+    scripts++;
+    const indent = m[1].length;
+    const body = [m[2]];
+    for (let j = i + 1; j < lines.length && (lines[j].trim() === '' || lines[j].search(/\S/) > indent); j++) body.push(lines[j]);
+    assert.doesNotMatch(body.join('\n'), /\$\{\{/, line);
+  });
+  assert.equal(scripts, 5);
+  // What makes the run the same check: the head, merged with main, and refused if that is another tree.
+  assert.match(text, /ref: \$\{\{ inputs\.head_sha \}\}/);
+  assert.match(text, /merge --no-edit --quiet "\$MAIN_SHA"/);
+  assert.match(text, /test "\$\(git rev-parse 'HEAD\^\{tree\}'\)" = "\$TREE_SHA"/);
+  assert.match(text, /package-manager-cache: false/, 'pull request code must not write into the default branch\'s cache');
   assert.match(text, /timeout-minutes: \d+/);
   assert.doesNotMatch(text, /\bGROUPS:|\$GROUPS/, 'bash keeps its own GROUPS: the user\'s group ids, whatever the environment says');
 });

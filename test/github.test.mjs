@@ -33,6 +33,15 @@ test('prInfo, defaultBranch, postStatus and nightlyFailures call gh as expected'
   assert.equal(desc.length - 'description='.length, 140);
 });
 
+test('commitStatus says when a bot posted the status', async () => {
+  const sha = 'c'.repeat(40);
+  const pr = { number: 5, headRefOid: sha, headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'OPEN' };
+  const answer = async (creator) => commitStatus({ repo: 'acme/app', sha, gh: (await fakeGh(await tempDir(), { pr, statuses: { [sha]: [{ context: 'local-ci', state: 'success', description: 'x', creator }] } })).gh });
+  assert.deepEqual(await answer({ login: 'github-actions[bot]', type: 'Bot' }), { state: 'success', description: 'x', postedBy: 'github-actions[bot]', bot: true });
+  assert.equal((await answer({ login: 'some-app[bot]', type: 'User' })).bot, true);
+  assert.equal((await answer({ login: 'someone', type: 'User' })).bot, false);
+});
+
 test('commitStatus picks one context out of the statuses and says who posted it; mergedSha reads the merge commit', async () => {
   const sha = 'c'.repeat(40);
   const statuses = {
