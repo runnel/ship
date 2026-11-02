@@ -450,6 +450,17 @@ test('run-groups: a pull request\'s own config changes nothing, a red step is ex
   const { work, mainSha, headSha } = await treeOnBranch(twoGroups('exit 4', 'true'), twoGroups('true', 'true'));
   const lines = [];
   assert.equal(await runGroupsHere({ cwd: work, groups: ['one'], mainSha, headSha, logFile: join(dir, 'log'), out: (l) => lines.push(l) }), 1);
+  assert.ok(lines.some((l) => l.startsWith('✗ one: exit 4')), 'the line a red run is summed up by');
+});
+
+test('run-groups refuses groups that main\'s config does not have', async () => {
+  const dir = await tempDir();
+  const { work, mainSha, headSha } = await treeOnBranch(twoGroups('true', 'true'));
+  const lines = [];
+  assert.equal(await runGroupsHere({ cwd: work, groups: ['nope'], mainSha, headSha, logFile: join(dir, 'log'), out: (l) => lines.push(l) }), 2);
+  assert.equal(await runGroupsHere({ cwd: work, groups: [], mainSha, headSha, logFile: join(dir, 'log'), out: (l) => lines.push(l) }), 2);
+});
+
 // A clone with one commit has neither main's config nor the changed files: they are handed over.
 async function handedOver({ config, files = 'src/x.ts\ndocs/y.md\n', env = null }) {
   const dir = await tempDir();
@@ -505,17 +516,6 @@ test('run-groups refuses a file handed over that cannot be read or does not fit'
   }
 });
 
-  assert.ok(lines.some((l) => l.startsWith('✗ one: exit 4')), 'the line a red run is summed up by');
-});
-
-test('run-groups refuses groups that main\'s config does not have', async () => {
-  const dir = await tempDir();
-  const { work, mainSha, headSha } = await treeOnBranch(twoGroups('true', 'true'));
-  const lines = [];
-  assert.equal(await runGroupsHere({ cwd: work, groups: ['nope'], mainSha, headSha, logFile: join(dir, 'log'), out: (l) => lines.push(l) }), 2);
-  assert.equal(await runGroupsHere({ cwd: work, groups: [], mainSha, headSha, logFile: join(dir, 'log'), out: (l) => lines.push(l) }), 2);
-});
-
 test('the example workflow takes what ship sends, can only read, and starts nothing by itself', async () => {
   const text = await readFile(new URL('../examples/ship-check.yml', import.meta.url), 'utf8');
   for (const input of ['head_sha', 'main_sha', 'tree_sha', 'groups', 'ship_sha', 'nonce']) assert.match(text, new RegExp(`^ {6}${input}: `, 'm'), input);
@@ -553,7 +553,7 @@ const withOverflow = (overflow) => ({ repo: 't/r', checks: [{ name: 'unit', path
 test('overflow config: defaults, and no default for what must stay free', () => {
   assert.equal(validateConfig({ repo: 't/r', checks: [{ name: 'unit', paths: ['**'], steps: ['true'] }] }).overflow, null);
   assert.deepEqual(validateConfig(withOverflow({ workflow: 'c.yml', includedMinutes: 3000, reservePerDay: 60, reserveFloor: 300 })).overflow, {
-    workflow: 'c.yml', includedMinutes: 3000, reservePerDay: 60, reserveFloor: 300, minAhead: 4, maxRunning: 2, runMinutes: 20, timeoutMin: 40, groups: null,
+    workflow: 'c.yml', includedMinutes: 3000, reservePerDay: 60, reserveFloor: 300, minAhead: 4, maxRunning: 2, runMinutes: 20, timeoutMin: 40, groups: null, cloudflare: null,
   });
   const good = { workflow: 'c.yml', includedMinutes: 3000, reservePerDay: 60, reserveFloor: 300 };
   for (const bad of [
@@ -562,4 +562,33 @@ test('overflow config: defaults, and no default for what must stay free', () => 
     { ...good, reservePerDay: 0 }, { ...good, reserveFloor: 0 }, { ...good, minAhead: 0 }, { ...good, maxRunning: 0 }, { ...good, maxRunning: 1.5 },
     { ...good, runMinutes: 0 }, { ...good, timeoutMin: -1 }, { ...good, groups: 'unit' }, { ...good, groups: ['nope'] }, { ...good, nope: 1 },
   ]) assert.throws(() => validateConfig(withOverflow(bad)), ConfigError, JSON.stringify(bad));
+});
+
+const GOOD_OVERFLOW = { workflow: 'c.yml', includedMinutes: 3000, reservePerDay: 60, reserveFloor: 300 };
+const withCloudflare = (cloudflare, extra = {}) => ({ repo: 't/r', checks: [{ name: 'unit', paths: ['**'], steps: ['true'] }, { name: 'db', paths: ['db/**'], steps: ['true'] }], overflow: { ...GOOD_OVERFLOW, cloudflare }, ...extra });
+const GOOD = { repo: 'acme/app-runner', branch: 'run', checkName: 'Workers Builds: app-runner' };
+
+test('overflow.cloudflare config: defaults, and what is required', () => {
+  assert.deepEqual(validateConfig(withCloudflare(GOOD)).overflow.cloudflare, {
+    repo: 'acme/app-runner', branch: 'run', checkName: 'Workers Builds: app-runner', minAhead: 2, maxRunning: 2, timeoutMin: 25, groups: null, setup: null, env: {},
+  });
+  const full = { ...GOOD, minAhead: 3, maxRunning: 4, timeoutMin: 30, groups: ['unit', 'db'], setup: 'scripts/remote-setup.sh', env: { unit: { SOME_VAR: '{root}/scripts/x.cjs' } } };
+  assert.deepEqual(validateConfig(withCloudflare(full)).overflow.cloudflare, full);
+  assert.equal(validateConfig(withCloudflare(undefined)).overflow.cloudflare, null);
+  assert.equal(validateConfig(withCloudflare(null)).overflow.cloudflare, null);
+});
+
+test('overflow.cloudflare config: what is refused', () => {
+  for (const bad of [
+    'x', [], { ...GOOD, repo: undefined }, { ...GOOD, repo: 'app-runner' }, { ...GOOD, repo: 'a/b/c' },
+    { ...GOOD, repo: 't/r' }, { ...GOOD, repo: 'T/R' }, // the repository itself: its branch is force-pushed
+    { ...GOOD, branch: undefined }, { ...GOOD, branch: '' }, { ...GOOD, branch: '-x' }, { ...GOOD, branch: 'a..b' }, { ...GOOD, branch: 'a//b' }, { ...GOOD, branch: 'a b' },
+    { ...GOOD, branch: 'run.' }, { ...GOOD, branch: 'run/' }, { ...GOOD, branch: 'run.lock' }, { ...GOOD, branch: 'run~1' }, { ...GOOD, branch: 'run:x' },
+    { ...GOOD, checkName: undefined }, { ...GOOD, checkName: ' ' }, { ...GOOD, checkName: 3 },
+    { ...GOOD, minAhead: 0 }, { ...GOOD, minAhead: 1.5 }, { ...GOOD, maxRunning: 0 }, { ...GOOD, timeoutMin: 0 }, { ...GOOD, timeoutMin: -1 },
+    { ...GOOD, groups: 'unit' }, { ...GOOD, groups: ['nope'] },
+    { ...GOOD, setup: '/etc/x' }, { ...GOOD, setup: '../x.sh' }, { ...GOOD, setup: 3 },
+    { ...GOOD, env: [] }, { ...GOOD, env: { nope: { A: 'b' } } }, { ...GOOD, env: { unit: 'A=b' } }, { ...GOOD, env: { unit: { A: 1 } } }, { ...GOOD, env: { unit: { 'A-B': 'x' } } },
+    { ...GOOD, nope: 1 },
+  ]) assert.throws(() => validateConfig(withCloudflare(bad)), ConfigError, JSON.stringify(bad));
 });
