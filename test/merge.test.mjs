@@ -33,6 +33,7 @@ test('only a success on the head, naming its main, allows a merge', () => {
   assert.match(bot.reason, /^local-ci on aaaaaaa was posted by github-actions\[bot\], not by ship check; run ship check --pr 7$/, 'a workflow token can post a status: it is not a check');
   assert.equal(judgeStatus({ state: 'failure', description: 'x', bot: true }, { pr: 7, headSha: HEAD }).ok, false);
   assert.equal(judgeStatus({ state: 'success', description: 'app · vs main@52d4c19 · 18m · on GitHub', postedBy: 'someone', bot: false }, { pr: 7, headSha: HEAD }).sha, '52d4c19', 'a check that ran on GitHub merges like any other');
+  assert.equal(judgeStatus({ state: 'success', description: 'app · vs main@52d4c19 · 14m · on Cloudflare', postedBy: 'someone', bot: false }, { pr: 7, headSha: HEAD }).sha, '52d4c19', 'and so does one that ran on Cloudflare');
   const odd = judgeStatus({ state: 'success', description: 'done' }, { pr: 7, headSha: HEAD });
   assert.equal(odd.ok, false);
   assert.match(odd.reason, /cannot tell which main local-ci checked \("done"\); run ship check --pr 7 again$/);
