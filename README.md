@@ -286,8 +286,10 @@ overflow: {
 
 1. Create a private repository for the runner (`acme/app-runner`) and turn Actions off in it.
 2. Create a Worker in Cloudflare and connect it to that repository: production branch `run`, build command
-   `bash .ship-run/run.sh`, deploy command `true`, build variable `SKIP_DEPENDENCY_INSTALL=1`. The Worker
-   never serves anything. The check run is named `Workers Builds: <worker name>`.
+   `bash .ship-run/run.sh`, deploy command `true`, build variables `SKIP_DEPENDENCY_INSTALL=1` and
+   `NODE_VERSION=24` (the image installs the Node that variable names; ship needs 24 or newer, and the
+   build refuses an older one; a `setup` script may bring its own instead). The Worker never serves
+   anything. The check run is named `Workers Builds: <worker name>`.
 3. Give the Cloudflare GitHub App that one repository only.
 4. **Narrow the build token by hand.** The build step can read `CLOUDFLARE_API_TOKEN`, and so can the code
    under check. Replace the token Cloudflare makes with one that has Account Settings, Workers Scripts,
@@ -308,27 +310,37 @@ line here. There is no counter or budget for Cloudflare: ship cannot read its us
 **What runs.** ship makes a commit and force-pushes it to `branch`. Its tree is the merged tree ship has
 just made (the head merged with main), with a `.ship-run/` directory laid over it, written by this machine
 from main: `run.sh` (a constant that comes with ship), `config.mjs` (`ship.config.mjs` as it is on main),
-`groups`, `changed-files`, `ship-sha`, `env.json`, and `setup.sh` (the `setup` file as it is on main, when
-configured). Anything the pull request has under `.ship-run/` is dropped, so a pull request cannot change
-what judges it. The parent of the commit is the branch's last tip, fetched first so that a push sends only
-what is new; the repository's own history is never pushed. Two checks at once push two commits, and both
-are built.
+`groups`, `changed-files`, `ship-sha`, `env.json`, `nonce` (a random value nobody reads: checking the same
+tree again still changes a file, which Workers Builds' watch paths could otherwise take as nothing to build)
+and `setup.sh` (the `setup` file as it is on main, when configured). Anything the pull request has under
+`.ship-run/` is dropped, so a pull request cannot change what judges it. The parent of the commit is the
+branch's last tip, fetched first so that a push sends only what is new (the mirror keeps the last commit it
+pushed under `refs/ship/cloudflare/tip/<branch>`, so that git does not prune the chain and the next fetch
+does not bring it again); the repository's own history is never pushed. Two checks at once push two
+commits, and both are built.
 
 Workers Builds clones that one commit and runs `bash .ship-run/run.sh`, from the checkout root. The script
-sets `LC_ALL=C.UTF-8` where there is no `en_US.UTF-8` locale, sources `setup.sh` if there is one (with
-`SHIP_GROUPS` set; it may change `PATH`, to install a Node version, say), downloads ship at `ship-sha`,
-runs `ship run-groups --config … --files … --env …` and prints the tail of the log if that fails. The
-machine has no `sudo` and no history: steps that need either must fit that, or get what they need from
-`setup`. The `.ship-run/` files are part of the commit, so `git status` is clean while the groups run. A
-secret in `env` is a secret in the runner repository: keep them out.
+first checks that the checkout is the commit the build was started for (`WORKERS_CI_COMMIT_SHA`, which
+must be set): a build that a later push superseded may clone that push, and must not give its result to a
+commit it did not check. It sets `LC_ALL=C.UTF-8` where there is no `en_US.UTF-8` locale. If there is a
+`setup.sh` it runs it in a subshell under `set -euo pipefail`, with `SHIP_GROUPS` set; only its `PATH` comes
+out (to install a Node version, say), and only if it ran to its end: a script that fails, uses a variable
+it never set, or calls `exit` (even `exit 0`) fails the build with exit 2, and nothing else it sets, such as
+`groups`, a trap or a function named `node`, reaches the rest. The `node` on `PATH` after that must be 24 or
+newer and outside the checkout, or the build fails with exit 2. Then it downloads ship at `ship-sha`, runs
+`ship run-groups --config … --files … --env …` and prints the tail of the log if that fails. The machine
+has no `sudo` and no history: steps that need either must fit that, or get what they need from `setup`. The
+`.ship-run/` files are part of the commit, so `git status` is clean while the groups run. A secret in `env`
+is a secret in the runner repository: keep them out.
 
 **The verdict.** Only green is taken from Cloudflare: a check run on the commit ship pushed, made by the
 GitHub App `cloudflare-workers-and-pages`, named `checkName`, completed with `success`. Another app's check
-run, another name, another commit, `neutral` or one that is still going: none of them counts. The build
-leaves its check run only when it ends, so a build that has not started cannot be told from one that is
-running, and ship waits `timeoutMin` for it (a build is stopped by Cloudflare after 20 minutes; the rest is
-for the queue). Green posts `local-ci` with `· on Cloudflare` in the description and a link to the check run,
-from this machine, with your login. Anything else (a red build, no result in time, a push that failed, `gh`
+run, another name, another commit, `neutral` or one that is still going: none of them counts, and a
+completed run of the build that is not a success on that commit makes it red even beside a success. Only a
+completed run is read: while the build is queued or running there may be no check run or one that is
+`in_progress`, and ship keeps waiting, up to `timeoutMin` (a build is stopped by Cloudflare after 20
+minutes; the rest is for the queue). Green posts `local-ci` with `· on Cloudflare` in the description and a link to the check
+run, from this machine, with your login. Anything else (a red build, no result in time, a push that failed, `gh`
 not answering) sends the check back to its old place in line with a `! … back in line on this machine` line,
 and this machine gives the verdict: a red may be Cloudflare's, so it never reads as a red check. Ctrl-C and a
 pull request that moves on end the wait, but the build cannot be cancelled without a Cloudflare credential,
