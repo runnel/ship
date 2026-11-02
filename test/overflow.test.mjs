@@ -8,7 +8,7 @@ import { acquire, ownerInfo, tryLock } from '../lib/lock.mjs';
 import { minutesUsed, daysLeftInMonth, reserveVerdict, recentRuns, overflowGate, PENDING_WINDOW_MS } from '../lib/overflow.mjs';
 import { runGroupsHere } from '../lib/run-groups.mjs';
 import { validateConfig, ConfigError } from '../lib/config.mjs';
-import { commitFiles, fakeGh, git, killQuietly, makeOrigin, setupCheck, spawnCheckLeader, tempDir, waitUntil } from './helpers.mjs';
+import { commitFiles, fakeGh, git, killQuietly, longLine, makeOrigin, setupCheck, spawnCheckLeader, tempDir, waitUntil } from './helpers.mjs';
 
 const actionsRow = (quantity, sku = 'Actions Linux') => ({ product: 'actions', unitType: 'Minutes', sku, quantity, repositoryName: 'r' });
 const USAGE = (quantity) => ({ usageItems: [actionsRow(quantity)] });
@@ -20,17 +20,6 @@ const configText = (steps, overflow = OVERFLOW, check = {}) => `export default {
 
 const setup = ({ steps = ['true'], overflow = OVERFLOW, check = {}, github = { usage: LOTS_LEFT }, ...rest } = {}) =>
   setupCheck({ configText: configText(steps, overflow, check), ghOptions: { github }, ...rest });
-
-// The lane is held and one waiter stands in line, so a check that arrives is second in line. `free()`
-// lets both go (the waiter gives the lane back at once).
-async function longLine(s) {
-  await mkdir(s.deps.tmpRoot, { recursive: true, mode: 0o700 });
-  const lane = join(s.deps.tmpRoot, 'lanes', 'heavy');
-  const holder = await acquire(lane, await ownerInfo({ repo: 'o/x', pr: 1 }));
-  const waiter = acquire(lane, await ownerInfo({ repo: 'o/x', pr: 2 }), { priority: 1, pollMs: 5 }).then((release) => release());
-  await waitUntil(async () => (await readdir(join(s.deps.tmpRoot, 'lanes'))).some((n) => n.startsWith('heavy.q-') && n.endsWith('.json')), 'the waiter is in line');
-  return { free: async () => { await holder(); await waiter; } };
-}
 
 const dispatches = async (s) => (await s.calls()).filter((c) => c[0] === 'api' && c[3]?.endsWith('/dispatches'));
 const billingReads = async (s) => (await s.calls()).filter((c) => c[0] === 'api' && c[1]?.includes('/billing/'));
