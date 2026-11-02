@@ -461,6 +461,61 @@ test('run-groups: a pull request\'s own config changes nothing, a red step is ex
   const { work, mainSha, headSha } = await treeOnBranch(twoGroups('exit 4', 'true'), twoGroups('true', 'true'));
   const lines = [];
   assert.equal(await runGroupsHere({ cwd: work, groups: ['one'], mainSha, headSha, logFile: join(dir, 'log'), out: (l) => lines.push(l) }), 1);
+// A clone with one commit has neither main's config nor the changed files: they are handed over.
+async function handedOver({ config, files = 'src/x.ts\ndocs/y.md\n', env = null }) {
+  const dir = await tempDir();
+  const work = join(dir, 'checkout');
+  await mkdir(work);
+  const handed = { configFile: join(dir, 'config.mjs'), filesFile: join(dir, 'changed-files') };
+  await writeFile(handed.configFile, config);
+  await writeFile(handed.filesFile, files);
+  if (env !== null) {
+    handed.envFile = join(dir, 'env.json');
+    await writeFile(handed.envFile, typeof env === 'string' ? env : JSON.stringify(env));
+  }
+  return { dir, work, seen: join(dir, 'seen'), handed, logFile: join(dir, 'log') };
+}
+
+test('run-groups with a config and a list of files handed over needs no history and no main', async () => {
+  const seen = join(await tempDir(), 'seen');
+  const h = await handedOver({ config: twoGroups(`echo "$SHIP_CHANGED_FILES" >> ${seen}`, `echo two >> ${seen}`) });
+  const lines = [];
+  assert.equal(await runGroupsHere({ cwd: h.work, groups: ['one', 'two'], ...h.handed, logFile: h.logFile, out: (l) => lines.push(l) }), 0, lines.join('\n'));
+  assert.deepEqual((await readFile(seen, 'utf8')).trim().split('\n'), ['src/x.ts', 'docs/y.md', 'two']);
+});
+
+test('run-groups: the handed-over config and files are used even where git has other ones', async () => {
+  const seen = join(await tempDir(), 'seen');
+  const { work, mainSha, headSha } = await treeOnBranch(twoGroups('exit 4', 'true'));
+  const h = await handedOver({ config: twoGroups(`echo "$SHIP_CHANGED_FILES" >> ${seen}`, 'true'), files: 'only/this.ts\n' });
+  assert.equal(await runGroupsHere({ cwd: work, groups: ['one'], mainSha, headSha, ...h.handed, logFile: h.logFile, out: () => {} }), 0, 'main\'s exit 4 is not what ran');
+  assert.equal((await readFile(seen, 'utf8')).trim(), 'only/this.ts', 'src/x.ts is what git would have said');
+});
+
+test('run-groups: the env file adds to the named groups only, with {root} the checkout', async () => {
+  const seen = join(await tempDir(), 'seen');
+  const probe = (name) => `echo ${name}=$SOME_VAR/$OTHER_VAR/$SHIP_CHANGED_FILES >> ${seen}`;
+  const config = `export default { repo: 't/r', checks: [
+    { name: 'one', paths: ['**'], env: { SOME_VAR: 'from-config', OTHER_VAR: 'from-config' }, steps: [${JSON.stringify(probe('one'))}] },
+    { name: 'two', paths: ['**'], steps: [${JSON.stringify(probe('two'))}] }] };\n`;
+  const h = await handedOver({ config, files: 'a.ts\n', env: { one: { SOME_VAR: '{root}/scripts/x.cjs', SHIP_CHANGED_FILES: 'x' } } });
+  assert.equal(await runGroupsHere({ cwd: h.work, groups: ['one', 'two'], ...h.handed, logFile: h.logFile, out: () => {} }), 0);
+  assert.deepEqual((await readFile(seen, 'utf8')).trim().split('\n'), [`one=${h.work}/scripts/x.cjs/from-config/a.ts`, 'two=//a.ts'],
+    'added after the group\'s own, before what ship sets itself; another group gets nothing');
+});
+
+test('run-groups refuses a file handed over that cannot be read or does not fit', async () => {
+  const lines = [];
+  const run = async (h, overrides = {}) => runGroupsHere({ cwd: h.work, groups: ['one'], ...h.handed, ...overrides, logFile: h.logFile, out: (l) => lines.push(l) });
+  const config = twoGroups('true', 'true');
+  assert.equal(await run(await handedOver({ config }), { configFile: '/nonexistent/config.mjs' }), 2);
+  assert.equal(await run(await handedOver({ config }), { filesFile: '/nonexistent/changed-files' }), 2);
+  assert.ok(lines.some((l) => /cannot read what was handed over/.test(l)), lines.join('\n'));
+  for (const env of ['not json', '[]', '{"one": "x"}', '{"one": {"A": 1}}', '{"nope": {"A": "b"}}']) {
+    assert.equal(await run(await handedOver({ config, env })), 2, env);
+  }
+});
+
   assert.ok(lines.some((l) => l.startsWith('✗ one: exit 4')), 'the line a red run is summed up by');
 });
 
