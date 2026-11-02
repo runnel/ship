@@ -189,6 +189,7 @@ test('the build gets main\'s config, setup and the constant script, never the pu
   assert.equal(await inRunner(ok, '.ship-run/groups'), 'unit\n');
   assert.equal(await inRunner(ok, '.ship-run/changed-files'), ['.ship-run/extra', '.ship-run/run.sh', '.ship-run/setup.sh', 'scripts/remote-setup.sh', 'ship.config.mjs', 'src/x.ts'].map((f) => `${f}\n`).join(''));
   assert.equal(await inRunner(ok, '.ship-run/ship-sha'), `${'c'.repeat(40)}\n`);
+  assert.match(await inRunner(ok, '.ship-run/nonce'), /^[0-9a-f]{24}\n$/);
   assert.deepEqual(JSON.parse(await inRunner(ok, '.ship-run/env.json')), { unit: { SOME_VAR: '{root}/scripts/x.cjs' } }, '{root} is the build\'s to expand');
   // Around the directory the tree is the one ship got from merging the head with main.
   assert.equal(await inRunner(ok, 'scripts/remote-setup.sh'), 'PR setup\n');
@@ -211,8 +212,49 @@ test('the next check builds on the branch\'s tip, and the branch holds only ship
   assert.deepEqual(both[0].parents, [first.sha], 'the parent is the tip it found');
   assert.deepEqual(both[1], first);
   assert.equal(both.length, Number((await git(['--git-dir', s.runner, 'rev-list', '--count', 'refs/heads/run'])).trim()));
-  const mirrorRefs = await git(['--git-dir', join(s.deps.mirrorRoot, 't__r.git'), 'for-each-ref', 'refs/ship']);
-  assert.equal(mirrorRefs.trim(), '', 'the private ref the tip was fetched into does not stay');
+  const mirrorRefs = await git(['--git-dir', join(s.deps.mirrorRoot, 't__r.git'), 'for-each-ref', '--format=%(refname)', 'refs/ship']);
+  assert.equal(mirrorRefs.trim(), 'refs/ship/cloudflare/tip/run', 'the private ref the tip was fetched into does not stay; the one that keeps the chain does');
+});
+
+test('checking the same tree again still changes a file: every overlay has a nonce of its own', { timeout: 60_000 }, async () => {
+  const s = await setup();
+  assert.equal(await runCheck({ cwd: s.work, cloudflare: true, deps: s.deps }), 0);
+  const [first] = await pushes(s);
+  assert.equal(await runCheck({ cwd: s.work, cloudflare: true, deps: s.deps }), 0);
+  const [second] = await pushes(s);
+  assert.notEqual(second.sha, first.sha);
+  const nonce = (sha) => inRunner(s, '.ship-run/nonce', sha);
+  assert.notEqual(await nonce(second.sha), await nonce(first.sha));
+  const changed = (await git(['--git-dir', s.runner, 'diff', '--name-only', first.sha, second.sha])).trim().split('\n');
+  assert.deepEqual(changed, ['.ship-run/nonce'], 'the tree around it was the same, and that is the one file a watch path sees');
+});
+
+test('the mirror keeps the runner branch\'s last commit under a ref of its own, so that its chain is not pruned or fetched again', { timeout: 60_000 }, async () => {
+  const s = await setup();
+  const mirror = join(s.deps.mirrorRoot, 't__r.git');
+  const kept = () => git(['--git-dir', mirror, 'rev-parse', '--verify', '--quiet', 'refs/ship/cloudflare/tip/run']).then((t) => t.trim(), () => null);
+  assert.equal(await kept(), null);
+  assert.equal(await runCheck({ cwd: s.work, cloudflare: true, deps: s.deps }), 0);
+  const [first] = await pushes(s);
+  assert.equal(await kept(), first.sha);
+  assert.equal(await runCheck({ cwd: s.work, cloudflare: true, deps: s.deps }), 0);
+  const [second] = await pushes(s);
+  assert.equal(await kept(), second.sha, 'moved on with the branch');
+  assert.equal((await git(['--git-dir', mirror, 'merge-base', '--is-ancestor', first.sha, second.sha]).then(() => 'yes', () => 'no')), 'yes');
+  assert.equal((await git(['--git-dir', mirror, 'for-each-ref', '--format=%(refname)', 'refs/ship'])).trim(), 'refs/ship/cloudflare/tip/run', 'the refs of single calls are gone');
+});
+
+test('a ref the mirror cannot keep does not fail the check', { timeout: 60_000 }, async () => {
+  const s = await setup();
+  const mirror = join(s.deps.mirrorRoot, 't__r.git');
+  assert.equal(await runCheck({ cwd: s.work, cloudflare: true, deps: s.deps }), 0); // makes the mirror
+  const [first] = await pushes(s);
+  // A ref below the one that would be kept: git cannot have both.
+  await git(['--git-dir', mirror, 'update-ref', '-d', 'refs/ship/cloudflare/tip/run']);
+  await git(['--git-dir', mirror, 'update-ref', 'refs/ship/cloudflare/tip/run/blocker', first.sha]);
+  assert.equal(await runCheck({ cwd: s.work, cloudflare: true, deps: s.deps }), 0);
+  assert.match((await s.statuses()).at(-1).description, /on Cloudflare$/);
+  assert.equal((await pushes(s)).length, 2);
 });
 
 test('a setup script main does not have: nothing is pushed, the check waits here', { timeout: 60_000 }, async () => {
@@ -224,9 +266,10 @@ test('a setup script main does not have: nothing is pushed, the check waits here
 });
 
 test('overlayFiles: only the groups that run get variables; no setup, no setup.sh', () => {
-  const base = { run: 'r', config: 'c', groups: ['a', 'b'], files: ['x', 'y z'], shipSha: 'f'.repeat(40), env: { a: { A: '1' }, c: { C: '3' } }, setup: null };
+  const base = { run: 'r', config: 'c', groups: ['a', 'b'], files: ['x', 'y z'], shipSha: 'f'.repeat(40), env: { a: { A: '1' }, c: { C: '3' } }, setup: null, nonce: 'abc123' };
   const files = overlayFiles(base);
-  assert.deepEqual(Object.keys(files).sort(), ['changed-files', 'config.mjs', 'env.json', 'groups', 'run.sh', 'ship-sha']);
+  assert.deepEqual(Object.keys(files).sort(), ['changed-files', 'config.mjs', 'env.json', 'groups', 'nonce', 'run.sh', 'ship-sha']);
+  assert.equal(files.nonce, 'abc123\n');
   assert.equal(files.groups, 'a,b\n');
   assert.equal(files['changed-files'], 'x\ny z\n');
   assert.deepEqual(JSON.parse(files['env.json']), { a: { A: '1' } });
@@ -273,6 +316,8 @@ backHere('another app made the check run, under the right name', { runs: [[{ app
 backHere('the check run has no app', { runs: [[{ app: null }]] }, { why: /no result after/, cloudflare: SHORT });
 backHere('the check run is for another commit', { runs: [[{ head_sha: 'f'.repeat(40) }]] }, { why: /no result after/, cloudflare: SHORT });
 backHere('a genuine red beside a forged green', { runs: [[{ conclusion: 'failure' }, { app: { slug: 'github-actions' } }, { name: 'Workers Builds: other-worker' }]] }, { why: /build was red/ });
+backHere('a genuine red beside a genuine green', { runs: [[{}, { conclusion: 'failure' }]] }, { why: /build was red/ });
+backHere('a genuine neutral beside a genuine green', { runs: [[{ conclusion: 'neutral' }, {}]] }, { why: /ended as neutral/ });
 backHere('GitHub stops answering', { readFails: 1e6 }, { why: /GitHub has not answered/, blindMs: 30 });
 
 test('a genuine green is green whatever else is on the commit', { timeout: 60_000 }, async () => {
@@ -309,7 +354,14 @@ test('buildVerdict: exactly the app, the name and the commit; completed and succ
     const v = verdict({ ...run, conclusion });
     assert.equal(v.done && v.ok, false, String(conclusion));
   }
-  assert.equal(verdict({ ...run, conclusion: 'failure' }, run).ok, true, 'a genuine success counts, forged or not the others');
+  // A run of ours that is over and not a success is not green, whatever else is on the commit; one that is not over says nothing.
+  for (const conclusion of ['failure', 'neutral', 'cancelled', 'timed_out']) {
+    assert.deepEqual(verdict(run, { ...run, conclusion }), { done: true, ok: false, conclusion, url: 'u' }, `a success beside ${conclusion}`);
+    assert.deepEqual(verdict({ ...run, conclusion }, run), { done: true, ok: false, conclusion, url: 'u' }, `${conclusion} beside a success`);
+  }
+  assert.equal(verdict(run, { ...run, conclusion: 'failure', app: { slug: 'github-actions' } }).ok, true, 'but another app\'s red is not ours');
+  assert.equal(verdict(run, { ...run, status: 'in_progress', conclusion: null }).ok, true, 'and a build going again says nothing yet');
+  assert.equal(verdict(run, run).ok, true, 'two successes are green');
 });
 
 test('a push the runner repository refuses: the check goes back in line', { timeout: 60_000 }, async () => {
