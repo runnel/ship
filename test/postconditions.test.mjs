@@ -126,10 +126,10 @@ test('a trailing note is ignored on every form but sql', () => {
   assert.equal(parseConditions("-- ship:verify sql (select ')') = ')'\n").errors.length, 0, 'parentheses inside quotes do not count');
 });
 
-test('the example in the README parses', () => {
-  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
-  const block = readme.match(/```sql\n((?:-- ship:verify[^\n]*\n)+)```/)?.[1];
-  assert.ok(block, 'the README has a ship:verify example block');
+test('the example in docs/migrations.md parses', () => {
+  const doc = readFileSync(new URL('../docs/migrations.md', import.meta.url), 'utf8');
+  const block = doc.match(/```sql\n((?:-- ship:verify[^\n]*\n)+)```/)?.[1];
+  assert.ok(block, 'docs/migrations.md has a ship:verify example block');
   const { conditions, errors } = parseConditions(block);
   assert.deepEqual(errors, []);
   assert.deepEqual(new Set(conditions.map((c) => c.kind)), new Set(['table', 'column', 'function', 'rls', 'no-access', 'no-execute', 'access', 'execute', 'absent', 'sql']));

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The build command of a Cloudflare Workers Builds machine that checks a pull request for ship (README,
+# The build command of a Cloudflare Workers Builds machine that checks a pull request for ship (docs/overflow.md,
 # "Overflow to Cloudflare Workers Builds"): `bash .ship-run/run.sh`. ship copies this file, unchanged, to
 # .ship-run/ of every commit it pushes to the runner repository, next to the files it reads here:
 #   groups           the check groups to run, comma separated
