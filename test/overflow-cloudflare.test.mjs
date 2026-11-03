@@ -285,11 +285,11 @@ test('overlayFiles: only the groups that run get variables; no setup, no setup.s
 
 // Only a completed, successful run of the Workers Builds app, named as configured, on the commit that was
 // pushed, is green. Everything else sends the check back to its old place in line, with no red verdict.
-const backHere = (name, builds, { why, cloudflare = {}, blindMs } = {}) =>
+const backHere = (name, builds, { why, cloudflare = {}, blindMs, queueMs } = {}) =>
   test(`${name}: the check goes back in line and this machine gives the verdict`, { timeout: 60_000 }, async () => {
     const s = await setup({ overflow: { minAhead: 1 }, cloudflare, builds }); // GitHub would take it, if it were asked
     const line = await longLine(s);
-    const check = runCheck({ cwd: s.work, deps: { ...s.deps, ...(blindMs ? { cloudflareBlindMs: blindMs } : {}) } });
+    const check = runCheck({ cwd: s.work, deps: { ...s.deps, ...(blindMs ? { cloudflareBlindMs: blindMs } : {}), ...(queueMs ? { cloudflareQueueMs: queueMs } : {}) } });
     await waitUntil(() => says(s, /back in line on this machine/), 'it comes back');
     await new Promise((r) => setTimeout(r, 200)); // the line is still long: it must not go a second time, to either
     assert.equal((await pushes(s)).length, 1, 'one try per check');
@@ -322,6 +322,9 @@ backHere('the check run is for another commit', { runs: [[{ head_sha: 'f'.repeat
 backHere('a genuine red beside a forged green', { runs: [[{ conclusion: 'failure' }, { app: { slug: 'github-actions' } }, { name: 'Workers Builds: other-worker' }]] }, { why: /build was red/ });
 backHere('a genuine red beside a genuine green', { runs: [[{}, { conclusion: 'failure' }]] }, { why: /build was red/ });
 backHere('a genuine neutral beside a genuine green', { runs: [[{ conclusion: 'neutral' }, {}]] }, { why: /ended as neutral/ });
+backHere('the build never starts, as a skipped one does not', { runs: [[]] }, { why: /had not started after/, queueMs: 30 });
+backHere('another app\'s check run does not count as the build having started', { runs: [[{ app: { slug: 'github-actions' }, status: 'in_progress', conclusion: null }]] }, { why: /had not started after/, queueMs: 30 });
+backHere('a check run of another name does not count as the build having started', { runs: [[{ name: 'Workers Builds: other-worker', status: 'in_progress', conclusion: null }]] }, { why: /had not started after/, queueMs: 30 });
 backHere('GitHub stops answering', { readFails: 1e6 }, { why: /GitHub has not answered/, blindMs: 30 });
 
 test('a genuine green is green whatever else is on the commit', { timeout: 60_000 }, async () => {
@@ -334,6 +337,14 @@ test('a build that is not over at first is waited for; a short wobble in GitHub\
   const s = await setup({ steps: ['exit 9'], builds: { readFails: 2, runs: [[], [{ status: 'in_progress', conclusion: null }], [{}]] } });
   assert.equal(await runCheck({ cwd: s.work, cloudflare: true, deps: { ...s.deps, cloudflareBlindMs: 60_000 } }), 0);
   assert.match((await s.statuses()).at(-1).description, /on Cloudflare$/);
+});
+
+test('a build that has started is waited for past the limit on starting', { timeout: 60_000 }, async () => {
+  const going = { status: 'in_progress', conclusion: null };
+  const s = await setup({ steps: ['exit 9'], builds: { runs: [[going], [going], [going], [going], [going], [going], [{}]] } });
+  assert.equal(await runCheck({ cwd: s.work, cloudflare: true, deps: { ...s.deps, cloudflareQueueMs: 1 } }), 0);
+  assert.match((await s.statuses()).at(-1).description, /on Cloudflare$/);
+  assert.ok(!says(s, /had not started/), s.lines.join('\n'));
 });
 
 test('buildVerdict: exactly the app, the name and the commit; completed and successful', () => {
