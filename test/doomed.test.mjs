@@ -1,13 +1,17 @@
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { access, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { runCheck } from '../lib/check.mjs';
+import { runCheck as realRunCheck } from '../lib/check.mjs';
 import { acquire, ownerInfo, readOwner } from '../lib/lock.mjs';
 import { acquireShared } from '../lib/shared.mjs';
 import { mirrorPath } from '../lib/git.mjs';
 import { watchDoomed } from '../lib/doomed.mjs';
-import { setupCheck as setup, git, tempDir, commitFiles, waitUntil, readPid, assertGone } from './helpers.mjs';
+import { setupCheck as setup, atTestEnd, git, tempDir, commitFiles, waitUntil, readPid, assertGone, killQuietly, stopBackground, tracked } from './helpers.mjs';
+
+// However a test ends, the lane it held and the check waiting for it end with it.
+afterEach(stopBackground, { timeout: 30_000 });
+const runCheck = tracked(realRunCheck);
 
 // A repo that asks for a fresh check when main gains a file under db/.
 const RECHECK_CONFIG = (steps = ['true'], lane = 'heavy') =>
@@ -20,7 +24,7 @@ const ONLY_AT_THE_GATES = { doomedPollMs: 1_000_000, doomedFreshMs: 0, doomedCon
 // Takes a lane the way a running check would, so that the check under test has to wait for it.
 const holdLane = async (s, lane = 'heavy') => {
   const dir = join(s.deps.tmpRoot, 'lanes', lane);
-  const release = await acquire(dir, await ownerInfo({ repo: 't/r', command: 'test holder' }), { pollMs: 10 });
+  const release = atTestEnd(await acquire(dir, await ownerInfo({ repo: 't/r', command: 'test holder' }), { pollMs: 10 }));
   return { dir, release, nonce: (await readOwner(dir)).nonce };
 };
 
@@ -141,6 +145,12 @@ test('a PR merged while its steps run: the running step and what it started are 
   const second = join(dir, 'second-ran');
   // The step starts a child of its own and waits for it, as a build does.
   const s = await setup({ configText: RECHECK_CONFIG([`echo $$ > ${pidFile}; sleep 30 & echo $! > ${childFile}; wait`, `touch ${second}`]) });
+  atTestEnd(async () => {
+    // The step may not have recorded its pids yet when the test ends.
+    for (let i = 0; i < 100 && (await readPid(childFile)) === null; i++) await new Promise((r) => setTimeout(r, 25));
+    killQuietly(await readPid(pidFile));
+    killQuietly(await readPid(childFile));
+  });
   const started = Date.now();
   const run = runCheck({ cwd: s.work, deps: { ...s.deps, ...FAST } });
   await waitUntil(async () => (await readPid(pidFile)) !== null && (await readPid(childFile)) !== null, 'the step runs');

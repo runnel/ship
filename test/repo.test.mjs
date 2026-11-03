@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -6,8 +6,11 @@ import { access, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
-import { fakeGh, makeOrigin, tempDir } from './helpers.mjs';
+import { atTestEnd, fakeGh, makeOrigin, stopBackground, tempDir, tracked } from './helpers.mjs';
 import { openTree, prRefs, shipsText, syncMirror } from '../lib/repo.mjs';
+
+// However a test ends, the lock it took and the sync waiting behind it end with it.
+afterEach(stopBackground, { timeout: 30_000 });
 
 const pkg = JSON.parse(await readFile(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'));
 
@@ -51,15 +54,12 @@ test('syncMirror asks GitHub for the default branch before it takes the mirror l
   const { origin, root } = await makeOrigin({ 'a.txt': 'a' });
   const { gh, calls } = await fakeGh(root, { pr: null });
   const d = { gh, remoteUrl: () => origin, mirrorRoot: join(root, 'm'), tmpRoot: join(root, 'tmp'), pollMs: 10, out: () => {} };
-  const release = await acquire(join(root, 'tmp', 'locks', 'mirror-t__r'), await ownerInfo({ label: 'other run' }), { pollMs: 10 });
-  const pending = syncMirror({ repo: 't/r', d });
-  try {
-    const until = Date.now() + 30000;
-    while (Date.now() < until && (await calls()).length === 0) await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal((await calls()).length, 1, 'gh was asked while another run still holds the lock');
-  } finally {
-    await release(); // also when the assertion failed: the waiting sync must not poll forever
-  }
+  const release = atTestEnd(await acquire(join(root, 'tmp', 'locks', 'mirror-t__r'), await ownerInfo({ label: 'other run' }), { pollMs: 10 }));
+  const pending = tracked(syncMirror)({ repo: 't/r', d });
+  const until = Date.now() + 30000;
+  while (Date.now() < until && (await calls()).length === 0) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal((await calls()).length, 1, 'gh was asked while another run still holds the lock');
+  await release();
   assert.equal((await pending).mainBranch, 'main');
 });
 
