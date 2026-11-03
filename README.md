@@ -1,10 +1,36 @@
 # ship
 
-A local CI gate for solo developers who work on one machine: `ship check` checks a pull request
-merged with the current main branch in a fresh worktree and posts a GitHub commit status
-`local-ci`, which branch protection can require. Your checks run on your own hardware; GitHub
-Actions is left for nightly clean runs. The same gate can ship Cloudflare Workers from the main
-branch: see [Deploy](#deploy-cloudflare-workers).
+A local CI gate for solo developers: `ship check` runs your checks on your own machine and posts the GitHub commit status `local-ci` for a pull request.
+
+## Why
+
+Pull request CI is billed by the minute, and a laptop is fast and already paid for. But a green status posted on your word alone proves little.
+
+ship runs the checks itself, in a fresh worktree, on the pull request merged with current main, and only then posts `local-ci`, which branch protection can require. The config is read from main, so a pull request cannot weaken its own gate, and `ship merge` refuses a `local-ci` that a bot posted.
+
+Compare [`basecamp/gh-signoff`](https://github.com/basecamp/gh-signoff): that tool records your sign-off, ship runs the check.
+
+## Who it is for
+
+One developer, or a few working from one machine, running many pull requests. Not for a team that needs shared runners or several operating systems in the matrix. ship is young and run daily by its author.
+
+## What it looks like
+
+```
+$ ship check
+▸ acme/app PR #42 add-export @ 3f2a1b9 (vs main@52d4c19)
+▸ groups: app (heavy lane)
+… waiting for the heavy lane (2nd in line): acme/app PR #40 since 14/11, 17:21
+✓ app: npm ci (14s)
+✓ app: npm test (1m32s)
+✓ local-ci success: app · vs main@52d4c19 · 3m47s
+```
+
+When a repository configures [overflow](docs/overflow.md) and the heavy lane's line is long, a check can run on GitHub Actions or Cloudflare Workers Builds instead of waiting:
+
+```
+▸ running on GitHub instead (812 of 3000 minutes used, 1500 kept free)
+```
 
 ## Install
 
@@ -19,50 +45,25 @@ ship keeps its own bare clone of the repository under `~/.ship/mirrors` and clon
 `https://github.com/<repo>.git` over HTTPS, whatever your local remote says. For a private
 repository git needs credentials for that: run `gh auth setup-git` once.
 
-## Configure a repository
+## Minimal config
 
-Add `ship.config.mjs` at the repository root. The config is always read from the main branch,
-so a pull request cannot weaken its own gate. The one exception is the pull request that adopts
-ship, when main has no config yet: it is checked with its own, and ship says so. The other thing
-taken from the pull request's own config is a deployable's `paths` in the import containment check
-(so a pull request that widens them can pass when main already violates them); that file is
-evaluated in a child process with the same minimal environment as the check steps.
-
-The default export may be an object, or a function `({ root }) => config`. The config is evaluated
-from a temporary copy, so it cannot `import` files of the repository or its packages; read what
-you need through `root`, the path of the tree under check.
+Add `ship.config.mjs` at the repository root. ship reads it from the main branch, so the pull request that adds it is checked with its own copy.
 
 ```js
 export default {
   repo: 'acme/app',
-  mainBranch: 'main',
   docsOnly: ['*.md', 'docs/**'],        // a diff entirely inside these passes instantly
-  recheckOnMainChange: [],              // globs; see "Merge" below (default: none)
   checks: [
     {
       name: 'app',
-      lane: 'heavy',                    // 'heavy' and 'light' lanes each run one check at a time
+      lane: 'heavy',                    // one heavy check at a time on this machine
       paths: ['src/**', 'package*.json'],
-      cwd: '.',
       install: 'npm ci',
-      env: {},                          // added to a minimal environment (never your shell's)
-      timeoutMin: 30,                   // per step
-      steps: ['npm test', { run: 'npm run build', env: { PUBLIC_API_URL: 'https://example.org' } }],
+      steps: ['npm test'],
     },
   ],
 };
 ```
-
-A changed file that matches no group (and is not docs-only) runs every group, as does any change
-under `.github/` or to `ship.config.mjs`. Globs are anchored at the repository root: `*.md` is a
-root-level file only. A moved file counts as a deletion plus an addition, so both paths are
-classified.
-
-Steps run with a minimal environment: `HOME`, `PATH`, `SHELL`, `USER`, `TMPDIR` and `LANG` from
-your shell (`LC_ALL` is forced to a real locale), `CI=true`, `SHIP_CHANGED_FILES` (the changed
-paths, one per line) and the `env` of the check and the step. Nothing else your shell has exported
-reaches a step. Because `HOME` is passed, tools can still read your dotfiles, `~/.npmrc` for
-instance.
 
 Then require the status on main. This call **replaces the branch's whole protection**: read the
 current settings first (`gh api repos/acme/app/branches/main/protection`) and carry them over.
@@ -74,692 +75,28 @@ gh api -X PUT repos/acme/app/branches/main/protection --input - <<'EOF'
 EOF
 ```
 
-## Use
+All options are in [Configure a repository](docs/configuration.md).
+
+## Everyday commands
 
 ```bash
-ship check            # the PR of the current branch
+ship check            # the PR of the current branch (push first)
 ship check --pr 42
-ship check --pr 42 --github   # run it on GitHub now (see Overflow to GitHub Actions)
-ship check --pr 42 --cloudflare   # run it on Cloudflare now (see Overflow to Cloudflare Workers Builds)
 ship merge --pr 42    # merge a PR that passed, unless main changed under its check
 ship queue            # who holds each lane, who waits, and for how long
 ```
 
-Deploying Workers (`ship deploy`, `ship status`, ...) is described under [Deploy](#deploy-cloudflare-workers).
-
-`ship check` checks the pull request head that was pushed, merged with main: push first, local
-commits are not checked. Pull requests that are not open, that come from a fork, or that target a
-branch other than the default one are refused (exit 2, no status). Exit codes: 0 success, 1
-failure or error, 2 refused, stopped (see below) or a usage error, 130 interrupted.
-
-Right after a push, `gh pr view` can still answer with the previous head. ship compares its answer
-with the branch tip it has just fetched; when they differ it prints `… waiting for GitHub` and asks
-again every 2 s for up to 60 s. If GitHub never agrees, ship exits 1 with a `local-ci not run` line
-and posts no status: run it again in a minute.
-
-Every pull request is checked against a main without the other open ones, so two that add a
-migration with the same number both pass. When `migrations` is configured and the pull request
-adds a numbered migration (a file under `migrations.paths` that main does not have, named
-`<digits>_…`), ship compares its number with the files added by every other open pull request,
-whatever its base branch (up to 100 of them), and prints a
-`! migration prefix … is also added by open PR #…` line for each match. This never changes the
-verdict: a passing check stays a pass, and its status description ends with
-` · migration <prefix> also in #<n>` (the lowest number when there are several). If the open pull
-requests cannot be listed, a `! could not compare` line says so and the check goes on. Whichever of
-the two merges second renumbers.
-
-Output is one line per step; on failure the last lines of the failing step and the full log path
-under `~/.ship/logs/`. A step that outlives its `timeoutMin` is killed together with everything it
-started. Background processes a step leaves running (a build worker, a dev server) stay available to
-the later steps and are stopped when the check ends, with a line saying so. A daemon that detaches
-itself (`setsid`, `pg_ctl start`) escapes that: stop it from a `trap` in the script that starts it. Two checks of the same commit started at the same time run once. Ctrl-C stops the running
-step, marks the status as errored (never as success) and cleans up. A check that uses the heavy
-lane prints `! on battery power` right after the groups line when `pmset` (macOS only) says the Mac
-is on battery, because heavy checks time out more often there; it warns and goes on. Times in messages use the
-system time zone; `SHIP_TZ=UTC` (any IANA name) overrides it.
-
-A lane is first come, first served. A check or deploy step that wants a lane files a ticket in
-`$SHIP_TMP/lanes` and starts only when its ticket is first, so it cannot lose to a waiter that
-happens to poll at a luckier moment. Work that `ship deploy` does (its setup, deploy-time checks and
-builds) goes ahead of waiting pull request checks; whoever holds the lane is never interrupted. The
-waiting line says the place: `… waiting for the heavy lane (3rd in line): acme/app PR #12 since 17:21`
-(who holds the lane now), repeated whenever the place changes and at least once a minute. A waiter
-that is killed does not hold the others up: the next one removes the ticket of a process that is
-gone, and Ctrl-C takes the waiter's own ticket back. The tickets only decide who tries; the lane
-itself is still one lock, so two heavy builds never run at once.
-
-A check that cannot be used any more stops instead of taking, or keeping, a lane. From the moment
-it queues for a lane, and then once a minute while it waits and runs, it asks GitHub and its mirror
-whether (1) the pull request is still open and still aimed at the default branch, (2) its head is
-still the one being checked (a different head must be seen twice, a few seconds apart, because
-`gh` can answer with an older one for a while after a push), and (3) main still contains the main
-the check began against and has gained no file that matches `recheckOnMainChange`: the cases in
-which `ship merge` would refuse the result anyway. (The look uses the `recheckOnMainChange` the
-check began with; `ship merge` reads the one on main at the time.) It also looks once more when it
-wins the lane. If any of these is no longer so, it prints
-`✗ stopped checking PR #…: <reason> (no verdict posted)` and exits 2: a waiting check gives its
-place in line back, a running one has its step and everything the step started stopped, the steps
-after it do not start, and the lane and the worktree are released. Nothing is posted: the
-`pending` status it already left stays on a head, or against a main, that nobody will merge on
-this result. A main that moved in any other way does not stop a check. A look that cannot be made
-or takes more than 30 s (GitHub unreachable, a hung fetch) says nothing, and the check goes on.
-Stopping only ends work in progress: a check that has finished posts its verdict as before.
-
-`ship queue` shows the lanes on one screen, read only. For each lane it shows the holder (the pull
-request or command, how long it has held the lane, the usual run time, and how long ago its log
-was last written) and the waiters in line order with how long each has waited and when it should
-start. The usual time is the median of the latest 20 runs of that kind in that repository, and the
-90th percentile is the top of the range; both come from `~/.ship/logs/`. A deploy's log spans all
-of its turns at the lane, so a deploy's figure is for the whole deploy. With fewer than 3 runs
-there is no estimate. The estimate is the holder's time left plus the usual time of each waiter
-ahead, and assumes that no deploy work is put in front of them (a `+` marks a holder that is
-already past its usual time). A holder is marked `possibly stuck` once it has held the lane for
-more than three times the usual time, more than 1.5 times the 90th percentile, and at least five
-minutes. A holder whose process is gone is said to be; the next in line takes the lane over.
-
-Short-lived state (locks, lanes, worktrees) lives in a per-user directory created with mode 0700:
-on macOS always `/private/tmp/ship-<uid>`, whatever `$TMPDIR` says (so every session of yours shares
-one set of lanes and locks), elsewhere `ship-<uid>` under the system temp directory. Set `SHIP_TMP`
-to move it; that splits sessions that do not share the variable.
-
-### Merge
-
-A passing check says the pull request was fine against the main of that moment. When main moves
-afterwards, the verdict is usually still good, but not always: a generated file that carries a hash
-of all migrations, for instance, goes stale when another pull request adds one. `ship merge --pr
-<number>` merges only when that cannot have happened. It reads the `local-ci` status of the pull
-request's current head (it must be `success`; a head that was pushed after the check has none),
-takes the main commit the check ran against from the `vs main@<sha>` in its description, fetches
-main and compares the two. It refuses (exit 2) when that commit is no longer on main (main was
-rewritten) or the check ran against another branch. If main gained a file that matches
-`recheckOnMainChange` since then, it refuses and names the files:
-
-```
-✗ main gained db/migrations/0042_x.sql since the check (vs main@52d4c19); run ship check --pr 42 again
-```
-
-```js
-recheckOnMainChange: ['db/migrations/**'],   // in ship.config.mjs; default: none
-```
-
-The globs are read from the main branch's config, like the checks, and are relative to the
-repository root: an entry with a leading `./` or `/` or a trailing `/` could never match, so the
-config is refused (write `dir/**`). Otherwise it squash-merges with
-`gh pr merge --squash --delete-branch` (`--keep-branch` leaves the branch, which a pull request
-stacked on it needs) and prints the merge commit. The merge is pinned to the checked head
-(`--match-head-commit`), so a push made in between is refused by GitHub rather than merged
-unchecked. A docs-only verdict ran nothing that main could have made stale and is never held back.
-Two `ship merge` runs for one repository on one machine take turns, so the second fetches the main
-the first one made. If `gh pr merge` fails or gets no answer within two minutes, ship reads the pull
-request again: when it is merged after all (gh can fail after the merge, deleting the branch) the
-line says `merged … but gh reported: …`; when it is not, or its state cannot be read, the line says
-which. ship neither posts a status nor passes `--admin`: branch protection decides exactly as it
-does for `gh pr merge`. Main can still move on GitHub between ship's fetch and the merge itself
-(there is no merge queue).
-
-Exit codes: 0 merged (also when gh reported an error after the merge landed); 1 failed: GitHub
-refused the merge, the merge got no answer, or any other error (no network, a config on main that
-does not load); 2 refused by ship, or a usage error.
-
-### Overflow to GitHub Actions
-
-A repository whose config has `overflow` can send a check to GitHub Actions when the heavy lane's
-line is long, instead of waiting here. It is a way around a queue, not a second gate: the same groups
-run with the same code, and `ship check` on this machine stays the only thing that posts `local-ci`. A
-repository that also has [`overflow.cloudflare`](#overflow-to-cloudflare-workers-builds) tries that first;
-the rules below apply when it does not take the check.
-
-```js
-overflow: {
-  workflow: 'ship-check.yml',  // in .github/workflows on main; start from examples/ship-check.yml
-  includedMinutes: 3000,       // what the account's plan includes per month
-  reservePerDay: 60,           // kept free per day left in the month, for everything else on Actions
-  reserveFloor: 300,           // kept free on top of that
-  minAhead: 4,                 // waiters ahead of a check before it goes (default 4)
-  maxRunning: 2,               // runs at once, on this machine (default 2)
-  runMinutes: 20,              // what a run counts as until the usage report shows it; set it to what a run takes (default 20)
-  timeoutMin: 40,              // ship gives a run up after this long (default 40)
-  groups: ['app', 'workers'],  // only checks made of these groups go (default: any)
-},
-```
-
-**When a check goes.** Only a check in the heavy lane, never a deploy, and only when main's own config
-says so. It goes when `minAhead` waiters are ahead of it and a place is free. The line is looked at
-when the check arrives and once a minute while it waits, so a place that comes free does not stay
-empty. `ship check --github` goes without looking at the line, to measure a run; every other rule
-holds. A check goes at most once.
-
-**The reserve.** The minutes are shared with everything else the account runs on Actions, and if they
-run out, that stops too. So a run starts only if
-`includedMinutes - used - runMinutes x (recent runs + this one) >= reserveFloor + reservePerDay x days left`.
-`used` comes from the account's usage report for the current UTC month. Recent runs are those decided
-on this machine in the last 24 hours, counted again on top of the report because it may not show them
-yet (`~/.ship/overflow/runs.jsonl`). Two checks at once take turns at this, so they cannot both spend
-the last room. If the report cannot be read or has no Actions row, or that
-file cannot be read, the check stays here. The reason is printed as a `· stays on this machine` line.
-ship never reads or changes a budget. To stop all overflow at once: `gh workflow disable ship-check.yml`.
-
-**What runs.** ship starts the workflow from `main`, never from the pull request's branch, so a pull
-request cannot change what judges it. The workflow merges main into the head and fails unless that
-gives the tree ship got from the same merge here, then runs `ship run-groups`, which takes the groups
-from `ship.config.mjs` on main. Its token can only read. Copy `examples/ship-check.yml`; it may need
-more for your groups (a database, say).
-
-**The verdict.** Only green is taken from GitHub: when the run that ship started, from that workflow on
-main, ends in success, ship posts `local-ci` with `· on GitHub` in the description and a link to the
-run. Anything else (a red run, a cancelled one, one that is not started after 5 minutes or has no result
-after `timeoutMin`, GitHub not answering, a failed start) sends the check back to its old place in
-line, with a `! … back in line on this machine` line, and this machine gives the verdict. A red on
-GitHub may be GitHub's, so it never reads as a red check. Ctrl-C cancels the run, and so does a pull
-request that moves on while it runs, like any check whose result can no longer be used. `ship queue`
-lists the running ones as `on GitHub:` with a link to the run.
-
-`ship merge` refuses a `local-ci` posted by a bot: a workflow's token can post a status, and only
-`ship check` may.
-
-### Overflow to Cloudflare Workers Builds
-
-A repository whose config has `overflow.cloudflare` can also send a check to Cloudflare Workers Builds when
-the heavy lane's line is long. It is tried before GitHub Actions and is otherwise the same kind of thing:
-a way around a queue, not a second gate. The same groups run with the same code, and `ship check` on this
-machine stays the only thing that posts `local-ci`. ship needs no Cloudflare credential for it: it only
-pushes with `git` and reads with `gh`.
-
-```js
-overflow: {
-  // ...the GitHub keys above, which stay required
-  cloudflare: {
-    repo: 'acme/app-runner',                  // a private runner repository, not this one; its branch is force-pushed
-    branch: 'run',
-    checkName: 'Workers Builds: app-runner',  // the check run the build leaves: Workers Builds: <worker name>
-    minAhead: 2,                              // waiters ahead of a check before it goes (default 2)
-    maxRunning: 4,                            // builds at once, on this machine (default 2)
-    timeoutMin: 25,                           // ship gives a build up after this long (default 25)
-    groups: ['app', 'migrations'],            // only checks made of these groups go (default: any)
-    setup: 'scripts/remote-setup.sh',         // optional: main's copy of this file runs first, for what the groups need
-    env: { app: { SOME_VAR: '{root}/scripts/x.cjs' } },  // optional: added to a group's steps; {root} is the checkout in the build
-  },
-},
-```
-
-**Setting it up.**
-
-1. Create a private repository for the runner (`acme/app-runner`) and turn Actions off in it.
-2. Create a Worker in Cloudflare and connect it to that repository: production branch `run`, build command
-   `bash .ship-run/run.sh`, deploy command `true`, build variables `SKIP_DEPENDENCY_INSTALL=1` and
-   `NODE_VERSION=24` (the image installs the Node that variable names; ship needs 24 or newer, and the
-   build refuses an older one; a `setup` script may bring its own instead). The Worker never serves
-   anything. The check run is named `Workers Builds: <worker name>`.
-3. Give the Cloudflare GitHub App that one repository only.
-4. **Narrow the build token by hand.** The build step can read `CLOUDFLARE_API_TOKEN`, and so can the code
-   under check. Replace the token Cloudflare makes with one that has Account Settings, Workers Scripts,
-   Memberships and User Details, all read: that is accepted. Three of them without Workers Scripts is
-   refused when the connection is set up, with a misleading "user who has left your organization".
-5. Add `cloudflare` to `overflow` in the config on main. To turn it off, remove it there; a build that has
-   been pushed runs on.
-
-**When a check goes.** Only a check in the heavy lane, never a deploy, and only when main's own config says
-so. Cloudflare is tried first: a check goes when `minAhead` waiters are ahead of it, `groups` takes every
-group of the check, and a place is free. The places are its own (`cloudflare-0` ...: `maxRunning` of them),
-so they never take GitHub's. Otherwise the GitHub rules apply exactly as before, with its reserve untouched.
-The line is looked at when the check arrives and once a minute while it waits. `ship check --cloudflare`
-goes without looking at the line (`--github` and `--cloudflare` together are refused); every other rule
-holds. A check goes at most once, to one of the two: after anything but green from either it is back in
-line here. There is no counter or budget for Cloudflare: ship cannot read its usage.
-
-**What runs.** ship makes a commit and force-pushes it to `branch`. Its tree is the merged tree ship has
-just made (the head merged with main), with a `.ship-run/` directory laid over it, written by this machine
-from main: `run.sh` (a constant that comes with ship), `config.mjs` (`ship.config.mjs` as it is on main),
-`groups`, `changed-files`, `ship-sha`, `env.json`, `nonce` (a random value nobody reads: checking the same
-tree again still changes a file, which Workers Builds' watch paths could otherwise take as nothing to build)
-and `setup.sh` (the `setup` file as it is on main, when configured). Anything the pull request has under
-`.ship-run/` is dropped, so a pull request cannot change what judges it. The parent of the commit is the
-branch's last tip, fetched first so that a push sends only what is new (the mirror keeps the last commit it
-pushed under `refs/ship/cloudflare/tip/<branch>`, so that git does not prune the chain and the next fetch
-does not bring it again); the repository's own history is never pushed. Two checks at once push two
-commits, and both are built.
-
-Workers Builds clones that one commit and runs `bash .ship-run/run.sh`, from the checkout root. The script
-first checks that the checkout is the commit the build was started for (`WORKERS_CI_COMMIT_SHA`, which
-must be set): a build that a later push superseded may clone that push, and must not give its result to a
-commit it did not check. It sets `LC_ALL=C.UTF-8` where there is no `en_US.UTF-8` locale. If there is a
-`setup.sh` it runs it in a subshell under `set -euo pipefail`, with `SHIP_GROUPS` set; only its `PATH` comes
-out (to install a Node version, say), and only if it ran to its end: a script that fails, uses a variable
-it never set, or calls `exit` (even `exit 0`) fails the build with exit 2, and nothing else it sets, such as
-`groups`, a trap or a function named `node`, reaches the rest. The `node` on `PATH` after that must be 24 or
-newer and outside the checkout, or the build fails with exit 2. Then it downloads ship at `ship-sha`, runs
-`ship run-groups --config … --files … --env …` and prints the tail of the log if that fails. The machine
-has no `sudo` and no history: steps that need either must fit that, or get what they need from `setup`. The
-`.ship-run/` files are part of the commit, so `git status` is clean while the groups run. A secret in `env`
-is a secret in the runner repository: keep them out.
-
-**The verdict.** Only green is taken from Cloudflare: a check run on the commit ship pushed, made by the
-GitHub App `cloudflare-workers-and-pages`, named `checkName`, completed with `success`. Another app's check
-run, another name, another commit, `neutral` or one that is still going: none of them counts, and a
-completed run of the build that is not a success on that commit makes it red even beside a success. Only a
-completed run is read: while the build is queued or running there may be no check run or one that is
-`in_progress`, and ship keeps waiting, up to `timeoutMin` (a build is stopped by Cloudflare after 20
-minutes; the rest is for the queue). Green posts `local-ci` with `· on Cloudflare` in the description and a link to the check
-run, from this machine, with your login. Anything else (a red build, no result in time, a push that failed, `gh`
-not answering) sends the check back to its old place in line with a `! … back in line on this machine` line,
-and this machine gives the verdict: a red may be Cloudflare's, so it never reads as a red check. Ctrl-C and a
-pull request that moves on end the wait, but the build cannot be cancelled without a Cloudflare credential,
-which ship does not have: it runs on and its result is ignored. `ship queue` lists the running ones as
-`on Cloudflare:` with a link to the commit. `ship merge` reads the status like any other.
-
-**What it costs and exposes.** The code of every pull request that goes is copied to the runner repository
-and to Cloudflare's machines. The GitHub token the clone has can read the runner repository and cannot write
-it. Builds beyond what the Cloudflare plan includes are billed automatically, with nothing to stop them.
-
-## Leak guard (for this repository)
-
-`ship leak --staged | --msg <file> | --pre-push [remote] | --all | --history [--generic-only]` scans for
-shapes that must not be published, including commit author and committer identities. For the
-commits GitHub creates itself (a squash or merge commit from the web UI or `gh pr merge`), GitHub
-fills the author line from the account. When the committer is `GitHub <noreply@github.com>` and the
-author address is a `users.noreply.github.com` one, that author line (name and noreply address) is
-not matched against the denylist; the rest of the commit, and the generic rules on that line, apply
-as usual. Both identity lines are self-asserted, so this is a narrow exemption, not proof of
-origin. Besides messages and patches it reads, whole and as stored, the files in which a merge
-commit differs from every parent, and it reads annotated tags and any blob or tree that a ref or a
-tag names. Replace refs and grafts are ignored, and so is the config that would change what
-`git log` prints (quoted file names, diff prefixes, textconv, `diff.relative`, `log.showRoot`, output
-encoding). `--all` and `--history` leave `refs/stash` alone: a push sends it only when named. It
-fails closed: a git error, a binary file it cannot scan, a commit message stored in an encoding
-other than UTF-8, or a `git log` that does not split into exactly the commits `git rev-list` names
-is a finding, not a pass. Enable with
-`git config core.hooksPath .githooks` and create `~/.config/ship/denylist`. Pull requests are
-judged by main's copy of the guard.
-
-## Deploy (Cloudflare Workers)
-
-`ship deploy` deploys what changed on the main branch since it went live — per deployable, in
-dependency order, from a fresh worktree of the main branch, on your machine.
-
-| Command | What it does | Allowlist for an agent |
-|---|---|---|
-| `ship deploy [<name>…] [--dry-run]` | Deploy every deployable (or the named ones) whose files changed since its live commit. `--dry-run` runs the gates, setup, checks, builds and `preDeploy` steps, uploads nothing, and exits 0 when all of that passed, and then its last line says that nothing was uploaded (with nothing pending, the usual "live" line prints instead). | yes |
-| `ship deploy --redeploy <name>…` | Deploy the named deployables even when nothing changed (same code again). The names are required. | yes |
-| `ship status` | Per deployable: live commit, pending commits, holds, an undeployed newest version; migrations not cleared. Read-only. | yes |
-| `ship adopt --plan` | Read-only: per Worker, the main commit at the time its live code was uploaded, and the adopt commands for it. Skips Workers whose live commit is already known, in the repository and on main, and never guesses for a version made by `wrangler versions secret put`. | no |
-| `ship adopt --at <sha> (<name>… \| --all)` | Record that each Worker's current version was built from `<sha>` (7–40 hex digits, a commit on main): a new Cloudflare deployment of that version at 100%, annotated `sha:<sha> adopt`. A split deployment is refused, and so is a `<sha>` that would hide pending commits of a Worker whose live commit is known. Also records every migration file present at `<sha>` as cleared. See [Adopting](#adopting). | no |
-| `ship rollback <name>` | Show what a rollback would do and print the command for it. Read-only. | no |
-| `ship rollback <name> --to <version> [--revert-secrets]` | Set a hold, promote an earlier version (its id: at least 6 hex digits, the first 8 are enough; any version among the last 200 whose commit is known) and probe it. `--revert-secrets` sends the deployment with `?force=true`, so the rollback also undoes secret changes made since that version; without it Cloudflare refuses (error 10220). See [Rollbacks](#rollbacks). | no |
-| `ship unhold <name>` | Clear a hold. It works from the state directory alone (offline), so it cannot know the config's names: a name without a hold is reported as "no hold" (with the names that are held) and exits 0. | no |
-| `ship migrations plan <file>` | Read the declared post-conditions from the database and run the file and them inside a transaction that is always rolled back; print the plan. Changes nothing, needs no terminal. A dry run holds the file's real locks on the database for its duration (capped at 5 s waiting, 120 s running). See [Applying migrations](#applying-migrations). | yes |
-| `ship migrations apply <file>` | Show the plan, wait for a typed answer, apply the file as merged on main, check its declared post-conditions in the database, and only then clear it for deploy, recording who applied it. Refuses without a terminal. See [Applying migrations](#applying-migrations). | no |
-| `ship migrations ack <file>…` | Mark migration files on main as cleared for deploy, without applying or checking anything (a file that goes after the deploy, or one applied some other way). A file may be named as a repository path, a path from the current directory, a path from another checkout, or a bare file name; see [Clearing migrations](#clearing-migrations). | no |
-
-The commands that are not allowlisted are the owner's: the permission prompt is the confirmation.
-ship asks interactively in one place only: `ship migrations apply` waits for a
-typed answer, and refuses to run when standard input or output is not a terminal. Every usage error (an unknown flag, an extra or missing
-argument, a malformed value such as `--at zz`, `--redeploy` without names, an unknown deployable) prints
-`✗ ship <command>: <what is wrong>` on stderr and the command's usage line on stdout, and exits 2.
-A refusal that needs the repository (a commit that is not on main, a version that does not exist)
-says so in its own words and also exits 2.
-
-### Configuration
-
-```js
-export default {
-  repo: 'acme/app',
-  checks: [
-    { name: 'db', lane: 'light', onDeploy: true, paths: ['db/**'], steps: ['bash scripts/replay.sh'] },
-  ],
-  deploySetup: [{ run: 'npm ci', cwd: 'web' }],   // once per deploy, before the onDeploy checks
-  deployables: [
-    {
-      name: 'web', worker: 'example-app', cwd: 'web', paths: ['web/**'], ignore: ['web/docs/**'],
-      mode: 'versioned',                        // upload → preview probes → promote
-      build: 'npm run build', env: { NODE_OPTIONS: '--max-old-space-size=4096' },
-      envFiles: [{ from: '/abs/path/to/.env.production', to: 'web/.env.production' }],
-      bundleCheck: { file: 'dist/worker.js', pattern: 'https://[a-z0-9]+\\.example\\.com', allow: ['https://api.example.com'] },
-      probes: [{ path: '/health', status: 200 }, { path: '/admin', status: 401 }],
-      liveHost: 'https://app.example.com', warmup: ['/'],
-      liveMarker: { path: '/', file: 'dist/BUILD_ID' },
-    },
-    {
-      name: 'cron', worker: 'example-cron', cwd: 'workers/cron', paths: ['workers/cron/**'],
-      mode: 'direct',                           // wrangler deploy: cron triggers, routes, Durable Objects
-      wrangler: 'web/node_modules/.bin/wrangler',
-      probes: [{ path: '/', status: 403 }], liveHost: 'https://example-cron.example.workers.dev',
-      after: ['web'],
-    },
-  ],
-  migrations: { paths: ['db/migrations/*.sql'],
-                apply: { adapter: 'supabase', project: 'abcdefghijklmnopqrst', label: 'production' } }, // optional
-  requires: [{ repo: 'acme/api', deployable: 'api' }], // must be live at its main branch first
-  credentials: { file: '/abs/path/to/credentials.env',
-                 map: { CLOUDFLARE_API_TOKEN: 'CF_TOKEN', CLOUDFLARE_ACCOUNT_ID: 'CF_ACCOUNT' } },
-};
-```
-
-Deployable keys (defaults in brackets): `name`, `worker` (the Cloudflare script name; the `name` in
-the wrangler config must be the same, or the deploy is refused before it builds), `mode`
-(`versioned` | `direct`), `paths`, `cwd` [`.`], `ignore` [none], `install`, `build`, `env`,
-`envFiles` (copied in after `install` and before `build`, removed after it), `bundleCheck` (at least
-one match, every match allowed), `wrangler` [`<cwd>/node_modules/.bin/wrangler`, relative to the
-repository root — must be the repo's locked copy], `wranglerConfig` [wrangler.json, wrangler.jsonc or
-wrangler.toml in `cwd`], `preDeploy`, `probes` (required for `versioned`; each `{ path, status,
-method, followRedirects }`, method `GET` [default], `HEAD` or `POST`, redirects not followed unless
-`followRedirects`), `liveHost` (`https://host`, required whenever there are `probes`, checked
-whenever present), `warmup`, `liveMarker` (versioned only; `file` is read right after the build and
-must not be empty), `after`, `timeoutMin` [30], `uploadTimeoutMin` [10]. A `direct` deployable without `probes` gets no live
-probes, only the check that its new version is the current one. A deployable's relative imports must
-stay inside its `paths` and must not reach a file its `ignore` or the repo's `docsOnly` lists (a
-change there would never make it pending): `ship check` and `ship deploy` both enforce it, so a
-change to an imported file is never missed.
-
-`migrations.apply` is optional and turns on `ship migrations apply`: `adapter` (`supabase`, the only
-one), `project` (the project reference), `label` [none; shown in the plan and the prompt],
-`tokenKey` [`SUPABASE_ACCESS_TOKEN`, the key to read from `credentials.file`] and `dryRun` [true].
-The token is read from `credentials.file` only when a migration is planned or applied, by that one
-key. A config that also lists it in `credentials.map` (which would hand it to every deploy step) is
-refused. `ship.config.mjs` is read from main, so a
-pull request cannot point the command at another database.
-
-`credentials.file` is parsed (`KEY=value` lines), never sourced. `map` names the environment
-variables wrangler reads (`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are required) and the
-file keys they come from; only those reach wrangler, and no build or check step of ship sees them.
-A `[build] command` in a wrangler config runs inside `wrangler deploy` (or `versions upload`), so it
-does see them. `requires` loads the other repository's `ship.config.mjs` from its main branch and
-evaluates it in ship's own process: list only repositories you trust.
-
-A config of the wrong shape (a `probes` or `preDeploy` that is not an array, a `checks` entry that
-is not an object, a malformed `liveHost`) is refused with a message naming the key, not a crash.
-Unknown keys are refused at every level of the file, not only at the top: in a check and its
-`{ run, env }` steps, a deployable, a probe, a `deploySetup` or `preDeploy` step (`run`, `env`,
-`cwd`), an `envFiles` entry (`from`, `to`), `bundleCheck` (`file`, `pattern`, `allow`), `liveMarker`
-(`path`, `file`), `migrations` (`paths`, `apply`; and inside `apply`: `adapter`, `project`, `label`, `tokenKey`, `dryRun`), a `requires` entry (`repo`, `deployable`) and `credentials`
-(`file`, `map`). `liveHost` is checked whenever it is present, also on a deployable without `probes`.
-
-### The live commit
-
-Every version and deployment ship makes carries the message `sha:<40 hex> …`, sha first
-(Cloudflare cuts messages at 1,000 characters; `wrangler deploy` keeps 50 on the deployment). The
-live commit is read from the current deployment: its own message, else the code of its version (a
-deployment stamp of that version, the version's message, or — for a version Cloudflare made when a
-secret was changed with `wrangler secret put` — the version before it). A split deployment, a
-version made outside ship (including `wrangler versions secret put`, which copies the newest
-version whether or not it is deployed) or history beyond the last 50 deployments / 200 versions is
-**live unknown**: that deployable (and what comes after it) is not deployed until `ship adopt`.
-
-### Adopting
-
-`ship adopt --plan` suggests, per Worker, the main commit at the time its live code was uploaded
-(adopting it makes every later commit that touches the deployable pending). `ship adopt --at <sha>`
-stamps the current version as built from `<sha>`. A `<sha>` later than the code that is really live
-hides the commits in between from `ship deploy`; for a Worker whose live commit is already known
-that is refused (exit 1, the commits named, the migrations not recorded), while the same commit or an
-older one is fine.
-
-### What `ship deploy` does
-
-1. Takes the repo's deploy lock (a second deploy joins it or waits, see [One deploy at a
-   time](#one-deploy-at-a-time-and-a-fresh-main)), fetches the main branch, opens a fresh worktree
-   at its tip and loads `ship.config.mjs` from it.
-2. Per deployable: holds, import containment, the live commit (must be an ancestor of main), and
-   whether any of its files changed since (minus `ignore` and `docsOnly`). Nothing pending: done.
-   A pending deployable whose live commit is known gets `· ships 3 commit(s): #41 #43 + 1 without a
-   PR number` at the end of its plan line (a number is read from a trailing `(#n)` in the commit
-   subject). A first deploy, and a `--redeploy` of code with no new commits, show none. The lines are
-   printed before the migration gate, setup, checks and builds, so a deploy says what it will ship
-   before it runs anything.
-3. Migration files on main that are not cleared → stop. `requires` not live → stop.
-4. `deploySetup`, which waits for the heavy lane: when the slot arrives the deploy reads main
-   again and may move to it (below), and prints `▸ building main@<sha> · ships …`, the final list
-   of what it builds. Then every `onDeploy` check group; red → stop.
-5. Each pending deployable, dependencies first. Both modes refuse, before building, a wrangler
-   config whose `name` is not the deployable's `worker`. `versioned`: refuses when a setting only
-   `wrangler deploy` applies differs (crons, routes, workers.dev and preview URLs, Durable Object
-   migrations, observability, logpush, tail consumers); builds; `wrangler versions upload`; probes
-   the preview URL; checks that live has not moved and that the newest version is ours; promotes.
-   `direct`: builds; checks that live has not moved; `wrangler deploy`. Both: the current version
-   must be ours, live probes (a probe that gets no answer reports the error and its cause, such as
-   `fetch failed (ECONNREFUSED)`), then (versioned, with a `liveMarker`) a check that the live host
-   serves this build — a warning only. Right after the promote Cloudflare's deployment list can
-   still show the version that was live before, or none; while it does, ship reads it again for up
-   to 30 s. Any other version is somebody else's deploy and sets a hold at once, and so does a
-   deployment that splits traffic between versions (even with ours among them) and a version that
-   is still not ours when the 30 s are over. The first deploy of a versioned deployable
-   is the owner's: the Worker must exist and its preview URLs must be on.
-6. A failing live probe sets a hold and, when it can, rolls back to the previous version (see
-   [Rollbacks](#rollbacks)). A deployable that fails or is held stops the deployables that come
-   `after` it; the others go on. Naming a deployable whose `after` dependency has pending changes
-   skips it too, unless the dependency is named as well.
-
-### One deploy at a time, and a fresh main
-
-Sessions that merge a pull request each run `ship deploy`, and each build takes the machine's
-heavy slot. So deploys of one repository collapse into one:
-
-- **A late caller joins.** A `ship deploy` that finds another one of the same repository that has
-  not yet fixed what it ships (it is waiting for the deploy lock, or for its slot) does not wait
-  for the lock to deploy what is left. It prints `↪ …: a deploy started at 17:21 (pid 4711) has not
-  begun building; this one joins it, with the same result`, then the other deploy's output, line
-  for line, and exits with its status. It joins only a deploy that was asked for the same
-  deployables and the same `--redeploy`; a `--dry-run` neither joins nor is joined. If the deploy it
-  joined ends before it began building (it stopped at a migration, found nothing pending, was
-  interrupted), the caller says so and deploys for itself.
-- **Once the deploy has its slot, main is read again.** What a deploy ships is decided when it gets
-  the heavy lane for its setup: waiting for that lane can take a long time, and main goes on
-  meanwhile. From that moment no one joins it; a `ship deploy` that arrives later waits for the
-  lock and deploys what is still pending, as before. The deploy then fetches main. If it moved
-  and the new head is safe, the deploy moves to it: it prints `↻ main moved while the deploy
-  waited: 9607018 → 3f2a1b9 (5 new commit(s))`, makes its plan again (the plan lines of the
-  later head follow, the earlier ones stay above) and builds the later head, setup and deploy-time
-  checks included. The `sha:` annotation names the commit that was built. A move is **not** made,
-  and the deploy goes on with the head it planned, saying why, when:
-  - the new commits bring a migration file that is not cleared (a deploy never goes past one:
-    the owner clears it and the next `ship deploy` carries it);
-  - main is not a descendant of the planned head (it was rewritten), or the later head's tree or
-    config cannot be opened;
-  - a deployable that would run on the planned head would be held, blocked or skipped on the later
-    one (an import outside its paths, say), or a deployable name is unknown there;
-  - the later head's config `requires` something the planned one did not, and that is not live.
-  When the deploy keeps its head although main moved, or cannot read main (the read and the
-  judging are given 90 s each, because they run while the deploy holds the heavy lane), it does not
-  answer for the callers that joined it: they deploy for themselves, which gives each of them its
-  own verdict. The same goes for a joined deploy that is interrupted or vanishes.
-  A `requires` the planned head already passed is not asked again. A hold written while the deploy
-  waited stops that deployable whether or not main moved. The heavy lane is taken again for each
-  build, so main is not read a second time: pull requests merged after the deploy has its slot go
-  with the next deploy. A repository without a `deploySetup` has no slot to wait for before the
-  first build, so its deploy reads main again right after it has planned, and does not wait for
-  anything before that.
-
-### Clearing migrations
-
-`ship deploy` stops while main has migration files (those matching `migrations.paths`) that are
-not cleared; `ship migrations ack <file>…` clears them. A migration that is not merged yet cannot be
-cleared. Each argument is tried in this order, and the first rule that finds exactly one file wins:
-
-1. a repository path (`db/migrations/0042_add_users.sql`; a leading `./` is dropped);
-2. a path from the current directory, relative or absolute, inside this checkout;
-3. an absolute path into another checkout or worktree of the same repository: the repository path
-   it ends with is used;
-4. a bare file name (`0042_add_users.sql`).
-
-A rule that finds several files makes the argument ambiguous: ship does not try the next rule, and
-prints the candidate paths so that you can give one. A miss prints the repository, branch and commit
-it looked at and the globs it searched, and says that a migration that is not merged yet cannot be
-cleared. Either way ship exits 2 and records nothing, not even the arguments before the failing one.
-
-### Applying migrations
-
-`ship migrations ack` is the owner's word that a file may be deployed past; it checks nothing, so an
-acked file can be missing from the database. `ship migrations apply <file>` replaces the word with a
-proof, for a repository with `migrations.apply`. It reads the file as merged on main (the bytes that
-are hashed, shown, dry-run and applied are those of one commit) and then:
-
-1. refuses unless standard input and output are a terminal, before it reads or sends anything;
-2. reads each declared post-condition from the database, one request each, in a read-only
-   transaction that is always abandoned. Any condition that cannot be read stops the run: a probe
-   that did not answer is not "does not hold";
-3. if every post-condition already holds, the SQL is **not** run. Ship tells two cases apart. If it
-   sent this exact file before and never recorded a result (a lost answer), the owner types `yes`
-   and the proof is recorded as `applied`. Otherwise it cannot say who made the conditions hold, so
-   it shows the SQL, warns, asks the owner to type `record`, and records `verified` instead;
-4. otherwise runs the file and the conditions as a dry run (below); a file that fails, or whose
-   post-conditions do not hold at its end, stops here. The dry run is skipped, and the plan says
-   why, for a file with `CONCURRENTLY`, `VACUUM`, `ALTER SYSTEM` or `CREATE DATABASE` (they cannot
-   run in a transaction) and for one with effects that outlive a rollback: `setval`, a
-   session-level advisory lock, `dblink`, `pg_terminate_backend`, or its own `lock_timeout` /
-   `statement_timeout` (a lone `SET` of those is simply dropped from the dry run). `nextval` leaves
-   a gap in a sequence, which is harmless;
-5. prints the plan (commit, file, size and hash, project, post-conditions with their state now,
-   earlier migrations not yet cleared, the SQL) and waits. The typed word goes on (`yes`; `apply
-   again` when an earlier send of this file has no recorded result), `v` shows all of the SQL,
-   anything else cancels;
-6. takes the repository's deploy lock (only now, so an open prompt blocks nobody), reads the
-   database and the attempts again and cancels if anything differs from the plan (a second terminal
-   that sent the file meanwhile included), writes an *attempt* line with an id, and sends the file
-   as one request;
-7. reads the database again: the post-conditions, not the answer to the apply, decide. All hold: the
-   file is cleared for deploy and the ledger line records `applied`, who (`user@host`), when, the
-   file's sha256, main's commit and the number of post-conditions; the attempt is settled. One
-   fails: the failed ones are named and nothing is cleared.
-
-What the outcome of the request means:
-
-- **Postgres refused it** (an HTTP error carrying the database's own error), for a file that is one
-  transaction and was dry-run: nothing committed, the attempt is settled, and re-running is safe.
-  If every condition holds anyway, ship does not record: someone else changed the database, or the
-  file commits part of itself. A file that is **not** one transaction (several `begin;`/`commit;`
-  blocks, `savepoint`, `CONCURRENTLY`, or no dry run) may have committed part of itself: the plan
-  says so, a refusal keeps the attempt open and is never called safe.
-- **Never sent** (no address, connection refused, a certificate that is not accepted): the attempt
-  is settled and nothing is open.
-- **No answer** (a timeout, a gateway error, Ctrl-C): the statement may still be running or may yet
-  commit, so ship never says a re-run is safe. The attempt stays open; the next run warns about it,
-  and applying that file again needs the typed answer `apply again`. If the conditions hold when
-  the database is read, the file is recorded as `applied` (the attempt is the evidence).
-- **Answered, but a condition fails**: committed and not cleared; the attempt stays open.
-
-The dry run sends `begin;` and then runs the file as a string (`execute`) inside a `DO` block that
-ends with an exception carrying the post-condition answers, so nothing can commit. A COMMIT,
-ROLLBACK or END inside the file does not end the transaction: Postgres refuses it, the dry run
-fails and says why. The file's own lone `begin;`/`commit;` lines and its `notify pgrst` are dropped.
-The dry run takes the file's real locks while it runs, which is why `lock_timeout` (5 s) and
-`statement_timeout` (120 s) are set for it.
-
-`ship status` tells the clearances apart (`proof: N applied and proven by ship, M found in place and
-recorded, K acked only`, and the newest of each); `ship deploy` treats every kind as cleared. A file
-already proven is not touched again, and if the file on main has changed since, ship says so. Keep
-`ack` for a file that goes after the deploy.
-
-**Post-conditions** are declared in the migration as comment lines, or one per line in a
-`<name>.verify` file beside it (the `--` is optional there). A file that declares none cannot be
-applied by ship. Names are lower-case and schema-qualified. A trailing `-- note` is ignored on every
-form but `sql`.
-
-```sql
--- ship:verify table public.things
--- ship:verify column public.things.owner_id
--- ship:verify function public.record_scan(uuid, text)
--- ship:verify rls public.things
--- ship:verify no-access anon,authenticated public.things
--- ship:verify no-execute anon public.record_scan(uuid, text)
--- ship:verify access service_role select,insert public.things
--- ship:verify execute service_role public.record_scan(uuid, text)
--- ship:verify absent table public.old_things
--- ship:verify sql (select count(*) from public.things) = 0
-```
-
-`table` means a relation (a table or a view) exists; `rls` that row level security is enabled;
-`no-access` that none of the roles holds any privilege on the relation or on any of its columns;
-`absent` also takes `column` and `function`. Each form becomes one boolean; an object that does not
-exist reads as "does not hold". A `sql` condition is a single balanced expression (no `;`, `$` or
-comments) and runs read-only: a condition that tries to write fails instead of persisting.
-
-`ship migrations plan` stops after step 4 and prints the plan: no terminal needed, nothing applied
-or recorded, so a session can check a migration and its declarations before asking the owner to
-apply it. Without a terminal only the first line of a Postgres error is printed, since later lines
-can quote row data.
-
-What the terminal check does and does not do: it stops a script that merely runs the command or
-pipes an answer into it. It does **not** stop a process that allocates a pseudo-terminal of its own
-(`script`, `expect`, a language's `pty` module) or one that is handed the owner's keystrokes; to
-those it is only a speed bump. The boundary is the permission rule: allow `ship migrations plan` for
-agents, never `ship migrations apply`. The ledger is a file in ship's state directory on this
-machine, next to the acks (attempts are in a sibling file, and clear nothing), not a table in the
-database.
-
-### Holds
-
-A hold stops `ship deploy` from touching a deployable, and everything that comes `after` it, until
-the owner runs `ship unhold <name>`. Something sets one when it cannot say the Worker is in a good
-state: a failing live probe (the hold comes first, whether or not a rollback follows), `ship
-rollback --to`, an interrupt after the promote, a current version that is not ours after the promote
-(and its 30 s settle window), an error after the promote, and `wrangler deploy` failing after our
-code went live. `ship status` lists them.
-
-`ship deploy` also writes a hold just before it promotes and removes it once the live probes have
-passed, so a ship that is killed outright in between (`kill -9`, out of memory, power loss) leaves
-"deploy of <sha> in progress … the result was never verified" behind instead of a version that the
-next run would take for verified. Look at the Worker, then `ship unhold <name>`. A deploy that fails
-before anything changed on the Worker leaves no hold, and if the hold cannot be written the deploy
-does not promote.
-
-### Rollbacks
-
-When the live probes fail after a promote, ship sets the hold first, so that nothing else deploys
-over the Worker. It then rolls back, in both modes, only when all of this is true; the rollback is a
-new deployment of the version that was live before:
-
-- that version is known: the deployable's live commit was known before this deploy (with none,
-  there is nothing to go back to);
-- no Durable Object migration differs between that commit and this one (Cloudflare refuses a
-  rollback past one);
-- the version that is live, read again just before the rollback, is still ours alone: ship never
-  promotes over somebody else's deploy (a deployment that splits traffic between versions is one,
-  even with ours among them), and does not roll back when it cannot read which version is live;
-- Cloudflare accepts the deployment. A refusal leaves our version live; for error 10220 (a secret
-  changed since that version was live) the owner decides between
-  `ship rollback <name> --to <version> --revert-secrets` and a fix forward.
-
-In every other case the deploy ends stuck: the hold is all there is, and the output says why nothing
-was rolled back. After a rollback ship probes again, reports the result and names any settings a
-rollback does not restore (crons, routes, ...); the hold stays set either way, until `ship unhold`.
-
-A rollback request that gets no answer (a network error, a timeout, a 5xx) may still have been
-applied, so ship reads the deployment again, with the same settle window as after a promote: while
-the deployment list still shows the version that was live before the request (ours), or none, ship
-reads it again for up to 30 s. If the previous version is live at 100 %, the rollback counts as
-done and is reported as rolled back, with a note that its answer was lost. If ours is still live
-when the 30 s are over, another version is, the deployment splits traffic between versions (either
-ends the wait at once; a split is not the rollback, even with the previous version among them), or
-the deployment cannot be read, the deploy ends stuck and the output says which.
-
-`ship rollback <name> --to <version>` sets the hold first too. A refusal from Cloudflare changed
-nothing, and the hold goes back to what it was. When the request gets no answer, ship reads which
-version is live, through the same 30 s settle window (it says so, and re-reads while the list
-still names the version it named before the request, the split it showed, or none): the target at
-100 % means the rollback took effect, and it is reported as done and probed like any other. Anything
-else is reported as an unknown outcome that names the version that is live (or says that the current
-deployment splits traffic between versions, even with the target among them, or that it could not
-be read), and the hold stays: look with `ship status`.
-
-### When a versioned deploy refuses
-
-A versioned deploy uploads a version and promotes it; it never applies the settings that only
-`wrangler deploy` applies, and it refuses when they differ instead of leaving them silently stale:
-`triggers.crons`, `workers_dev` and `preview_urls` against the Worker's actual state, and `routes`,
-Durable Object migrations, `logpush`, tail consumers and `observability` against the live commit's
-config. The owner applies such a change once, outside ship, and then `ship deploy` carries on. For
-the state keys: `wrangler triggers deploy` in the deployable's directory. For the config keys:
-`wrangler deploy --message "sha:<full main sha> <name> owner"` from a clean checkout of main, after
-running the repository's `deploySetup` and the deployable's `install` and `build` there as ship would
-(wrangler deploys what has been built, with the `envFiles` in place for the build). The `sha:` stamp
-keeps the live commit known, so the next `ship deploy` sees what is still pending.
-
-### Exit codes and state
-
-`ship deploy` exits 0 when every selected deployable is live at main (with `--dry-run`: when
-everything it ran passed), 1 when something failed, is held, blocked or skipped, 2 on a usage
-error, 130 when interrupted. `ship status` exits 0 whatever it reports (1 when it cannot read the
-repository or Cloudflare, 2 on a usage error). Holds live in `~/.ship/holds/`, the migration ack
-ledger in `~/.ship/acks/`, logs in `~/.ship/logs/`; locks, lanes and worktrees in `$SHIP_TMP`.
+A check can overflow to GitHub Actions or Cloudflare Workers Builds when the line for the heavy lane is long ([Overflow](docs/overflow.md)). `ship deploy` deploys Cloudflare Workers from main and `ship status` shows what is live ([Deploy](docs/deploy.md), [Applying migrations](docs/migrations.md)).
+
+## Documentation
+
+- [Configure a repository](docs/configuration.md): the config file, what a step sees, branch protection.
+- [Checks and merge](docs/checks-and-merge.md): how `ship check` runs, lanes and `ship queue`, `ship merge`.
+- [Overflow](docs/overflow.md): GitHub Actions and Cloudflare Workers Builds.
+- [Deploy](docs/deploy.md): `ship deploy`, `ship status`, adopting, holds, rollbacks.
+- [Applying migrations](docs/migrations.md): `ship migrations apply` and `plan`.
+- [Contributing](CONTRIBUTING.md): the tests and the leak guard, for working on ship itself.
+- [Changelog](CHANGELOG.md).
 
 ## Licence
 

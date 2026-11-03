@@ -1,5 +1,5 @@
 # The copy of this file on the default branch is what `ship check` starts when the heavy lane's line
-# is long (README, "Overflow to GitHub Actions"). ship always starts it from the default branch, so a
+# is long (docs/overflow.md, "Overflow to GitHub Actions"). ship always starts it from the default branch, so a
 # pull request cannot change what judges it. Inputs reach the shell only through `env`, never by
 # `${{ }}` inside a script.
 name: ship-check

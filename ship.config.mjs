@@ -1,6 +1,6 @@
 // ship checks itself. No docs-only shortcut: the leak guard must read every change.
 //
-// A pull request must not weaken its own gate (README, "Configure a repository"), so the leak step
+// A pull request must not weaken its own gate (docs/configuration.md, "Configure a repository"), so the leak step
 // runs the guard that is on main, extracted to a temporary directory, against the tree under check.
 const GUARD_FROM_MAIN = [
   'set -o pipefail',
