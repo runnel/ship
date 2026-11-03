@@ -84,3 +84,66 @@ sibling.kill('SIGKILL');
     try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group already gone */ }
   }
 });
+
+// A file that goes red while something it started is still going. It runs as a plain script, with none of
+// the flags of the test command, so that only what the helpers do can end it, and a hang is one
+// process group to kill.
+test('a red assertion ends the file: a held lane, a waiting check, a watched run and a process of its own stop with the test', { timeout: 120_000 }, async () => {
+  const dir = await tempDir('red-');
+  const script = join(dir, 'red.test.mjs');
+  const leaderPid = join(dir, 'leader.pid');
+  const href = (path) => JSON.stringify(new URL(path, import.meta.url).href);
+  await writeFile(script, `
+import { afterEach, test } from 'node:test';
+import assert from 'node:assert/strict';
+import { writeFile } from 'node:fs/promises';
+import { runCheck } from ${href('../lib/check.mjs')};
+import { longLine, setupCheck, spawnCheckLeader, stopBackground, tempDir, tracked, waitUntil } from ${href('./helpers.mjs')};
+
+afterEach(stopBackground, { timeout: 30_000 });
+const check = tracked(runCheck);
+const says = (s, re) => s.lines.some((l) => re.test(l));
+const config = "export default { repo: 't/r', checks: [{ name: 'unit', lane: 'heavy', paths: ['src/**'], steps: ['true'] }], overflow: { workflow: 'ship-check.yml', includedMinutes: 3000, reservePerDay: 60, reserveFloor: 300, maxRunning: 1 } };";
+const usage = { usageItems: [{ product: 'actions', unitType: 'Minutes', sku: 'Actions Linux', quantity: 100 }] };
+const setup = () => setupCheck({ configText: config, ghOptions: { github: { usage, runs: [{ status: 'in_progress', conclusion: null }] } } });
+
+test('in line behind a lane that is held', async () => {
+  const s = await setup();
+  await longLine(s);
+  check({ cwd: s.work, deps: s.deps });
+  await waitUntil(() => says(s, /2nd in line/), 'the check is in line');
+  assert.fail('red on purpose');
+});
+
+test('watching a run on GitHub that never ends', async () => {
+  const s = await setup();
+  check({ cwd: s.work, github: true, deps: s.deps });
+  await waitUntil(() => says(s, /GitHub run:/), 'the run has started');
+  assert.fail('red on purpose');
+});
+
+test('a check in a process of its own', async () => {
+  const s = await setup();
+  const run = await spawnCheckLeader(s, await tempDir(), { github: true });
+  await writeFile(${JSON.stringify(leaderPid)}, String(run.child.pid));
+  assert.fail('red on purpose');
+});
+`);
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT; // this process's report format, which is not for reading here
+  const child = spawn(process.execPath, [script], { detached: true, stdio: ['ignore', 'pipe', 'pipe'], env });
+  let out = '';
+  child.stdout.on('data', (b) => { out += b; });
+  child.stderr.on('data', (b) => { out += b; });
+  const exited = new Promise((resolve) => child.on('close', (code, signal) => resolve({ code, signal })));
+  try {
+    const { code, signal } = await Promise.race([exited, deadline(100_000, 'the red file')]);
+    assert.deepEqual({ code, signal }, { code: 1, signal: null }, out);
+    assert.equal(out.match(/AssertionError \[ERR_ASSERTION\]: red on purpose/g)?.length, 3, out);
+    assert.equal(await isGone(await readPid(leaderPid)), true, 'the process of its own is gone');
+  } finally {
+    for (const pid of [child.pid, await readPid(leaderPid)]) {
+      if (pid) try { process.kill(-pid, 'SIGKILL'); } catch { /* group already gone */ }
+    }
+  }
+});

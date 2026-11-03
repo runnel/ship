@@ -11,9 +11,13 @@ const GUARD_FROM_MAIN = [
   'exit $status',
 ].join('; ');
 
+// A file's process lives until its event loop is empty, and the run waits for it: without these a test
+// that leaves a loop behind, or never returns, would hold the lane until the step's own timeout.
+const TESTS = 'node --test --test-force-exit --test-timeout=300000 "test/**/*.test.mjs"';
+
 export default {
   repo: 'runnel/ship',
   checks: [
-    { name: 'test', lane: 'light', paths: ['**'], steps: ['node --test "test/**/*.test.mjs"', GUARD_FROM_MAIN] },
+    { name: 'test', lane: 'light', paths: ['**'], steps: [TESTS, GUARD_FROM_MAIN] },
   ],
 };
