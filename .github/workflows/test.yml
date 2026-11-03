@@ -15,7 +15,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
-      - run: node --test "test/**/*.test.mjs"
+      - run: node --test --test-force-exit --test-timeout=300000 "test/**/*.test.mjs"
       # A pull request must not weaken its own gate: the guard that judges the tree is main's copy.
       # The private denylist exists only on the owner's machine; CI checks the generic shapes.
       - run: |

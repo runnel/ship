@@ -360,7 +360,9 @@ test('versioned: a failing preview probe leaves live untouched', async () => {
 });
 
 test('versioned: a hung upload that made the version is found by its message', async () => {
-  const { ctx, lines } = await fixture({ patch: { uploadTimeoutMin: 0.05 }, wrangler: { 'versions upload': { sleepMs: 30_000 } } });
+  // The limit has to run out for real, and first the fake has to start and make the version: on a busy
+  // machine that alone can take seconds.
+  const { ctx, lines } = await fixture({ patch: { uploadTimeoutMin: 0.25 }, wrangler: { 'versions upload': { sleepMs: 60_000 } } });
   const res = await deployOne(ctx);
   assert.equal(res.outcome, 'deployed', lines.join('\n'));
   assert.match(lines.join('\n'), /upload timed out, but version .* with our message exists/);

@@ -1,14 +1,18 @@
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { runCheck } from '../lib/check.mjs';
+import { runCheck as realRunCheck } from '../lib/check.mjs';
 import { capture } from '../lib/proc.mjs';
 import { acquire, ownerInfo, tryLock } from '../lib/lock.mjs';
 import { minutesUsed, daysLeftInMonth, reserveVerdict, recentRuns, overflowGate, PENDING_WINDOW_MS } from '../lib/overflow.mjs';
 import { runGroupsHere } from '../lib/run-groups.mjs';
 import { validateConfig, ConfigError } from '../lib/config.mjs';
-import { commitFiles, fakeGh, git, killQuietly, longLine, makeOrigin, setupCheck, spawnCheckLeader, tempDir, waitUntil } from './helpers.mjs';
+import { commitFiles, fakeGh, git, killQuietly, longLine, makeOrigin, setupCheck, spawnCheckLeader, stopBackground, tempDir, tracked, waitUntil } from './helpers.mjs';
+
+// However a test ends, the lane it held and the check it started end with it.
+afterEach(stopBackground, { timeout: 30_000 });
+const runCheck = tracked(realRunCheck);
 
 const actionsRow = (quantity, sku = 'Actions Linux') => ({ product: 'actions', unitType: 'Minutes', sku, quantity, repositoryName: 'r' });
 const USAGE = (quantity) => ({ usageItems: [actionsRow(quantity)] });

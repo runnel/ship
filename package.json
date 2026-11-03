@@ -6,6 +6,6 @@
   "private": true,
   "bin": { "ship": "bin/ship.mjs" },
   "engines": { "node": ">=24" },
-  "scripts": { "test": "node --test \"test/**/*.test.mjs\"" },
+  "scripts": { "test": "node --test --test-force-exit --test-timeout=300000 \"test/**/*.test.mjs\"" },
   "license": "MIT"
 }

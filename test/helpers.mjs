@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, mkdir, chmod, readFile, readdir } from 'node:fs/promises';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { setTimeout as sleepFor } from 'node:timers/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { capture, isPid } from '../lib/proc.mjs';
@@ -13,10 +14,43 @@ process.on('exit', () => rmSync(ROOT, { recursive: true, force: true }));
 
 export const tempDir = (prefix = 't-') => mkdtemp(join(ROOT, prefix));
 
-// Polls `fn` until it is true; fails with `what` after `ms`.
-export async function waitUntil(fn, what, ms = 10_000) {
+// node:test cannot stop what a test started: a failed assertion or a timeout only ends the test
+// function. The file's process then lives until its event loop is empty, and `node --test` waits for
+// that process, so a waiter polling a lane that nobody gives back would keep the whole run going for
+// ever. What a test starts is therefore entered here, and a file that does this ends it all when each
+// test ends, however it ended: `afterEach(stopBackground, { timeout: 30_000 })`. One test runs at a
+// time in a file. (`--test-force-exit`, in the test command, is the net for files that do not.)
+let testOver = new AbortController(); // what sleeps or polls for the current test stops when this fires
+const background = new Set(); // what ends something the current test started; may have ended already
+
+export const atTestEnd = (stop) => {
+  background.add(stop);
+  return stop;
+};
+
+export async function stopBackground() {
+  testOver.abort();
+  testOver = new AbortController();
+  const stops = [...background];
+  background.clear();
+  await Promise.allSettled(stops.map((stop) => stop())); // at once: a check may be waiting for a line to be freed
+}
+
+// `fn` for a test to call, whose result is waited for when the test ends if it has not come by then.
+export const tracked = (fn) => (...args) => {
+  const running = fn(...args);
+  atTestEnd(() => running);
+  return running;
+};
+
+// Polls `fn` until it is true. How long that takes depends on the machine and says nothing about the
+// code, so the limit is no judge of speed: it only has to name what was being waited for, just before
+// the 60 s most tests that wait have would end them without saying.
+const WAIT_MS = 50_000;
+export async function waitUntil(fn, what, ms = WAIT_MS) {
+  const { signal } = testOver;
   const until = Date.now() + ms;
-  while (Date.now() < until) {
+  while (Date.now() < until && !signal.aborted) {
     if (await fn()) return;
     await new Promise((r) => setTimeout(r, 10));
   }
@@ -209,12 +243,14 @@ export async function setupCheck({
   const pr = { number: 7, headRefOid: head, headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'OPEN', ...prOverrides };
   const fake = await fakeGh(root, { pr, ...ghOptions });
   const lines = [];
+  const { signal } = testOver;
   const deps = {
     gh: fake.gh, remoteUrl: () => origin,
     mirrorRoot: join(root, 'mirrors'), tmpRoot: join(root, 'tmp'), logRoot: join(root, 'logs'),
     overflowRoot: join(root, 'overflow'), overflowAskMs: 0, githubPollMs: 5, cloudflarePollMs: 5, verdictRetryMs: 5, shipSha: async () => 'c'.repeat(40),
     out: (s) => lines.push(s), pollMs: 10,
     onBattery: async () => false, // never ask the real pmset: a test that wants the warning injects its own
+    sleep: (ms) => sleepFor(ms, undefined, { signal }), // a check still watching a remote run ends when its test does
   };
   const statuses = async () => statusesOf(await fake.calls());
   // The pull request as GitHub shows it from now on: setPr({ state: 'MERGED' }), setPr({ headRefOid: … }).
@@ -229,8 +265,9 @@ export async function longLine(s) {
   const lane = join(s.deps.tmpRoot, 'lanes', 'heavy');
   const holder = await acquire(lane, await ownerInfo({ repo: 'o/x', pr: 1 }));
   const waiter = acquire(lane, await ownerInfo({ repo: 'o/x', pr: 2 }), { priority: 1, pollMs: 5 }).then((release) => release());
+  const free = atTestEnd(async () => { await holder(); await waiter; });
   await waitUntil(async () => (await readdir(join(s.deps.tmpRoot, 'lanes'))).some((n) => n.startsWith('heavy.q-') && n.endsWith('.json')), 'the waiter is in line');
-  return { free: async () => { await holder(); await waiter; } };
+  return { free };
 }
 
 // runCheck in a child process that leads its own process group, as bin/ship.mjs makes ship do.
@@ -264,7 +301,7 @@ process.exitCode = code;
   const out = { text: '' };
   child.stdout.on('data', (b) => { out.text += b; });
   const exited = new Promise((resolve) => child.on('close', (code) => resolve(code)));
-  const kill = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group already gone */ } };
+  const kill = atTestEnd(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group already gone */ } });
   return { child, out, exited, kill };
 }
 

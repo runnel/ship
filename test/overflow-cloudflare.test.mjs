@@ -1,13 +1,17 @@
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { runCheck } from '../lib/check.mjs';
+import { runCheck as realRunCheck } from '../lib/check.mjs';
 import { ownerInfo, tryLock } from '../lib/lock.mjs';
 import { firstGate } from '../lib/overflow.mjs';
 import { BUILD_APP, buildVerdict, cloudflareGate, overlayFiles } from '../lib/overflow-cloudflare.mjs';
 import { checkRuns } from '../lib/github.mjs';
-import { fakeGh, git, killQuietly, longLine, setupCheck, spawnCheckLeader, tempDir, waitUntil } from './helpers.mjs';
+import { fakeGh, git, killQuietly, longLine, setupCheck, spawnCheckLeader, stopBackground, tempDir, tracked, waitUntil } from './helpers.mjs';
+
+// However a test ends, the lane it held and the check it started end with it.
+afterEach(stopBackground, { timeout: 30_000 });
+const runCheck = tracked(realRunCheck);
 
 const LOTS_LEFT = { usageItems: [{ product: 'actions', unitType: 'Minutes', sku: 'Actions Linux', quantity: 100, repositoryName: 'r' }] };
 // GitHub's own rules never let a check go here unless a test says so (minAhead 99).
