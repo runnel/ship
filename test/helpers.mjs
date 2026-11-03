@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile, mkdir, chmod, readFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, mkdir, chmod, readFile, readdir } from 'node:fs/promises';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { capture, isPid } from '../lib/proc.mjs';
+import { acquire, ownerInfo } from '../lib/lock.mjs';
 
 // One scratch root per test process, removed when the process exits.
 const ROOT = mkdtempSync(join(tmpdir(), 'ship-tests-'));
@@ -72,7 +73,11 @@ export async function makeOrigin(files) {
 // the billing report (undefined: gh fails); `dispatchFail` makes the dispatch fail; `runs` = [overrides…]
 // is what the Nth read of the run says on top of a run of the workflow that was dispatched, the last one
 // repeating; `runReadFails` makes the first reads fail.
-export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false, statuses = null, mergeFail = null, mergeDelayMs = 0, github = null, apiFailTimes = null }) {
+// cloudflare = { runs, readFails, name }: the check runs of a commit in the runner repository. `runs` =
+// [[overrides…]…] is what the Nth read lists (the last one repeating): one check run per entry, each made
+// from a green run of the Workers Builds app named `name`, on the commit that was asked about, with the
+// overrides on top; `readFails` makes the first reads fail.
+export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false, statuses = null, mergeFail = null, mergeDelayMs = 0, github = null, cloudflare = null, apiFailTimes = null }) {
   const log = join(dir, 'gh.log');
   const script = join(dir, 'gh');
   const viewCount = join(dir, 'gh-pr-view.count');
@@ -105,6 +110,20 @@ if (args[0] === 'pr' && args[1] === 'merge') {
 }
 const asked = ${JSON.stringify(statuses)} !== null && args[0] === 'api' && /\\/commits\\/([0-9a-f]+)\\/statuses/.exec(args[1]);
 if (asked) reply(${JSON.stringify(statuses)}[asked[1]] ?? []);
+const cloudflare = ${JSON.stringify(cloudflare)};
+const builds = cloudflare && args[0] === 'api' && /\\/commits\\/([0-9a-f]+)\\/check-runs/.exec(args[1]);
+if (builds) {
+  const reads = ${JSON.stringify(join(dir, 'gh-cf-reads'))};
+  let i = 0;
+  try { i = Number(fs.readFileSync(reads, 'utf8')) || 0; } catch { /* first read */ }
+  fs.writeFileSync(reads, String(i + 1));
+  if (i < (cloudflare.readFails ?? 0)) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
+  const list = cloudflare.runs ?? [[{}]];
+  reply({ total_count: 1, check_runs: list[Math.min(i, list.length - 1)].map((o) => ({
+    id: 77, name: cloudflare.name ?? 'Workers Builds: app-runner', head_sha: builds[1], status: 'completed', conclusion: 'success',
+    html_url: 'https://example.com/builds/77', app: { slug: 'cloudflare-workers-and-pages' }, ...o,
+  })) });
+}
 const github = ${JSON.stringify(github)};
 if (github && args[0] === 'api') {
   const path = args.find((x) => x.includes('/'));
@@ -173,12 +192,12 @@ export const statusesOf = (calls) =>
 export const CONFIG = (steps, extra = {}) =>
   `export default { repo: 't/r', docsOnly: ['*.md'], checks: [${JSON.stringify({ name: 'unit', paths: ['src/**'], steps, ...extra })}] };\n`;
 
-// origin: main has the config + a.txt; branch feat adds featFiles; main then moves with mainFiles.
+// origin: main has the config + a.txt (+ baseFiles); branch feat adds featFiles; main then moves with mainFiles.
 export async function setupCheck({
   steps = ['test -f src/x.ts', 'test -f b.txt'], checkExtra = {},
-  featFiles = { 'src/x.ts': 'x\n' }, mainFiles = { 'b.txt': 'b\n' }, prOverrides = {}, mainConfig = true, configText = null, ghOptions = {},
+  featFiles = { 'src/x.ts': 'x\n' }, mainFiles = { 'b.txt': 'b\n' }, baseFiles = {}, prOverrides = {}, mainConfig = true, configText = null, ghOptions = {},
 } = {}) {
-  const { origin, work, root } = await makeOrigin({ ...(mainConfig ? { 'ship.config.mjs': configText ?? CONFIG(steps, checkExtra) } : {}), 'a.txt': 'a\n' });
+  const { origin, work, root } = await makeOrigin({ ...(mainConfig ? { 'ship.config.mjs': configText ?? CONFIG(steps, checkExtra) } : {}), 'a.txt': 'a\n', ...baseFiles });
   await git(['checkout', '--quiet', '-b', 'feat'], work);
   const head = await commitFiles(work, featFiles, 'feat');
   await git(['push', '--quiet', 'origin', 'feat'], work);
@@ -193,7 +212,7 @@ export async function setupCheck({
   const deps = {
     gh: fake.gh, remoteUrl: () => origin,
     mirrorRoot: join(root, 'mirrors'), tmpRoot: join(root, 'tmp'), logRoot: join(root, 'logs'),
-    overflowRoot: join(root, 'overflow'), overflowAskMs: 0, githubPollMs: 5, verdictRetryMs: 5, shipSha: async () => 'c'.repeat(40),
+    overflowRoot: join(root, 'overflow'), overflowAskMs: 0, githubPollMs: 5, cloudflarePollMs: 5, verdictRetryMs: 5, shipSha: async () => 'c'.repeat(40),
     out: (s) => lines.push(s), pollMs: 10,
     onBattery: async () => false, // never ask the real pmset: a test that wants the warning injects its own
   };
@@ -203,10 +222,22 @@ export async function setupCheck({
   return { work, deps, statuses, lines, origin, root, gh: fake.gh, calls: fake.calls, setPr };
 }
 
+// The lane is held and one waiter stands in line, so a check that arrives is second in line. `free()`
+// lets both go (the waiter gives the lane back at once).
+export async function longLine(s) {
+  await mkdir(s.deps.tmpRoot, { recursive: true, mode: 0o700 });
+  const lane = join(s.deps.tmpRoot, 'lanes', 'heavy');
+  const holder = await acquire(lane, await ownerInfo({ repo: 'o/x', pr: 1 }));
+  const waiter = acquire(lane, await ownerInfo({ repo: 'o/x', pr: 2 }), { priority: 1, pollMs: 5 }).then((release) => release());
+  await waitUntil(async () => (await readdir(join(s.deps.tmpRoot, 'lanes'))).some((n) => n.startsWith('heavy.q-') && n.endsWith('.json')), 'the waiter is in line');
+  return { free: async () => { await holder(); await waiter; } };
+}
+
 // runCheck in a child process that leads its own process group, as bin/ship.mjs makes ship do.
 // Printed lines go to `out.text`; `exited` resolves with the exit code; `kill()` ends the whole
 // group (the test's cleanup: nothing may outlive it).
-export async function spawnCheckLeader(s, dir, { env = process.env, pollMs = 10, unwindPostTimeoutMs, github = false, githubPollMs = 5 } = {}) {
+// `runner` = { repo, url }: the repository a check on Cloudflare pushes to, and where it is (with `cloudflare`).
+export async function spawnCheckLeader(s, dir, { env = process.env, pollMs = 10, unwindPostTimeoutMs, github = false, githubPollMs = 5, cloudflare = false, cloudflarePollMs = 5, runner = null } = {}) {
   const script = join(dir, 'check.mjs');
   const mod = new URL('../lib/check.mjs', import.meta.url).href;
   await writeFile(script, `
@@ -215,11 +246,12 @@ import { isInterrupted } from ${JSON.stringify(new URL('../lib/interrupt.mjs', i
 const a = JSON.parse(process.argv[2]);
 const deps = { gh: a.gh, remoteUrl: () => a.origin, mirrorRoot: a.mirrorRoot, tmpRoot: a.tmpRoot, logRoot: a.logRoot, pollMs: a.pollMs, out: (l) => process.stdout.write(l + '\\n') };
 if (a.unwindPostTimeoutMs) deps.unwindPostTimeoutMs = a.unwindPostTimeoutMs;
-if (a.github) Object.assign(deps, { overflowRoot: a.overflowRoot, githubPollMs: a.githubPollMs, shipSha: async () => 'c'.repeat(40) });
+if (a.github || a.cloudflare) Object.assign(deps, { overflowRoot: a.overflowRoot, githubPollMs: a.githubPollMs, cloudflarePollMs: a.cloudflarePollMs, shipSha: async () => 'c'.repeat(40) });
+if (a.cloudflare) deps.remoteUrl = (repo) => (repo === a.runner.repo ? a.runner.url : a.origin);
 // Like lib/cli.mjs: an interrupt that makes a call fail is exit 130, anything else a plain failure.
 let code;
 try {
-  code = await runCheck({ cwd: a.cwd, github: a.github, deps });
+  code = await runCheck({ cwd: a.cwd, github: a.github, cloudflare: a.cloudflare, deps });
 } catch (e) {
   if (e?.aborted || isInterrupted()) code = 130;
   else { process.stderr.write('ship check: ' + e.message + '\\n'); code = 1; }
@@ -227,7 +259,7 @@ try {
 process.stdout.write('RETURNED ' + code + '\\n');
 process.exitCode = code;
 `);
-  const arg = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot, pollMs, unwindPostTimeoutMs, github, githubPollMs, overflowRoot: s.deps.overflowRoot });
+  const arg = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot, pollMs, unwindPostTimeoutMs, github, githubPollMs, cloudflare, cloudflarePollMs, runner, overflowRoot: s.deps.overflowRoot });
   const child = spawn(process.execPath, [script, arg], { detached: true, stdio: ['ignore', 'pipe', 'inherit'], env });
   const out = { text: '' };
   child.stdout.on('data', (b) => { out.text += b; });

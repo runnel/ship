@@ -314,3 +314,21 @@ test('a check on GitHub is listed with its run, not as a lane, and is never call
   const starting = render(await snapshot({ tmpRoot: join(root, 'tmp'), logRoot: join(root, 'logs') })).find((l) => l.startsWith('on GitHub:'));
   assert.match(starting, /starting$/, 'between taking the place and GitHub naming the run');
 });
+
+test('a check on Cloudflare is listed with its commit, next to one on GitHub, and neither is a lane', async () => {
+  const root = await tempDir();
+  const since = new Date(Date.now() - 12 * 60_000).toISOString();
+  for (const [name, pr, run] of [['cloudflare-0', 12, { url: 'https://example.com/runner/commit/abc' }], ['github-0', 13, { runId: 5, url: 'https://example.com/runs/5' }], ['cloudflare-1', 14, null]]) {
+    const place = join(root, 'tmp', 'lanes', name);
+    await mkdir(place, { recursive: true });
+    await writeFile(join(place, 'owner.json'), JSON.stringify({ pid: process.pid, startTime: await processStartTime(process.pid), nonce: name, since, repo: 'acme/app', pr }));
+    if (run) await writeFile(join(place, 'run.json'), JSON.stringify(run));
+  }
+  const lines = render(await snapshot({ tmpRoot: join(root, 'tmp'), logRoot: join(root, 'logs') }));
+  const on = (re) => lines.find((l) => re.test(l));
+  assert.match(on(/^on Cloudflare: acme\/app PR #12/), /for 12m.*https:\/\/example\.com\/runner\/commit\/abc$/);
+  assert.match(on(/^on GitHub: acme\/app PR #13/), /https:\/\/example\.com\/runs\/5$/);
+  assert.match(on(/^on Cloudflare: acme\/app PR #14/), /starting$/, 'between taking the place and the push');
+  assert.ok(!lines.some((l) => /cloudflare-|github-|stuck/.test(l)), lines.join('\n'));
+  assert.ok(lines.includes('heavy lane: free'));
+});

@@ -8,7 +8,7 @@ import { acquire, ownerInfo, tryLock } from '../lib/lock.mjs';
 import { minutesUsed, daysLeftInMonth, reserveVerdict, recentRuns, overflowGate, PENDING_WINDOW_MS } from '../lib/overflow.mjs';
 import { runGroupsHere } from '../lib/run-groups.mjs';
 import { validateConfig, ConfigError } from '../lib/config.mjs';
-import { commitFiles, fakeGh, git, killQuietly, makeOrigin, setupCheck, spawnCheckLeader, tempDir, waitUntil } from './helpers.mjs';
+import { commitFiles, fakeGh, git, killQuietly, longLine, makeOrigin, setupCheck, spawnCheckLeader, tempDir, waitUntil } from './helpers.mjs';
 
 const actionsRow = (quantity, sku = 'Actions Linux') => ({ product: 'actions', unitType: 'Minutes', sku, quantity, repositoryName: 'r' });
 const USAGE = (quantity) => ({ usageItems: [actionsRow(quantity)] });
@@ -20,17 +20,6 @@ const configText = (steps, overflow = OVERFLOW, check = {}) => `export default {
 
 const setup = ({ steps = ['true'], overflow = OVERFLOW, check = {}, github = { usage: LOTS_LEFT }, ...rest } = {}) =>
   setupCheck({ configText: configText(steps, overflow, check), ghOptions: { github }, ...rest });
-
-// The lane is held and one waiter stands in line, so a check that arrives is second in line. `free()`
-// lets both go (the waiter gives the lane back at once).
-async function longLine(s) {
-  await mkdir(s.deps.tmpRoot, { recursive: true, mode: 0o700 });
-  const lane = join(s.deps.tmpRoot, 'lanes', 'heavy');
-  const holder = await acquire(lane, await ownerInfo({ repo: 'o/x', pr: 1 }));
-  const waiter = acquire(lane, await ownerInfo({ repo: 'o/x', pr: 2 }), { priority: 1, pollMs: 5 }).then((release) => release());
-  await waitUntil(async () => (await readdir(join(s.deps.tmpRoot, 'lanes'))).some((n) => n.startsWith('heavy.q-') && n.endsWith('.json')), 'the waiter is in line');
-  return { free: async () => { await holder(); await waiter; } };
-}
 
 const dispatches = async (s) => (await s.calls()).filter((c) => c[0] === 'api' && c[3]?.endsWith('/dispatches'));
 const billingReads = async (s) => (await s.calls()).filter((c) => c[0] === 'api' && c[1]?.includes('/billing/'));
@@ -472,6 +461,61 @@ test('run-groups refuses groups that main\'s config does not have', async () => 
   assert.equal(await runGroupsHere({ cwd: work, groups: [], mainSha, headSha, logFile: join(dir, 'log'), out: (l) => lines.push(l) }), 2);
 });
 
+// A clone with one commit has neither main's config nor the changed files: they are handed over.
+async function handedOver({ config, files = 'src/x.ts\ndocs/y.md\n', env = null }) {
+  const dir = await tempDir();
+  const work = join(dir, 'checkout');
+  await mkdir(work);
+  const handed = { configFile: join(dir, 'config.mjs'), filesFile: join(dir, 'changed-files') };
+  await writeFile(handed.configFile, config);
+  await writeFile(handed.filesFile, files);
+  if (env !== null) {
+    handed.envFile = join(dir, 'env.json');
+    await writeFile(handed.envFile, typeof env === 'string' ? env : JSON.stringify(env));
+  }
+  return { dir, work, seen: join(dir, 'seen'), handed, logFile: join(dir, 'log') };
+}
+
+test('run-groups with a config and a list of files handed over needs no history and no main', async () => {
+  const seen = join(await tempDir(), 'seen');
+  const h = await handedOver({ config: twoGroups(`echo "$SHIP_CHANGED_FILES" >> ${seen}`, `echo two >> ${seen}`) });
+  const lines = [];
+  assert.equal(await runGroupsHere({ cwd: h.work, groups: ['one', 'two'], ...h.handed, logFile: h.logFile, out: (l) => lines.push(l) }), 0, lines.join('\n'));
+  assert.deepEqual((await readFile(seen, 'utf8')).trim().split('\n'), ['src/x.ts', 'docs/y.md', 'two']);
+});
+
+test('run-groups: the handed-over config and files are used even where git has other ones', async () => {
+  const seen = join(await tempDir(), 'seen');
+  const { work, mainSha, headSha } = await treeOnBranch(twoGroups('exit 4', 'true'));
+  const h = await handedOver({ config: twoGroups(`echo "$SHIP_CHANGED_FILES" >> ${seen}`, 'true'), files: 'only/this.ts\n' });
+  assert.equal(await runGroupsHere({ cwd: work, groups: ['one'], mainSha, headSha, ...h.handed, logFile: h.logFile, out: () => {} }), 0, 'main\'s exit 4 is not what ran');
+  assert.equal((await readFile(seen, 'utf8')).trim(), 'only/this.ts', 'src/x.ts is what git would have said');
+});
+
+test('run-groups: the env file adds to the named groups only, with {root} the checkout', async () => {
+  const seen = join(await tempDir(), 'seen');
+  const probe = (name) => `echo ${name}=$SOME_VAR/$OTHER_VAR/$SHIP_CHANGED_FILES >> ${seen}`;
+  const config = `export default { repo: 't/r', checks: [
+    { name: 'one', paths: ['**'], env: { SOME_VAR: 'from-config', OTHER_VAR: 'from-config' }, steps: [${JSON.stringify(probe('one'))}] },
+    { name: 'two', paths: ['**'], steps: [${JSON.stringify(probe('two'))}] }] };\n`;
+  const h = await handedOver({ config, files: 'a.ts\n', env: { one: { SOME_VAR: '{root}/scripts/x.cjs', SHIP_CHANGED_FILES: 'x' } } });
+  assert.equal(await runGroupsHere({ cwd: h.work, groups: ['one', 'two'], ...h.handed, logFile: h.logFile, out: () => {} }), 0);
+  assert.deepEqual((await readFile(seen, 'utf8')).trim().split('\n'), [`one=${h.work}/scripts/x.cjs/from-config/a.ts`, 'two=//a.ts'],
+    'added after the group\'s own, before what ship sets itself; another group gets nothing');
+});
+
+test('run-groups refuses a file handed over that cannot be read or does not fit', async () => {
+  const lines = [];
+  const run = async (h, overrides = {}) => runGroupsHere({ cwd: h.work, groups: ['one'], ...h.handed, ...overrides, logFile: h.logFile, out: (l) => lines.push(l) });
+  const config = twoGroups('true', 'true');
+  assert.equal(await run(await handedOver({ config }), { configFile: '/nonexistent/config.mjs' }), 2);
+  assert.equal(await run(await handedOver({ config }), { filesFile: '/nonexistent/changed-files' }), 2);
+  assert.ok(lines.some((l) => /cannot read what was handed over/.test(l)), lines.join('\n'));
+  for (const env of ['not json', '[]', '{"one": "x"}', '{"one": {"A": 1}}', '{"nope": {"A": "b"}}']) {
+    assert.equal(await run(await handedOver({ config, env })), 2, env);
+  }
+});
+
 test('the example workflow takes what ship sends, can only read, and starts nothing by itself', async () => {
   const text = await readFile(new URL('../examples/ship-check.yml', import.meta.url), 'utf8');
   for (const input of ['head_sha', 'main_sha', 'tree_sha', 'groups', 'ship_sha', 'nonce']) assert.match(text, new RegExp(`^ {6}${input}: `, 'm'), input);
@@ -509,7 +553,7 @@ const withOverflow = (overflow) => ({ repo: 't/r', checks: [{ name: 'unit', path
 test('overflow config: defaults, and no default for what must stay free', () => {
   assert.equal(validateConfig({ repo: 't/r', checks: [{ name: 'unit', paths: ['**'], steps: ['true'] }] }).overflow, null);
   assert.deepEqual(validateConfig(withOverflow({ workflow: 'c.yml', includedMinutes: 3000, reservePerDay: 60, reserveFloor: 300 })).overflow, {
-    workflow: 'c.yml', includedMinutes: 3000, reservePerDay: 60, reserveFloor: 300, minAhead: 4, maxRunning: 2, runMinutes: 20, timeoutMin: 40, groups: null,
+    workflow: 'c.yml', includedMinutes: 3000, reservePerDay: 60, reserveFloor: 300, minAhead: 4, maxRunning: 2, runMinutes: 20, timeoutMin: 40, groups: null, cloudflare: null,
   });
   const good = { workflow: 'c.yml', includedMinutes: 3000, reservePerDay: 60, reserveFloor: 300 };
   for (const bad of [
@@ -518,4 +562,33 @@ test('overflow config: defaults, and no default for what must stay free', () => 
     { ...good, reservePerDay: 0 }, { ...good, reserveFloor: 0 }, { ...good, minAhead: 0 }, { ...good, maxRunning: 0 }, { ...good, maxRunning: 1.5 },
     { ...good, runMinutes: 0 }, { ...good, timeoutMin: -1 }, { ...good, groups: 'unit' }, { ...good, groups: ['nope'] }, { ...good, nope: 1 },
   ]) assert.throws(() => validateConfig(withOverflow(bad)), ConfigError, JSON.stringify(bad));
+});
+
+const GOOD_OVERFLOW = { workflow: 'c.yml', includedMinutes: 3000, reservePerDay: 60, reserveFloor: 300 };
+const withCloudflare = (cloudflare, extra = {}) => ({ repo: 't/r', checks: [{ name: 'unit', paths: ['**'], steps: ['true'] }, { name: 'db', paths: ['db/**'], steps: ['true'] }], overflow: { ...GOOD_OVERFLOW, cloudflare }, ...extra });
+const GOOD = { repo: 'acme/app-runner', branch: 'run', checkName: 'Workers Builds: app-runner' };
+
+test('overflow.cloudflare config: defaults, and what is required', () => {
+  assert.deepEqual(validateConfig(withCloudflare(GOOD)).overflow.cloudflare, {
+    repo: 'acme/app-runner', branch: 'run', checkName: 'Workers Builds: app-runner', minAhead: 2, maxRunning: 2, timeoutMin: 25, groups: null, setup: null, env: {},
+  });
+  const full = { ...GOOD, minAhead: 3, maxRunning: 4, timeoutMin: 30, groups: ['unit', 'db'], setup: 'scripts/remote-setup.sh', env: { unit: { SOME_VAR: '{root}/scripts/x.cjs' } } };
+  assert.deepEqual(validateConfig(withCloudflare(full)).overflow.cloudflare, full);
+  assert.equal(validateConfig(withCloudflare(undefined)).overflow.cloudflare, null);
+  assert.equal(validateConfig(withCloudflare(null)).overflow.cloudflare, null);
+});
+
+test('overflow.cloudflare config: what is refused', () => {
+  for (const bad of [
+    'x', [], { ...GOOD, repo: undefined }, { ...GOOD, repo: 'app-runner' }, { ...GOOD, repo: 'a/b/c' },
+    { ...GOOD, repo: 't/r' }, { ...GOOD, repo: 'T/R' }, // the repository itself: its branch is force-pushed
+    { ...GOOD, branch: undefined }, { ...GOOD, branch: '' }, { ...GOOD, branch: '-x' }, { ...GOOD, branch: 'a..b' }, { ...GOOD, branch: 'a//b' }, { ...GOOD, branch: 'a b' },
+    { ...GOOD, branch: 'run.' }, { ...GOOD, branch: 'run/' }, { ...GOOD, branch: 'run.lock' }, { ...GOOD, branch: 'run~1' }, { ...GOOD, branch: 'run:x' },
+    { ...GOOD, checkName: undefined }, { ...GOOD, checkName: ' ' }, { ...GOOD, checkName: 3 },
+    { ...GOOD, minAhead: 0 }, { ...GOOD, minAhead: 1.5 }, { ...GOOD, maxRunning: 0 }, { ...GOOD, timeoutMin: 0 }, { ...GOOD, timeoutMin: -1 },
+    { ...GOOD, groups: 'unit' }, { ...GOOD, groups: ['nope'] },
+    { ...GOOD, setup: '/etc/x' }, { ...GOOD, setup: '../x.sh' }, { ...GOOD, setup: 3 },
+    { ...GOOD, env: [] }, { ...GOOD, env: { nope: { A: 'b' } } }, { ...GOOD, env: { unit: 'A=b' } }, { ...GOOD, env: { unit: { A: 1 } } }, { ...GOOD, env: { unit: { 'A-B': 'x' } } },
+    { ...GOOD, nope: 1 },
+  ]) assert.throws(() => validateConfig(withCloudflare(bad)), ConfigError, JSON.stringify(bad));
 });

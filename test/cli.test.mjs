@@ -33,10 +33,22 @@ const usageError = async (args, problem, usage, { lines = 1 } = {}) => {
 };
 
 test('ship check: a bad flag or an extra argument is a usage error, exit 2', { timeout: 30_000 }, async () => {
-  const usage = /^ship check \[--pr <number>\] \[--github\] {3,}check a pull request/;
+  const usage = /^ship check \[--pr <number>\] \[--github \| --cloudflare\] {3,}check a pull request/;
+  await usageError(['check', '--github', '--cloudflare'], 'check: --github and --cloudflare cannot go together', usage);
   await usageError(['check', '--nope'], 'check: .*--nope', usage);
   await usageError(['check', '42'], 'check: .*42', usage);
   await usageError(['check', '--pr'], 'check: .*--pr', usage);
+});
+
+test('ship run-groups needs the groups, and main and the head unless it is handed the config and the files', { timeout: 30_000 }, async () => {
+  const usage = /^ship run-groups --groups <a,b> --main <sha> --head <sha> {3,}run check groups/;
+  const problem = 'run-groups: needs --groups, and --main and --head \\(or --config and --files in their place\\)';
+  await usageError(['run-groups'], problem, usage);
+  await usageError(['run-groups', '--groups', 'a'], problem, usage);
+  await usageError(['run-groups', '--groups', 'a', '--main', 'abc1234'], problem, usage);
+  await usageError(['run-groups', '--groups', 'a', '--config', 'c.mjs'], problem, usage);
+  await usageError(['run-groups', '--groups', 'a', '--files', 'f'], problem, usage);
+  await usageError(['run-groups', '--groups', 'a', '--config', 'c.mjs', '--files', 'f', '--nope'], 'run-groups: .*--nope', usage);
 });
 
 test('ship merge needs a pull request number: a missing, malformed or extra argument is a usage error, exit 2', { timeout: 30_000 }, async () => {
