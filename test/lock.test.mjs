@@ -1,12 +1,38 @@
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile, mkdir, chmod, utimes, rm, readdir } from 'node:fs/promises';
 import { readdirSync } from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dirname, join } from 'node:path';
-import { acquire, tryLock, ownerInfo, isStale, readOwner, processStartTime } from '../lib/lock.mjs';
-import { tempDir, waitUntil } from './helpers.mjs';
+import { acquire as acquireLock, tryLock, ownerInfo, isStale, readOwner, processStartTime } from '../lib/lock.mjs';
+import { atTestEnd, stopBackground, tempDir, waitUntil } from './helpers.mjs';
+
+// However a test ends, the locks it took, the waiters in line and the processes it started end with it.
+afterEach(stopBackground, { timeout: 30_000 });
+
+// `acquire` for a test. When the test ends a waiter still in line stops waiting and its promise stays
+// pending, so that nothing runs on in a finished test; a lock it did take is given back.
+const acquire = (dir, owner, opts = {}) => {
+  let over = false;
+  const taking = acquireLock(dir, owner, { ...opts, isAborted: () => over || (opts.isAborted?.() ?? false) });
+  atTestEnd(async () => {
+    over = true;
+    await (await taking.catch(() => null))?.();
+  });
+  return taking.catch((e) => {
+    if (over && e.aborted) return new Promise(() => {});
+    throw e;
+  });
+};
+
+// A node process running `code` on `dir`, in a group of its own as a ship process has; the group is
+// killed when the test ends.
+const spawnNode = (code, dir) => {
+  const child = spawn(process.execPath, ['--input-type=module', '-e', code, dir], { stdio: 'ignore', detached: true });
+  atTestEnd(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* the group is gone */ } });
+  return child;
+};
 
 const lockDir = async () => join(await tempDir('lock-'), 'l');
 const DEAD = { pid: 999999, pgid: 999999, startTime: 'x', nonce: 'dead' };
@@ -97,7 +123,9 @@ test('the lock directory never exists without its owner.json, while acquiring or
   const dir = await lockDir();
   let ownerless = 0;
   let stop = false;
-  const watcher = (async () => {
+  let watcher;
+  atTestEnd(async () => { stop = true; await watcher; });
+  watcher = (async () => {
     while (!stop) {
       try {
         // one syscall = one consistent snapshot of the directory
@@ -150,21 +178,16 @@ test('a directory without an owner is waited for until it is older than the grac
 
 test('acquire stops waiting when told to abort, instead of waiting for a live holder forever', { timeout: 30_000 }, async () => {
   const dir = await lockDir();
-  const release = await acquire(dir, await ownerInfo({ label: 'holder' }));
+  await acquire(dir, await ownerInfo({ label: 'holder' }));
   let abort = false;
   setTimeout(() => { abort = true; }, 100);
   const waiter = acquire(dir, await ownerInfo({ label: 'waiter' }), { pollMs: 10, isAborted: () => abort });
-  try {
-    const outcome = await Promise.race([
-      waiter.then(() => 'acquired', (e) => (e.aborted ? 'aborted' : `failed: ${e.message}`)),
-      new Promise((r) => setTimeout(() => r('still waiting'), 3_000).unref()),
-    ]);
-    assert.equal(outcome, 'aborted');
-    assert.equal((await readOwner(dir)).label, 'holder'); // the holder's lock is untouched
-  } finally {
-    await release(); // a waiter that ignored the abort gets the lock now ...
-    await waiter.then((r) => r(), () => {}); // ... and hands it back, so nothing keeps polling
-  }
+  const outcome = await Promise.race([
+    waiter.then(() => 'acquired', (e) => (e.aborted ? 'aborted' : `failed: ${e.message}`)),
+    new Promise((r) => setTimeout(() => r('still waiting'), 3_000).unref()),
+  ]);
+  assert.equal(outcome, 'aborted');
+  assert.equal((await readOwner(dir)).label, 'holder'); // the holder's lock is untouched
 });
 
 // --- the line: first come, first served, with priorities ---------------------------------------
@@ -242,31 +265,20 @@ test('a waiter that is killed does not block the line, even if a process is left
     import { acquire, ownerInfo } from ${JSON.stringify(mod)};
     spawn('sleep', ['30'], { stdio: 'ignore' }).unref();
     await acquire(process.argv[1], await ownerInfo({ label: 'doomed' }), { pollMs: 50, priority: 0 });`;
-  // A group of its own, as a ship process has.
-  const doomed = spawn(process.execPath, ['--input-type=module', '-e', code, dir], { stdio: 'ignore', detached: true });
+  const doomed = spawnNode(code, dir);
   const exited = new Promise((r) => doomed.on('exit', r));
-  let abort = false;
-  let behind;
-  try {
-    await waitUntil(() => ticketsOf(dir).length === 1, 'the doomed waiter to be in line');
-    behind = acquire(dir, await ownerInfo({ label: 'behind' }), { pollMs: 20, priority: 1, isAborted: () => abort });
-    behind.catch(() => {});
-    await waitUntil(() => ticketsOf(dir).length === 2, 'the next waiter to be in line');
-    doomed.kill('SIGKILL'); // no chance to withdraw its ticket
-    await exited;
-    assert.equal(ticketsOf(dir).length, 2); // its ticket is still there ...
-    await holder();
-    const outcome = await Promise.race([behind.then(() => 'acquired'), sleep(5_000).then(() => 'still waiting')]);
-    assert.equal(outcome, 'acquired'); // ... and does not hold anyone up
-    assert.equal((await readOwner(dir)).label, 'behind');
-    assert.equal(ticketsOf(dir).length, 0); // swept on the way
-    await (await behind)();
-  } finally {
-    abort = true;
-    try { process.kill(-doomed.pid, 'SIGKILL'); } catch { /* the group is gone */ }
-    await holder();
-    await behind?.then((r) => r(), () => {});
-  }
+  await waitUntil(() => ticketsOf(dir).length === 1, 'the doomed waiter to be in line');
+  const behind = acquire(dir, await ownerInfo({ label: 'behind' }), { pollMs: 20, priority: 1 });
+  await waitUntil(() => ticketsOf(dir).length === 2, 'the next waiter to be in line');
+  doomed.kill('SIGKILL'); // no chance to withdraw its ticket
+  await exited;
+  assert.equal(ticketsOf(dir).length, 2); // its ticket is still there ...
+  await holder();
+  const outcome = await Promise.race([behind.then(() => 'acquired'), sleep(5_000).then(() => 'still waiting')]);
+  assert.equal(outcome, 'acquired'); // ... and does not hold anyone up
+  assert.equal((await readOwner(dir)).label, 'behind');
+  assert.equal(ticketsOf(dir).length, 0); // swept on the way
+  await (await behind)();
 });
 
 test('a holder that dies is replaced by the first in line, not by the waiter that happens to poll first', { timeout: 30_000 }, async () => {
@@ -275,22 +287,18 @@ test('a holder that dies is replaced by the first in line, not by the waiter tha
   const code = `import { acquire, ownerInfo } from ${JSON.stringify(mod)};
     await acquire(process.argv[1], await ownerInfo({ label: 'doomed holder' }));
     setInterval(() => {}, 1000);`;
-  const doomed = spawn(process.execPath, ['--input-type=module', '-e', code, dir], { stdio: 'ignore', detached: true });
+  const doomed = spawnNode(code, dir);
   const exited = new Promise((r) => doomed.on('exit', r));
-  try {
-    await waitUntil(async () => (await readOwner(dir))?.label === 'doomed holder', 'the holder to take the lock');
-    const order = [];
-    const waiter = waiterIn(dir, order);
-    // The later arrival polls much faster, and would take over the dead holder's lock first without a line.
-    const first = await lineUp(dir, () => waiter('first', { priority: 1, pollMs: 150 }));
-    const second = await lineUp(dir, () => waiter('second', { priority: 1, pollMs: 5 }));
-    doomed.kill('SIGKILL');
-    await exited;
-    await Promise.all([first(), second()]);
-    assert.deepEqual(order, ['first', 'second']);
-  } finally {
-    doomed.kill('SIGKILL');
-  }
+  await waitUntil(async () => (await readOwner(dir))?.label === 'doomed holder', 'the holder to take the lock');
+  const order = [];
+  const waiter = waiterIn(dir, order);
+  // The later arrival polls much faster, and would take over the dead holder's lock first without a line.
+  const first = await lineUp(dir, () => waiter('first', { priority: 1, pollMs: 150 }));
+  const second = await lineUp(dir, () => waiter('second', { priority: 1, pollMs: 5 }));
+  doomed.kill('SIGKILL');
+  await exited;
+  await Promise.all([first(), second()]);
+  assert.deepEqual(order, ['first', 'second']);
 });
 
 test('a waiter that gives up withdraws its place, and the next one goes ahead', { timeout: 30_000 }, async () => {
@@ -402,28 +410,20 @@ test('a damaged ticket is swept, a ticket that cannot be read is not, and old ha
   await writeFile(unreadable, JSON.stringify(await ownerInfo({ label: 'unreadable' })));
   await chmod(unreadable, 0o000);
 
-  let abort = false;
   let got = false;
-  const waiter = acquire(dir, await ownerInfo({ label: 'w' }), { pollMs: 10, priority: 1, isAborted: () => abort })
+  const waiter = acquire(dir, await ownerInfo({ label: 'w' }), { pollMs: 10, priority: 1 })
     .then((r) => { got = true; return r(); }, () => {});
-  try {
-    await waitUntil(() => !names().some((n) => n.includes('damaged')), 'the damaged ticket to be swept');
-    assert.equal(names().some((n) => n.includes('old.json.tmp')), false);
-    assert.equal(names().some((n) => n.includes('young.json.tmp')), true);
-    assert.equal(names().some((n) => n.includes('unreadable')), true);
-    await holder();
-    await sleep(150); // many polls with the lane free
-    assert.equal(got, false); // the unreadable ticket is still ahead
-    await chmod(unreadable, 0o600);
-    await rm(unreadable);
-    await waiter;
-    assert.equal(got, true);
-  } finally {
-    abort = true;
-    await chmod(unreadable, 0o600).catch(() => {});
-    await holder();
-    await waiter;
-  }
+  await waitUntil(() => !names().some((n) => n.includes('damaged')), 'the damaged ticket to be swept');
+  assert.equal(names().some((n) => n.includes('old.json.tmp')), false);
+  assert.equal(names().some((n) => n.includes('young.json.tmp')), true);
+  assert.equal(names().some((n) => n.includes('unreadable')), true);
+  await holder();
+  await sleep(150); // many polls with the lane free
+  assert.equal(got, false); // the unreadable ticket is still ahead
+  await chmod(unreadable, 0o600);
+  await rm(unreadable);
+  await waiter;
+  assert.equal(got, true);
 });
 
 test('tryLock takes a free lock, answers null while it is held, and takes one whose holder is gone', async () => {

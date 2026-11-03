@@ -1,19 +1,27 @@
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { chmod, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { commitFiles, git, tempDir, waitUntil } from './helpers.mjs';
+import { atTestEnd, commitFiles, git, stopBackground, tempDir, tracked, waitUntil } from './helpers.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { addAcks, writeHold } from '../lib/state.mjs';
-import { runDeploy } from '../lib/deploy.mjs';
-import { at, setupDeploy } from './deploy-fixture.mjs';
+import { runDeploy as realRunDeploy } from '../lib/deploy.mjs';
+import { at, setupDeploy as makeDeploy } from './deploy-fixture.mjs';
+
+// However a test ends, the lanes it held and the deploys waiting behind them end with it.
+afterEach(stopBackground, { timeout: 30_000 });
+const runDeploy = tracked(realRunDeploy);
+const setupDeploy = async (options) => {
+  const s = await makeDeploy(options);
+  return { ...s, deploy: tracked(s.deploy) };
+};
 
 const seed = ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) });
 
 // Takes a lane or the deploy lock, as another run would; the returned function gives it back.
 async function hold(s, ...path) {
-  return await acquire(join(s.deps.tmpRoot, ...path), await ownerInfo({ command: 'test holder' }), { pollMs: 10 });
+  return atTestEnd(await acquire(join(s.deps.tmpRoot, ...path), await ownerInfo({ command: 'test holder' }), { pollMs: 10 }));
 }
 const waitFor = (lines, text, what = text) => waitUntil(() => lines.some((l) => l.includes(text)), what, 30_000);
 // main gains a commit on the origin the deploys fetch from.
