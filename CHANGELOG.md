@@ -2,6 +2,12 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- A check on Cloudflare Workers Builds whose build has not started after 5 minutes goes back in line, instead of waiting out `timeoutMin` for a build that may have been skipped: a skipped build leaves no check run to read.
+
 ## 0.1 - 2026-11-03
 
 ### Added

@@ -118,7 +118,7 @@ and `setup.sh` (the `setup` file as it is on main, when configured). Anything th
 branch's last tip, fetched first so that a push sends only what is new (the mirror keeps the last commit it
 pushed under `refs/ship/cloudflare/tip/<branch>`, so that git does not prune the chain and the next fetch
 does not bring it again); the repository's own history is never pushed. Two checks at once push two
-commits, and both are built.
+commits, and both are built, unless the older one is skipped (see the verdict below).
 
 Workers Builds clones that one commit and runs `bash .ship-run/run.sh`, from the checkout root. The script
 first checks that the checkout is the commit the build was started for (`WORKERS_CI_COMMIT_SHA`, which
@@ -140,8 +140,11 @@ run, another name, another commit, `neutral` or one that is still going: none of
 completed run of the build that is not a success on that commit makes it red even beside a success. Only a
 completed run is read: while the build is queued or running there may be no check run or one that is
 `in_progress`, and ship keeps waiting, up to `timeoutMin` (a build is stopped by Cloudflare after 20
-minutes; the rest is for the queue). Green posts `local-ci` with `· on Cloudflare` in the description and a link to the check
-run, from this machine, with your login. Anything else (a red build, no result in time, a push that failed, `gh`
+minutes; the rest is for the queue). A build that has not started has no check run, and it may never start:
+Workers Builds can skip a build still waiting for a machine when a newer commit reaches the branch, and a
+skipped build leaves no check run at all. So a build with no check run after 5 minutes is given up on, whatever
+`timeoutMin` says. If it starts after all it runs on, and its result is ignored. Green posts `local-ci` with `· on Cloudflare` in the description and a link to the check
+run, from this machine, with your login. Anything else (a red build, a build not started or no result in time, a push that failed, `gh`
 not answering) sends the check back to its old place in line with a `! … back in line on this machine` line,
 and this machine gives the verdict: a red may be Cloudflare's, so it never reads as a red check. Ctrl-C and a
 pull request that moves on end the wait, but the build cannot be cancelled without a Cloudflare credential,
