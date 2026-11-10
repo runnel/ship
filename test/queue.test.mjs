@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { acquire, ownerInfo, processStartTime } from '../lib/lock.mjs';
-import { parseLogName, runtimeOf, readHistory, usualFor, readLanes, snapshot, render, runQueue, kindOf } from '../lib/queue.mjs';
+import { parseLogName, runtimeOf, readHistory, usualFor, readLanes, snapshot, render, renderLand, runQueue, kindOf } from '../lib/queue.mjs';
+import { readLandLines } from '../lib/land-line.mjs';
 import { LANE_PRIORITY } from '../lib/shared.mjs';
 import { tempDir, waitUntil } from './helpers.mjs';
 
@@ -373,4 +374,24 @@ test('a land ticket filed after a check ticket is served first through the real 
   await holder();
   await Promise.all([check, land]);
   assert.deepEqual(served, ['land', 'check']);
+});
+
+test('ship queue shows each repository\'s land line: the holder, the live waiters in order, how long; read only', async () => {
+  const tmpRoot = await tempDir();
+  const dir = join(tmpRoot, 'land', 'acme__app');
+  await mkdir(join(dir, 'slot'), { recursive: true });
+  await writeFile(join(dir, 'slot', 'owner.json'), JSON.stringify(await live({ repo: 'acme/app', pr: 12, headSha: '3f2a1b9'.padEnd(40, '0'), land: true }, { since: new Date(NOW - 4 * MIN).toISOString() })));
+  const waiting = await live({ repo: 'acme/app', pr: 13, headSha: '9e8d7c6'.padEnd(40, '0'), land: true });
+  await writeFile(join(dir, `slot.q-01-${String(NOW - 3 * MIN).padStart(15, '0')}-000000-${waiting.nonce}.json`), JSON.stringify(waiting));
+  const gone = await deadOwner({ repo: 'acme/app', pr: 14, land: true });
+  await writeFile(join(dir, `slot.q-01-${String(NOW - 2 * MIN).padStart(15, '0')}-000000-${gone.nonce}.json`), JSON.stringify(gone));
+  const before = (await readdir(dir)).sort();
+  const lines = await readLandLines(tmpRoot);
+  assert.deepEqual(lines.map((l) => [l.repo, l.holder.pr, l.stale, l.waiters.map((w) => w.owner.pr)]), [['acme/app', 12, false, [13]]]);
+  const out = renderLand(lines, NOW);
+  assert.match(out[0], /^land acme\/app: PR #12 @ 3f2a1b9 holds the slot for 4m00s \(since .+\), 1 waiting$/);
+  assert.equal(out[1], '   1. PR #13 @ 9e8d7c6  ·  waited 3m00s');
+  assert.equal(out.length, 2);
+  assert.deepEqual((await readdir(dir)).sort(), before, 'read only');
+  assert.deepEqual(await readLandLines(await tempDir()), [], 'no land lines: nothing to show');
 });
