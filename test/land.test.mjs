@@ -1,8 +1,8 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { readdirSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { abortedError } from '../lib/shared.mjs';
@@ -482,9 +482,10 @@ test('an error after the merge is exit 3: "merged, but ship failed after the mer
 // PR #7 changes app (a deployable); the fake cloud has app and tick live at the first commit, and time
 // moves only when the land sleeps. `requires` is a JS array literal for the config; `extra(cloudDir)`
 // may add workers and repositories.
-async function setupLandLive({ requires = '[]', workers = {}, remote = null } = {}) {
+async function setupLandLive({ requires = '[]', workers = {}, remote = null, headConfig = null } = {}) {
   const cloudDir = join(await tempDir('cloud-'), 'cloud');
-  const s = await setupLand({ configText: configText(join(cloudDir, 'bin', 'wrangler'), { requires }), baseFiles: FILES, featFiles: { 'app/src/a.ts': 'export const a = 2;\n' } });
+  const text = configText(join(cloudDir, 'bin', 'wrangler'), { requires, ...(headConfig ? { guard: 'true' } : {}) });
+  const s = await setupLand({ configText: text, baseFiles: FILES, featFiles: { 'app/src/a.ts': 'export const a = 2;\n', ...(headConfig ? { 'ship.config.mjs': headConfig(text) } : {}) } });
   const first = (await git(['--git-dir', s.origin, 'rev-list', '--max-parents=0', 'main'], s.work)).trim();
   const cloud = await fakeCloud({ dir: cloudDir, workers: { 'example-app': at(first), 'example-tick': at(first), ...workers }, probe: healthy,
     hosts: { 'https://app.example.com': 'example-app', 'https://tick.example.com': 'example-tick' } });
@@ -553,6 +554,43 @@ test('floors that cannot be read are an error before the merge: exit 4, nothing 
   assert.match(s.lines.at(-1), /^✗ PR #7 not merged: could not read the floors of the requirements \(.+\); landing again is safe$/);
   assert.equal((await s.merges()).length, 0);
   assert.equal(await s.originMain(), before);
+});
+
+test('a head whose config does not load on its own still lands: main\'s requirements are the floors', { timeout: 90_000 }, async () => {
+  const { other, apiMain } = await apiOrigin();
+  // Loads in the merged tree (which has b.txt, from main) but not at the head alone.
+  const needsMain = (text) => `${text.replace('export default {', 'const cfg = {')}
+export default async ({ root }) => {
+  const { readFileSync } = await import('node:fs');
+  readFileSync(root + '/b.txt');
+  return cfg;
+};\n`;
+  const { s, deps } = await setupLandLive({ requires: REQUIRES_API, workers: { 'example-api': at(apiMain) }, headConfig: needsMain,
+    remote: (origin) => (repo) => (repo === 't/api' ? other.origin : origin) });
+  assert.equal(await land(s, { deps }), 0, s.lines.join('\n'));
+  const merged = await s.originMain();
+  const rec = JSON.parse(await readFile(join(landDir({ tmpRoot: s.deps.tmpRoot }, 't/r'), 'floors', `${merged}.json`), 'utf8'));
+  assert.deepEqual(rec.floors, { 't/api': apiMain });
+});
+
+test('the floor record is written as soon as the merge commit is known, before the wait for the mirror', { timeout: 90_000 }, async () => {
+  const { other, apiMain } = await apiOrigin();
+  let s;
+  let before = null;
+  let atFirstLook = null;
+  const dir = () => join(landDir({ tmpRoot: s.deps.tmpRoot }, 't/r'), 'floors');
+  const mainNow = () => execFileSync('git', ['--git-dir', s.origin, 'rev-parse', 'refs/heads/main'], { encoding: 'utf8' }).trim();
+  // seeMerge's first act is to read the mirror; the first read after main moved shows what exists by then.
+  const remote = (origin) => (repo) => {
+    if (repo === 't/api') return other.origin;
+    if (s && before && atFirstLook === null && mainNow() !== before) atFirstLook = existsSync(dir()) ? readdirSync(dir()) : [];
+    return origin;
+  };
+  const set = await setupLandLive({ requires: REQUIRES_API, workers: { 'example-api': at(apiMain) }, remote });
+  s = set.s;
+  before = mainNow();
+  assert.equal(await land(s, { deps: set.deps }), 0, s.lines.join('\n'));
+  assert.deepEqual(atFirstLook, [`${await s.originMain()}.json`]);
 });
 
 test('two lands started at the same moment: the one that meets the other on the head lock refuses as a duplicate (exit 2)', async () => {
