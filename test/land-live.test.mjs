@@ -1,12 +1,13 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { landDeps } from '../lib/land.mjs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { contains, decide, landedChanges, liveFor, readLiveCache, waitLive } from '../lib/land-live.mjs';
+import { contains, decide, landedChanges, liveFor, readLiveCache, recordFloors, waitLive } from '../lib/land-live.mjs';
 import { recordDeployEnd } from '../lib/land-deploy.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
-import { landDir } from '../lib/land-line.mjs';
+import { iso, landDir } from '../lib/land-line.mjs';
 import { addAcks, clearHold, writeHold } from '../lib/state.mjs';
 import { localTime } from '../lib/report.mjs';
 import { commitTimeMs, mirrorPath } from '../lib/git.mjs';
@@ -491,7 +492,7 @@ test('a change and its revert: the plan calls the deployable live although its l
 });
 
 test('the tip whose deploy ended ok is not deployed again: the land waits for it to show as live, then ends with 3', async () => {
-  const l = await landed({ land: { liveWaitHours: 0.02 } });
+  const l = await landed({ land: { liveWaitHours: 0.06 } }); // past the 120 s debounce, so only the guard keeps the deploy away
   await recordDeployEnd({ d: l.d, repo: 't/r', id: 'x1', tip: l.s.head, code: 0, log: '/dev/null' });
   assert.equal(await l.wait(), 3);
   assert.deepEqual(l.starts, []);
@@ -502,5 +503,76 @@ test('a deploy that stopped at an uncleared migration is not a failure of this l
   const l = await landed();
   await recordDeployEnd({ d: l.d, repo: 't/r', id: 'x1', tip: l.s.head, code: 1, log: '/dev/null', migrationsWaiting: true });
   assert.equal(await l.wait(), 0, l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1);
+});
+
+test('a deploy carries every merge below its tip: a later land\'s floor is met before A\'s tick ships it', async () => {
+  // A merged with floor F1 (t/api live at it); B, merged after A on top of it, needs t/api at F2, which
+  // is not live yet. A's tick must not ship B's merge under A's own floor.
+  const rq = await requiresSetup();
+  let apiLiveAt = null;
+  const l = await landed({ from: rq.s, ack: [], onTick: async (n, { s, d }) => {
+    if (n !== 7) return;
+    apiLiveAt = d.now();
+    const v = s.cloud.addVersion('example-api', { message: `sha:${rq.otherSecond} x` });
+    s.cloud.addDeployment('example-api', v.id, { message: `sha:${rq.otherSecond} x` });
+  } });
+  const b = await commitFiles(l.s.work, { 'app/src/a.ts': '3' }, 'b change (#10)');
+  await git(['push', '--quiet', l.d.remoteUrl(), 'main'], l.s.work);
+  await recordFloors({ d: l.d, repo: 't/r', mergeSha: b, floors: { 't/api': rq.otherSecond } });
+  assert.equal(await l.wait({ floors: { 't/api': rq.otherFirst } }), 0, l.s.lines.join('\n'));
+  assert.ok(l.s.lines.some((x) => x.startsWith(`… waiting for t/api app to be live at or past ${rq.otherSecond.slice(0, 7)} (live at ${rq.otherFirst.slice(0, 7)}) before deploying`)), l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1);
+  assert.ok(l.starts[0].at > apiLiveAt, 'the deploy of the tip that carries B waited for B\'s floor');
+  assert.ok(l.s.lines.includes(`✓ requires t/api app: live at or past ${rq.otherSecond.slice(0, 7)}`), 'the deploy was given the newest floor');
+});
+
+test('a floor recorded for a merge the tip does not carry is not held to', async () => {
+  const rq = await requiresSetup();
+  const l = await landed({ from: rq.s, ack: [] });
+  await recordFloors({ d: l.d, repo: 't/r', mergeSha: 'c'.repeat(40), floors: { 't/api': rq.otherSecond } });
+  assert.equal(await l.wait({ floors: { 't/api': rq.otherFirst } }), 0, l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1);
+});
+
+test('waitLive with no floor for a required repository holds it to that repository\'s main now', async () => {
+  const rq = await requiresSetup();
+  const l = await landed({ from: rq.s, ack: [], land: { liveWaitHours: 0.02 } });
+  assert.equal(await l.wait(), 3);
+  assert.ok(l.s.lines.includes(`… waiting for t/api app to be live at or past ${rq.otherSecond.slice(0, 7)} (live at ${rq.otherFirst.slice(0, 7)})`), l.s.lines.join('\n'));
+  assert.deepEqual(l.starts, []);
+});
+
+test('maybeDeploy\'s own check: a deploy of the tip that ended ok after the land decided is not started again', async () => {
+  const l = await landed({ land: { liveWaitHours: 0.06 } });
+  const orig = l.d.now;
+  let armed = false;
+  // The record appears after gather has read the deploys and before maybeDeploy does: the first
+  // time the land itself (decide's nowMs) asks for the time once the debounce has passed.
+  l.d.now = () => {
+    if (!armed && orig() - l.clock.t0 >= 120_000 && new Error().stack.split('\n')[2].includes('waitLive')) {
+      armed = true;
+      const dir = join(landDir(l.d, 't/r'), 'deploys');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${l.s.head}-zz.end.json`), JSON.stringify({ id: 'zz', tip: l.s.head, code: 0, log: '/dev/null', migrationsWaiting: false, endedAt: iso({ now: orig }) }));
+    }
+    return orig();
+  };
+  l.clock.t0 = l.clock.t;
+  assert.equal(await l.wait(), 3);
+  assert.ok(armed, 'the record was written between the read and the decision');
+  assert.deepEqual(l.starts, []);
+});
+
+test('an error starting the deploy is said once and tried again next tick, not the end of the land', async () => {
+  const l = await landed();
+  const real = l.d.startDeploy;
+  let failed = false;
+  l.d.startDeploy = async (a) => {
+    if (!failed) { failed = true; throw new Error('spawn boom'); }
+    return real(a);
+  };
+  assert.equal(await l.wait(), 0, l.s.lines.join('\n'));
+  assert.equal(l.s.lines.filter((x) => x === '! could not decide or start the deploy (spawn boom); trying again every 30 s').length, 1);
   assert.equal(l.starts.length, 1);
 });
