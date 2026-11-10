@@ -124,7 +124,7 @@ test('ship unhold and ship migrations reject what they cannot take with exit 2',
 
 test('the usage lists every command with its description in one column', { timeout: 30_000 }, async () => {
   const rows = (await ship()).stdout.split('\n').filter((l) => l.startsWith('  ship '));
-  assert.equal(rows.length, 13);
+  assert.equal(rows.length, 14);
   assert.equal(new Set(rows.map((l) => l.match(/^ {2}ship .*? {2,}/)[0].length)).size, 1, rows.join('\n'));
 });
 
@@ -134,4 +134,11 @@ test('ship migrations apply refuses to run without a terminal, before it reads o
   assert.equal(r.code, 2, r.stderr);
   assert.match(r.stdout, /^✗ ship migrations apply changes the production database, so it only runs where the owner can read the plan and type the answer: in their own terminal\. Nothing was read or changed\.\n/);
   assert.match(r.stdout, /ship migrations plan <file>/);
+});
+
+test('ship land takes --pr <number> and --keep-branch: anything else is a usage error, exit 2', { timeout: 30_000 }, async () => {
+  const usage = /^ship land \[--pr <number>\] \[--keep-branch\] {3,}check and merge a pull request/;
+  await usageError(['land', '--pr', 'feat'], 'land: --pr feat: give a pull request number', usage);
+  await usageError(['land', '--admin'], 'land: .*--admin', usage);
+  await usageError(['land', '12'], 'land: .*12', usage);
 });

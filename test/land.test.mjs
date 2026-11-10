@@ -1,13 +1,16 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { landDeps, landInSlot, reusable } from '../lib/land.mjs';
+import { landDeps, landInSlot, reusable, runLand } from '../lib/land.mjs';
 import { runCheck } from '../lib/check.mjs';
 import { ensureMirror, fetchCommit, mirrorPath } from '../lib/git.mjs';
 import { postStatus } from '../lib/github.mjs';
-import { acquire, ownerInfo } from '../lib/lock.mjs';
-import { atTestEnd, git, hangingRemote, setupCheck, stopBackground, tempDir } from './helpers.mjs';
+import { acquire, ownerInfo, readOwner } from '../lib/lock.mjs';
+import { headLockDir, landDir, slotDir } from '../lib/land-line.mjs';
+import { atTestEnd, commitFiles, fakeGh, git, hangingRemote, setupCheck, statusesOf, stopBackground, tempDir, tracked, waitUntil } from './helpers.mjs';
 
 afterEach(stopBackground, { timeout: 30_000 });
 
@@ -212,4 +215,192 @@ test('the status is read at the head the merge is pinned to', async () => {
   assert.ok(reads.length > 0);
   assert.ok(reads.every((c) => c[1].includes(`/commits/${head}/statuses`)), JSON.stringify(reads));
   assert.deepEqual((await s.merges())[0].slice(-3), ['--match-head-commit', head, '--delete-branch']);
+});
+
+// runLand in this process, with the land deps of a setup.
+const land = tracked((s, { pr = '7', deps = {}, keepBranch = false } = {}) => runLand({ cwd: s.work, pr, keepBranch, deps: { ...s.deps, ...deps } }));
+// Holds the land slot of t/r as another land would, so that the land under test waits in line.
+const holdSlot = async (s) => atTestEnd(await acquire(slotDir(s.deps, 't/r'), await ownerInfo({ repo: 't/r', pr: 99, headSha: 'f'.repeat(40), land: true })));
+const tickets = async (s) => (await readdir(landDir(s.deps, 't/r')).catch(() => [])).filter((n) => n.startsWith('slot.q-') && n.endsWith('.json'));
+const headOf = async (s, branch = 'feat') => (await git(['rev-parse', branch], s.work)).trim();
+
+test('refused without a status: a fork, a PR that is not open, one into another branch, a detached HEAD', async () => {
+  for (const [prOverrides, text] of [
+    [{ isCrossRepository: true }, /^✗ not landing: PR #7 comes from a fork/],
+    [{ state: 'MERGED' }, /^✗ not landing: PR #7 is merged$/],
+    [{ baseRefName: 'release' }, /^✗ not landing: PR #7 targets release; only PRs into main are landed$/],
+  ]) {
+    const s = await setupLand({ prOverrides });
+    assert.equal(await land(s), 2);
+    assert.match(s.lines.at(-1), text);
+    assert.deepEqual(await s.statuses(), []);
+  }
+  const s = await setupLand();
+  await git(['checkout', '--quiet', '--detach'], s.work);
+  assert.equal(await runLand({ cwd: s.work, deps: s.deps }), 2);
+  assert.match(s.lines.at(-1), /detached HEAD — run: ship land --pr <number>/);
+});
+
+test('the same PR and head landing twice: refused; a new head joins the line and the old land leaves at its probe', { timeout: 60_000 }, async () => {
+  const s = await setupLand();
+  const release = await holdSlot(s);
+  const first = land(s, { deps: { doomedPollMs: 25, doomedConfirmMs: 5 } });
+  await waitUntil(async () => (await tickets(s)).length === 1, 'the first land is in line');
+  assert.equal(await land(s), 2);
+  assert.match(s.lines.join('\n'), /✗ not landing: PR #7 @ [0-9a-f]{7} is already landing \(pid \d+\)/);
+  const newHead = await commitFiles(s.work, { 'src/y.ts': 'y\n' }, 'second commit');
+  await git(['push', '--quiet', s.origin, 'feat'], s.work);
+  await s.setPr({ headRefOid: newHead });
+  const second = land(s);
+  assert.equal(await first, 2);
+  assert.match(s.lines.join('\n'), /✗ not landing PR #7 @ [0-9a-f]{7}: the head of PR #7 moved to [0-9a-f]{7}; run ship land --pr 7 for it/);
+  await waitUntil(async () => (await tickets(s)).length === 1, 'the new head waits in line on its own');
+  await release();
+  assert.equal(await second, 0, s.lines.join('\n'));
+  assert.equal((await s.merges()).at(-1)[7], newHead);
+});
+
+test('an optional ship check of the same head: the land waits for it outside the line, then reuses its green', { timeout: 60_000 }, async () => {
+  const s = await setupLand({ steps: (ctl) => [`echo run >> ${ctl}/runs; for i in $(seq 1 600); do test -f ${ctl}/go && exit 0; sleep 0.05; done; exit 1`, 'test -f src/x.ts'] });
+  const check = tracked(runCheck)({ cwd: s.work, deps: s.deps });
+  await waitUntil(async () => (await s.runs()) === 1, 'the optional check runs its step');
+  const landing = land(s);
+  await waitUntil(() => s.lines.some((l) => l.includes('an optional ship check of')), 'the land waits for it');
+  assert.deepEqual(await tickets(s), [], 'no place in line while it waits');
+  await writeFile(join(s.ctl, 'go'), '');
+  assert.equal(await check, 0);
+  assert.equal(await landing, 0, s.lines.join('\n'));
+  assert.equal(await s.runs(), 1, 'checked once');
+  assert.equal((await s.merges()).length, 1);
+});
+
+test('lands go in arrival order, a dead waiter is skipped, and the next check runs on the main the first one made', { timeout: 90_000 }, async () => {
+  const s = await setupLand();
+  // PR #8 adds src/z.ts on a branch from main: its check passes only if it sees PR #7's src/x.ts on main.
+  await git(['checkout', '--quiet', '-b', 'feat2', 'main'], s.work);
+  const head8 = await commitFiles(s.work, { 'src/z.ts': 'z\n' }, 'feat2');
+  await git(['push', '--quiet', s.origin, 'feat2'], s.work);
+  await git(['checkout', '--quiet', 'feat'], s.work);
+  const gh8 = await fakeGh(await tempDir(), { pr: { number: 8, headRefOid: head8, headRefName: 'feat2', baseRefName: 'main', isCrossRepository: false, state: 'OPEN' }, origin: s.origin, squash: true, liveStatuses: true });
+  const release = await holdSlot(s);
+  const dead = spawn(process.execPath, ['-e', '0'], { stdio: 'ignore' });
+  await once(dead, 'close');
+  await writeFile(join(landDir(s.deps, 't/r'), `slot.q-01-${String(Date.now() - 60_000).padStart(15, '0')}-000000-dead.json`),
+    JSON.stringify({ pid: dead.pid, startTime: null, nonce: 'dead', repo: 't/r', pr: 5, headSha: 'e'.repeat(40), land: true }));
+  const live = async () => (await tickets(s)).filter((n) => !n.endsWith('-dead.json'));
+  const seven = land(s);
+  await waitUntil(async () => (await live()).length === 1, 'PR #7 is in line');
+  const eight = land(s, { pr: '8', deps: { gh: gh8.gh } });
+  await waitUntil(async () => (await live()).length === 2, 'PR #8 is in line behind it');
+  await release();
+  assert.equal(await seven, 0, s.lines.join('\n'));
+  assert.equal(await eight, 0, s.lines.join('\n'));
+  const subjects = (await git(['--git-dir', s.origin, 'log', '--first-parent', '--format=%s', '-2', 'main'], s.work)).trim().split('\n');
+  assert.deepEqual(subjects, ['feat2 (#8)', 'feat (#7)']);
+  const merged7 = (await git(['--git-dir', s.origin, 'rev-parse', 'main~1'], s.work)).trim();
+  assert.match(statusesOf(await gh8.calls()).at(-1).description, new RegExp(`vs main@${merged7.slice(0, 7)}`), 'PR #8 was checked against the main PR #7 made');
+  assert.deepEqual(await tickets(s), [], 'the dead waiter\'s ticket is gone too');
+  assert.equal(await readOwner(slotDir(s.deps, 't/r')), null);
+});
+
+test('red frees the slot and the head lock; so does a time limit hit in the slot (exit 4)', { timeout: 60_000 }, async () => {
+  const red = await setupLand({ steps: () => ['exit 3'] });
+  assert.equal(await land(red), 1);
+  assert.equal(await readOwner(slotDir(red.deps, 't/r')), null);
+  assert.equal(await readOwner(headLockDir(red.deps, 't/r', await headOf(red))), null);
+  const hung = await setupLand({ steps: ARMED });
+  await hung.arm(`printf '{"hangMs":5000}' > ${join(hung.root, 'pr-live.json')}\n`);
+  assert.equal(await land(hung, { deps: { ghTimeoutMs: 300 } }), 4);
+  assert.equal(await readOwner(slotDir(hung.deps, 't/r')), null);
+});
+
+// runLand in a child process that leads its own process group, as bin/ship.mjs makes ship do.
+// `out.text` is what it prints; `exited` resolves with its exit code; the test's end kills the group.
+function spawnLand(s) {
+  const script = `
+import { runLand } from ${JSON.stringify(new URL('../lib/land.mjs', import.meta.url).href)};
+import { isInterrupted } from ${JSON.stringify(new URL('../lib/interrupt.mjs', import.meta.url).href)};
+const a = JSON.parse(process.argv[1]);
+const deps = { gh: a.gh, remoteUrl: () => a.origin, mirrorRoot: a.mirrorRoot, tmpRoot: a.tmpRoot, logRoot: a.logRoot, stateRoot: a.stateRoot, pollMs: 10,
+  keepAwake: () => ({ stop() {} }), out: (l) => process.stdout.write(l + '\\n') };
+let code;
+try { code = await runLand({ cwd: a.cwd, pr: '7', deps }); } catch (e) { code = e?.aborted || isInterrupted() ? 130 : 1; }
+process.exitCode = code;
+`;
+  const args = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot, stateRoot: s.deps.stateRoot });
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script, args], { detached: true, stdio: ['ignore', 'pipe', 'inherit'] });
+  atTestEnd(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } });
+  const out = { text: '' };
+  child.stdout.on('data', (b) => { out.text += b; });
+  return { child, out, exited: new Promise((resolve) => child.on('close', (code) => resolve(code))) };
+}
+
+test('an interrupt while only queued leaves the line and posts no status', { timeout: 60_000 }, async () => {
+  const s = await setupLand();
+  const release = await holdSlot(s);
+  const l = spawnLand(s);
+  await waitUntil(() => l.out.text.includes('waiting in the land line'), 'the land waits in line');
+  process.kill(-l.child.pid, 'SIGINT');
+  assert.equal(await l.exited, 130);
+  assert.deepEqual(statusesOf(await s.calls()), [], 'no status: an optional green on the head stays');
+  assert.deepEqual(await tickets(s), []);
+  assert.equal(await readOwner(headLockDir(s.deps, 't/r', await headOf(s))), null);
+  assert.equal((await readOwner(slotDir(s.deps, 't/r'))).pr, 99, 'the holder is untouched');
+  await release();
+});
+
+test('an interrupt during the land check posts error, frees the slot and the head lock, merges nothing (130)', { timeout: 60_000 }, async () => {
+  const s = await setupLand({ steps: (ctl) => [`touch ${ctl}/started; for i in $(seq 1 600); do sleep 0.05; done`] });
+  const l = spawnLand(s);
+  await waitUntil(async () => (await readFile(join(s.ctl, 'started'), 'utf8').then(() => true, () => false)), 'the check step runs');
+  process.kill(-l.child.pid, 'SIGINT');
+  assert.equal(await l.exited, 130);
+  assert.doesNotMatch(l.out.text, /not merged|landing again is safe/, 'an interrupt is not reported as a failure');
+  const last = (await s.statuses()).at(-1);
+  assert.equal(last.state, 'error');
+  assert.match(last.description, /^ship interrupted · vs main@[0-9a-f]{7}$/);
+  assert.equal(await readOwner(slotDir(s.deps, 't/r')), null);
+  assert.equal(await readOwner(headLockDir(s.deps, 't/r', await headOf(s))), null);
+  assert.equal((await s.merges()).length, 0);
+});
+
+test('a PR with nothing to deploy is done at the merge, and every land leaves one ledger line', async () => {
+  const s = await setupLand();
+  assert.equal(await land(s), 0, s.lines.join('\n'));
+  assert.match(s.lines.at(-1), /^✓ PR #7 landed as [0-9a-f]{7}: it touches no deployable and adds no migration, so it is done at the merge$/);
+  const [entry] = (await readFile(join(s.deps.stateRoot, 'land', 't__r.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual([entry.pr, entry.head, entry.code], [7, await headOf(s), 0]);
+  for (const k of ['joinedAt', 'slotAt', 'mergedAt', 'endedAt']) assert.ok(!Number.isNaN(Date.parse(entry[k])), k);
+});
+
+// A config with one deployable, for the PR B interim: Task 14 replaces this test.
+const WITH_APP = `export default { repo: 't/r', docsOnly: ['*.md'], checks: [{ name: 'unit', paths: ['**'], steps: ['true'] }],
+  deployables: [{ name: 'app', worker: 'example-app', cwd: '.', paths: ['src/**'], mode: 'direct' }],
+  credentials: { file: '/unused', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } } };\n`;
+
+test('interim: a PR that touches a deployable is merged and not deployed by this version (exit 3)', async () => {
+  const s = await setupLand({ configText: WITH_APP });
+  assert.equal(await land(s), 3, s.lines.join('\n'));
+  assert.match(s.lines.at(-1), /^! PR #7 merged as [0-9a-f]{7} and touches app; this version of ship land does not deploy yet — run ship deploy$/);
+});
+
+test('two lands started at the same moment: the one that meets the other on the head lock refuses as a duplicate (exit 2)', async () => {
+  const s = await setupLand();
+  const head = await headOf(s);
+  // A land for this PR that took the head lock after the other's check-then-act (its owner names another head, so alreadyLanding does not see it).
+  const release = atTestEnd(await acquire(headLockDir(s.deps, 't/r', head), await ownerInfo({ repo: 't/r', pr: 7, headSha: 'f'.repeat(40), land: true })));
+  assert.equal(await land(s), 2, s.lines.join('\n'));
+  assert.match(s.lines.at(-1), /^✗ not landing PR #7 @ [0-9a-f]{7}: PR #7 @ [0-9a-f]{7} is already landing \(pid \d+\)$/);
+  assert.deepEqual(await tickets(s), []);
+  assert.deepEqual(statusesOf(await s.calls()), []);
+  assert.equal((await readOwner(headLockDir(s.deps, 't/r', head))).pr, 7, 'the holder is untouched');
+  await release();
+});
+
+test('a PR retargeted while it was checked is not merged: exit 2, nothing squashed onto an unchecked base', async () => {
+  const s = await setupLand({ steps: ARMED });
+  await s.arm(`printf '{"baseRefName":"release"}' > ${join(s.root, 'pr-live.json')}\n`);
+  assert.deepEqual(await inSlot(s), { code: 2 }, s.lines.join('\n'));
+  assert.equal((await s.merges()).length, 0);
+  assert.equal(s.lines.at(-1), '✗ not landing PR #7: it now targets release; only PRs into main are landed');
 });
