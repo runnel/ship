@@ -2,7 +2,7 @@ import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { landDeps, landInSlot, reusable, runLand } from '../lib/land.mjs';
 import { runCheck } from '../lib/check.mjs';
@@ -312,6 +312,7 @@ test('red frees the slot and the head lock; so does a time limit hit in the slot
   await hung.arm(`printf '{"hangMs":5000}' > ${join(hung.root, 'pr-live.json')}\n`);
   assert.equal(await land(hung, { deps: { ghTimeoutMs: 300 } }), 4);
   assert.equal(await readOwner(slotDir(hung.deps, 't/r')), null);
+  assert.equal(await readOwner(headLockDir(hung.deps, 't/r', await headOf(hung))), null);
 });
 
 // runLand in a child process that leads its own process group, as bin/ship.mjs makes ship do.
@@ -362,15 +363,77 @@ test('an interrupt during the land check posts error, frees the slot and the hea
   assert.equal(await readOwner(slotDir(s.deps, 't/r')), null);
   assert.equal(await readOwner(headLockDir(s.deps, 't/r', await headOf(s))), null);
   assert.equal((await s.merges()).length, 0);
+  assert.equal((await ledger(s)).at(-1).code, 130, 'an interrupted land is in the ledger too');
 });
 
-test('a PR with nothing to deploy is done at the merge, and every land leaves one ledger line', async () => {
+const ledger = async (s, file = 't__r.jsonl') => (await readFile(join(s.deps.stateRoot, 'land', file), 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+
+test('a PR with nothing to deploy is done at the merge, and every land leaves one ledger line, refused ones too', async () => {
   const s = await setupLand();
   assert.equal(await land(s), 0, s.lines.join('\n'));
   assert.match(s.lines.at(-1), /^✓ PR #7 landed as [0-9a-f]{7}: it touches no deployable and adds no migration, so it is done at the merge$/);
-  const [entry] = (await readFile(join(s.deps.stateRoot, 'land', 't__r.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+  const [entry] = await ledger(s);
   assert.deepEqual([entry.pr, entry.head, entry.code], [7, await headOf(s), 0]);
   for (const k of ['joinedAt', 'slotAt', 'mergedAt', 'endedAt']) assert.ok(!Number.isNaN(Date.parse(entry[k])), k);
+  assert.equal(await land(s), 2, 'the PR is merged now: refused');
+  const lines = await ledger(s);
+  assert.equal(lines.length, 2, 'appended, not replaced');
+  assert.deepEqual([lines[1].pr, lines[1].code, lines[1].joinedAt], [7, 2, null]);
+  // a branch ref goes in its own field, and a detached HEAD is a land too
+  const b = await setupLand();
+  assert.equal(await runLand({ cwd: b.work, deps: b.deps }), 0, b.lines.join('\n'));
+  assert.deepEqual([(await ledger(b))[0].pr, (await ledger(b))[0].branch], [7, 'feat']);
+  await git(['checkout', '--quiet', '--detach'], b.work);
+  assert.equal(await runLand({ cwd: b.work, deps: b.deps }), 2);
+  assert.equal((await ledger(b)).at(-1).code, 2);
+});
+
+test('a ledger that cannot be written is said once, and the land still ends as it would', async () => {
+  const s = await setupLand();
+  await writeFile(join(s.deps.stateRoot, 'land'), 'in the way').catch(async () => { await mkdir(s.deps.stateRoot, { recursive: true }); await writeFile(join(s.deps.stateRoot, 'land'), 'in the way'); });
+  assert.equal(await land(s), 0, s.lines.join('\n'));
+  assert.equal(s.lines.filter((l) => l.startsWith('! could not write the land ledger: ')).length, 1);
+});
+
+test('an error before the PR is read is exit 4, not 1, and leaves a ledger line: not a clone with a GitHub origin', async () => {
+  const s = await setupLand();
+  const nowhere = await tempDir('nowhere-');
+  assert.equal(await runLand({ cwd: nowhere, pr: '7', deps: s.deps }), 4);
+  assert.match(s.lines.at(-1), /^✗ PR 7 not merged: .*; landing again is safe$/);
+  const [entry] = await ledger(s, 'unknown.jsonl');
+  assert.deepEqual([entry.pr, entry.head, entry.code], [7, null, 4]);
+});
+
+test('a land of another PR with the same head on the head lock is waited for, not refused as a duplicate', { timeout: 30_000 }, async () => {
+  const s = await setupLand();
+  const release = await acquire(headLockDir(s.deps, 't/r', await headOf(s)), await ownerInfo({ repo: 't/r', pr: 99, headSha: 'f'.repeat(40), land: true }));
+  let done = false;
+  const landing = land(s).then((c) => { done = true; return c; });
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.equal(done, false, s.lines.join('\n'));
+  await release();
+  assert.equal(await landing, 0, s.lines.join('\n'));
+});
+
+test('after the merge: no merge commit named, or one the mirror never shows, is exit 3 and does not hold the slot for the mirror wait', async () => {
+  const unnamed = await setupLand({ ghOptions: { afterMerge: { mergeCommit: null } } });
+  const started = Date.now();
+  assert.equal(await land(unnamed, { deps: { mergeShaWaitMs: 100, mergePollMs: 5, mirrorWaitMs: 30_000 } }), 3);
+  assert.ok(Date.now() - started < 15_000, 'no mirror wait without a SHA');
+  assert.match(unnamed.lines.at(-1), /^✗ PR #7 merged, but GitHub has not named the merge commit after 0\.1 s: ship land cannot tell when it is live — ship status$/);
+  assert.equal(await readOwner(slotDir(unnamed.deps, 't/r')), null);
+  const unseen = await setupLand({ ghOptions: { afterMerge: { mergeCommit: { oid: 'f'.repeat(40) } } } });
+  assert.equal(await land(unseen, { deps: { mirrorWaitMs: 100, mergePollMs: 5 } }), 3);
+  assert.match(unseen.lines.at(-1), /^✗ PR #7 merged as fffffff, but the mirror does not show it on main after 0\.1 s: ship land cannot tell when it is live — ship status$/);
+  assert.equal((await ledger(unseen)).at(-1).code, 3);
+});
+
+test('an error after the merge is exit 3: "merged, but ship failed after the merge"', async () => {
+  const s = await setupLand();
+  let thrown = false;
+  const out = (l) => { s.lines.push(l); if (!thrown && l.startsWith('✓ PR #7 landed')) { thrown = true; throw new Error('boom'); } };
+  assert.equal(await land(s, { deps: { out } }), 3);
+  assert.equal(s.lines.at(-1), '✗ PR #7 merged, but ship failed after the merge (boom) — ship status');
 });
 
 // A config with one deployable, for the PR B interim: Task 14 replaces this test.
