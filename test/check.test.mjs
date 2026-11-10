@@ -372,3 +372,29 @@ test('a direct ship check whose queued status cannot be posted exits 1 with one 
   assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1, s.lines.join('\n'));
   assert.match(s.lines.join('\n'), /✗ local-ci not started: GitHub did not take the queued status/);
 });
+
+test('land mode names ship land in the advice of a post that failed or a head that moved; a direct check keeps ship check', async () => {
+  const queued = await setup({ ghOptions: { apiFail: { match: 'state=pending' } } });
+  const q = await prepareCheck(queued);
+  await checkOnce({ ...q, land: true });
+  assert.ok(queued.lines.includes('✗ local-ci not started: GitHub did not take the queued status (fake gh: forced failure); run ship land --pr 7'), queued.lines.join('\n'));
+  const direct = await setup({ ghOptions: { apiFail: { match: 'state=pending' } } });
+  await runCheck({ cwd: direct.work, deps: direct.deps });
+  assert.ok(direct.lines.includes('✗ local-ci not started: GitHub did not take the queued status (fake gh: forced failure); run ship check again'), direct.lines.join('\n'));
+
+  const verdict = await setup({ ghOptions: { apiFail: { match: 'state=success' } } });
+  const v = await prepareCheck(verdict);
+  await checkOnce({ ...v, d: { ...v.d, verdictRetryMs: 5 }, land: true });
+  assert.ok(verdict.lines.some((l) => l.endsWith('; run ship land --pr 7') && l.includes('did not take the status')), verdict.lines.join('\n'));
+
+  // the step runs in <root>/tmp/w/<tree>: the PR moves while the check runs
+  const moveHead = `printf '{"headRefOid":"${'d'.repeat(40)}"}' > ../../../pr-live.json`;
+  const landed = await setup({ steps: ['test -f src/x.ts', moveHead] });
+  const l = await prepareCheck(landed);
+  await checkOnce({ ...l, land: true });
+  assert.ok(landed.lines.includes('! the PR head moved to ddddddd during the check — run ship land --pr 7 for it'), landed.lines.join('\n'));
+  const plain = await setup({ steps: ['test -f src/x.ts', moveHead] });
+  const pl = await prepareCheck(plain);
+  await checkOnce(pl);
+  assert.ok(plain.lines.includes('! the PR head moved to ddddddd during the check — run ship check again for it'), plain.lines.join('\n'));
+});
