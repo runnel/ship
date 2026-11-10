@@ -272,12 +272,18 @@ test('the head probe of a waiting land has the gh time limit: no gh child outliv
   const pidsOf = async () => (await readFile(pidsFile, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(Number);
   atTestEnd(() => { for (const pid of pidsOf.last ?? []) killQuietly(pid); });
   const release = await holdSlot(s);
-  const landing = land(s, { deps: { doomedPollMs: 50, doomedConfirmMs: 5, ghTimeoutMs: 1000 } });
+  // The limit also applies to the land's own startup `gh` calls, so it must be far above what a loaded
+  // machine needs to start the fake gh (1000 ms made the land fail at startup, never wait, and the wait
+  // below time out); the hang is longer still, so only the limit ends a hung read.
+  const landing = land(s, { deps: { doomedPollMs: 50, doomedConfirmMs: 5, ghTimeoutMs: 3000 } });
   await waitUntil(async () => (await tickets(s)).length === 1, 'the land waits in line');
-  await writeFile(join(s.root, 'pr-live.json'), '{"hangMs":20000}');
+  await writeFile(join(s.root, 'pr-live.json'), '{"hangMs":40000}');
   await waitUntil(async () => (await pidsOf()).length > 0, 'a probe read hangs');
   await waitUntil(async () => (await pidsOf()).length > 1, 'the hung probe read was given up, the next one started');
   await writeFile(join(s.root, 'pr-live.json'), '{}');
+  // A read that hangs when the land ends is only ended by the limit (the land does not wait for it), so
+  // let the one in flight run into it before the land is released.
+  await new Promise((resolve) => setTimeout(resolve, 3500));
   await release();
   assert.equal(await landing, 0, s.lines.join('\n'));
   const pids = await pidsOf();

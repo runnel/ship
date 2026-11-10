@@ -1,15 +1,17 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { landDeps } from '../lib/land.mjs';
-import { join } from 'node:path';
-import { landedChanges, liveFor } from '../lib/land-live.mjs';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { contains, landedChanges, liveFor } from '../lib/land-live.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { landDir } from '../lib/land-line.mjs';
 import { clearHold, writeHold } from '../lib/state.mjs';
 import { commitTimeMs, mirrorPath } from '../lib/git.mjs';
 import { syncMirror } from '../lib/repo.mjs';
 import { at, setupDeploy } from './deploy-fixture.mjs';
-import { atTestEnd, git, stopBackground } from './helpers.mjs';
+import { capture } from '../lib/proc.mjs';
+import { atTestEnd, commitFiles, git, stopBackground } from './helpers.mjs';
 
 afterEach(stopBackground, { timeout: 30_000 });
 
@@ -128,4 +130,75 @@ test('a refresh that was under way when a deploy ended is not trusted for that d
   const after = await liveFor({ d, repo: 't/r', staleBeforeMs: endedAt });
   assert.ok(s.cloud.apiCalls.length > calls, 'read again: the first read may show what was live before the deploy');
   assert.ok(Date.parse(after.readAt) >= endedAt);
+});
+
+// A commit whose committer date is `at` (unix seconds), pushed to main.
+async function commitAt(s, files, message, at) {
+  for (const [path, content] of Object.entries(files)) {
+    await mkdir(dirname(join(s.work, path)), { recursive: true });
+    await writeFile(join(s.work, path), content);
+  }
+  const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@localhost', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@localhost', GIT_COMMITTER_DATE: `${at} +0000`, GIT_AUTHOR_DATE: `${at} +0000` };
+  await capture('git', ['add', '-A'], { cwd: s.work, env });
+  await capture('git', ['commit', '--quiet', '-m', message], { cwd: s.work, env });
+  const sha = (await git(['rev-parse', 'HEAD'], s.work)).trim();
+  await git(['push', '--quiet', s.deps.remoteUrl(), 'main'], s.work);
+  return sha;
+}
+
+test('a change and its revert leave nothing to ship: the plan says live, so there is no deadline to count from', async () => {
+  const s = await setupDeploy({ seed: seedFirst, change: { 'app/src/a.ts': '2' } });
+  await commitFiles(s.work, { 'app/src/a.ts': 'export const a = 1;\n' }, 'revert (#10)');
+  await git(['push', '--quiet', s.deps.remoteUrl(), 'main'], s.work);
+  const { d } = landD(s);
+  const cache = await liveFor({ d, repo: 't/r' });
+  assert.equal(cache.deployables.app.status, 'live');
+  assert.equal(cache.oldestUnliveAtMs, null);
+});
+
+test('the oldest commit not live is the oldest pending one, whichever deployable it is for', async () => {
+  const s = await setupDeploy({ seed: seedFirst });
+  const old = await commitAt(s, { 'workers/tick/src/index.ts': 'export default { a: 1 };\n' }, 'older (#11)', 1_700_000_000);
+  await commitAt(s, { 'app/src/a.ts': '3' }, 'newer (#12)', 1_700_000_005);
+  const { d } = landD(s);
+  const cache = await liveFor({ d, repo: 't/r' });
+  assert.equal(cache.deployables.app.status, 'pending');
+  assert.equal(cache.oldestUnliveAtMs, 1_700_000_000_000);
+  assert.equal(cache.oldestUnliveAtMs, await commitTimeMs(mirrorPath('t/r', d.mirrorRoot), old));
+});
+
+test('a blocked deployable\'s backlog is left out too (it imports files outside its paths)', async () => {
+  const s = await setupDeploy({ seed: seedFirst, change: { 'workers/tick/src/index.ts': "import '../../../app/src/a.ts';\nexport default {};\n" } });
+  const { d } = landD(s);
+  const cache = await liveFor({ d, repo: 't/r' });
+  assert.equal(cache.deployables.tick.status, 'blocked');
+  assert.equal(cache.oldestUnliveAtMs, null);
+});
+
+test('liveFor with no cache yet and another land reading: the tick waits, saying it has not been read', async () => {
+  const s = await setupDeploy({ seed: seedFirst, change: { 'app/src/a.ts': '2' } });
+  const { d } = landD(s);
+  const busy = atTestEnd(await acquire(join(landDir(d, 't/r'), 'refresh'), await ownerInfo({ command: 'another land' })));
+  await assert.rejects(liveFor({ d, repo: 't/r' }), (e) => e.notYet === true && e.message === 'what is live in t/r has not been read yet; waiting for it');
+  await busy();
+});
+
+test('contains: equal counts, a later commit has its ancestor, an earlier one does not', async () => {
+  const s = await setupDeploy({ seed: seedFirst, change: { 'app/src/a.ts': '2' } });
+  const { d } = landD(s);
+  const r = await syncMirror({ repo: 't/r', d });
+  assert.equal(await contains({ d, repo: 't/r', mirror: r.mirror, ancestor: s.first, sha: s.first }), true);
+  assert.equal(await contains({ d, repo: 't/r', mirror: r.mirror, ancestor: s.first, sha: s.head }), true);
+  assert.equal(await contains({ d, repo: 't/r', mirror: r.mirror, ancestor: s.head, sha: s.first }), false);
+});
+
+test('contains: a commit the mirror lacks is fetched for once; one still missing is false', async () => {
+  const s = await setupDeploy({ seed: seedFirst, change: { 'app/src/a.ts': '2' } });
+  const { d } = landD(s);
+  const r = await syncMirror({ repo: 't/r', d });
+  const later = await commitFiles(s.work, { 'app/src/a.ts': '3' }, 'later (#10)');
+  await git(['push', '--quiet', s.deps.remoteUrl(), 'main'], s.work);
+  assert.equal(await contains({ d, repo: 't/r', mirror: r.mirror, ancestor: s.head, sha: later }), true, 'fetched, then found');
+  assert.equal(await contains({ d, repo: 't/r', mirror: r.mirror, ancestor: s.head, sha: 'a'.repeat(40) }), false, 'not there even after the fetch');
+  assert.equal(await contains({ d, repo: 't/r', mirror: r.mirror, ancestor: 'b'.repeat(40), sha: later }), false, 'an ancestor the mirror lacks');
 });
