@@ -101,7 +101,7 @@ test('two runners started at once collapse into one deploy, and both record its 
   assert.deepEqual((await readDeploys({ d: s.deps, repo: 't/r' })).ended.map((x) => x.code), [0, 0]);
 });
 
-test('the detached deploy survives a SIGHUP to the land\'s process group and a SIGKILL of the land', { timeout: 60_000 }, async () => {
+test('the detached deploy survives a SIGHUP to the land\'s process group and the land\'s unwind (it exits 130)', { timeout: 60_000 }, async () => {
   const dir = await tempDir('detached-');
   const d = { tmpRoot: join(dir, 'tmp'), logRoot: join(dir, 'logs'), mirrorRoot: join(dir, 'm'), stateRoot: join(dir, 'state'), gh: 'gh', ghTimeoutMs: 60_000, fetchTimeoutMs: 120_000 };
   const go = join(dir, 'go');
@@ -121,14 +121,15 @@ export async function runDetachedDeploy(a) {
   // The land: leads its own process group, as bin/ship.mjs makes ship do, starts the deploy and waits.
   const landScript = `
 import { startDetachedDeploy } from ${JSON.stringify(new URL('../lib/land-deploy.mjs', import.meta.url).href)};
+import { writeFileSync } from 'node:fs';
 import { onInterrupt } from ${JSON.stringify(new URL('../lib/interrupt.mjs', import.meta.url).href)};
-onInterrupt(() => {});
 const a = JSON.parse(process.argv[1]);
+onInterrupt(() => writeFileSync(a.marker, 'unwound'));
 const s = await startDetachedDeploy({ d: a.d, repo: 't/r', cwd: a.cwd, tip: a.tip, floors: {}, runnerUrl: a.runnerUrl });
 process.stdout.write('started ' + s.pid + ' ' + s.log + '\\n');
 setInterval(() => {}, 1000);
 `;
-  const args = JSON.stringify({ d, cwd: dir, tip: TIP, runnerUrl: pathToFileURL(runner).href });
+  const args = JSON.stringify({ d, marker: join(dir, 'unwound'), cwd: dir, tip: TIP, runnerUrl: pathToFileURL(runner).href });
   const landProc = spawn(process.execPath, ['--input-type=module', '-e', landScript, args], { detached: true, stdio: ['ignore', 'pipe', 'inherit'] });
   atTestEnd(() => { try { process.kill(-landProc.pid, 'SIGKILL'); } catch { /* gone */ } });
   let out = '';
@@ -140,9 +141,11 @@ setInterval(() => {}, 1000);
   await waitUntil(async () => (await readFile(log, 'utf8').catch(() => '')).includes('runner started'), 'the runner runs');
   assert.ok((await readFile(log, 'utf8')).includes(`runner started in ${await realpath(d.tmpRoot)} for ${dir} leader 1 limits 60000 120000`),
     'it runs in $SHIP_TMP, not in the checkout a session may remove, and with the land\'s limits');
+  const landExit = once(landProc, 'exit');
   process.kill(-landProc.pid, 'SIGHUP');
-  try { process.kill(landProc.pid, 'SIGKILL'); } catch { /* the hangup ended it already */ }
-  await waitUntil(() => !isAlive(landProc.pid), 'the land is gone');
+  const [landCode] = await landExit;
+  assert.equal(landCode, 130, 'the land unwound and exited on the hangup');
+  assert.equal(await readFile(join(dir, 'unwound'), 'utf8'), 'unwound', 'its interrupt handlers ran: the sweep was exercised');
   assert.equal(isAlive(runnerPid), true, 'the deploy runs on');
   assert.deepEqual((await readDeploys({ d, repo: 't/r' })).running.map((x) => x.pid), [runnerPid]);
   await writeFile(go, '');
