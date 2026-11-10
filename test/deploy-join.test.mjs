@@ -8,7 +8,7 @@ import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { addAcks, writeHold } from '../lib/state.mjs';
 import { runDeploy as realRunDeploy } from '../lib/deploy.mjs';
 import { enterDeploy } from '../lib/intake.mjs';
-import { at, setupDeploy as makeDeploy } from './deploy-fixture.mjs';
+import { at, requiresSetup, setupDeploy as makeDeploy } from './deploy-fixture.mjs';
 
 // However a test ends, the lanes it held and the deploys waiting behind them end with it.
 afterEach(stopBackground, { timeout: 30_000 });
@@ -83,6 +83,30 @@ test('the commits that arrive bring an uncleared migration: the deploy keeps its
   assert.match(text, new RegExp(`▸ building main@${s.head.slice(0, 7)} · ships 1 commit\\(s\\): #9\\n`));
   assert.equal((await readFile(builtSha, 'utf8')).trim(), s.head, 'the build is of the older head');
   assert.match(await deployMessage(s), new RegExp(`^sha:${s.head} app run:[0-9a-f]{6} #9$`), 'and so is the annotation');
+});
+
+test('with a floorsAt hook, the commits that arrive carry a floor that is not met: the deploy keeps its head', async () => {
+  const rq = await requiresSetup();
+  const s = rq.s;
+  const releaseLane = await hold(s, 'lanes', 'heavy');
+  // The planned head's floor is met (t/api is live at otherFirst); the later head's is otherSecond.
+  const asked = [];
+  let later = null;
+  const floorsAt = async (sha) => {
+    asked.push(sha);
+    return { 't/api': sha === later ? rq.otherSecond : rq.otherFirst };
+  };
+  const run = runDeploy({ cwd: s.work, floors: { 't/api': rq.otherFirst }, floorsAt, deps: s.deps });
+  await waitFor(s.lines, 'waiting for the heavy lane');
+  later = await mainMoves(s, { 'app/src/b.ts': '3' }, 'later change (#10)');
+  await releaseLane();
+  assert.equal(await run, 0, s.lines.join('\n'));
+  const text = s.lines.join('\n');
+  assert.deepEqual(asked, [s.head, later], 'asked for the head it planned, then for the one it was moving to');
+  assert.match(text, new RegExp(`! main moved to ${later.slice(0, 7)} while the deploy waited, but it requires t/api app: live at ${rq.otherFirst.slice(0, 7)}, before ${rq.otherSecond.slice(0, 7)}`));
+  assert.match(text, new RegExp(`deploying main@${s.head.slice(0, 7)} as planned`));
+  assert.equal((await uploads(s)).length, 1);
+  assert.match(await deployMessage(s), new RegExp(`^sha:${s.head} `), 'the later merge was not shipped');
 });
 
 test('a migration the owner cleared meanwhile does not stop the move', async () => {

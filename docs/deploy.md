@@ -238,11 +238,17 @@ merge it carries, and waits (`… waiting for <repo> <deployable> to be live at 
 one is not met. A floor is met when the deployable's files as of the floor are live, even if the
 live commit is older than the floor, when nothing it changed since is pending.
 
-**A known gap.** The detached deploy ships main as it is when the deploy freezes what it ships (it
-fetches main again once it holds the heavy lane, see above), not the exact tip the land decided on.
-A merge that lands in the seconds between that decision and the freeze is shipped under the floors
-judged for the older tip. Its own land still waits for it, and its requirement is checked by the
-deploy's own `requires` gate, but the floor it recorded was not part of that decision.
+**The deploy judges what it ships.** The detached deploy ships main as it is when it freezes what it
+ships (it fetches main again once it holds the heavy lane, see above), which can be later than the
+tip the land decided on. So the runner, and only the runner, gives the deploy a `floorsAt(sha)`
+function: the combined floors for a commit, that is the newest recorded floor (one file per merge in
+`$SHIP_TMP/land/<owner>__<repo>/floors/`) of every merge the commit carries, per required repository,
+the same pick the land makes before it starts the deploy. The deploy's `requires` gate asks it for
+the commit it planned, and when main moves while it waits, for the commit it would move to, with
+every requirement asked again. An unmet floor stops the deploy as an unmet `requires` does today
+(`✗ requires …`, nothing shipped; when main moved it keeps the head it planned and says so), and a
+land treats that like any deploy that did not ship. `ship deploy` called directly passes no such
+function and judges as before.
 
 ## Clearing migrations
 

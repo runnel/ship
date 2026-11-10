@@ -252,8 +252,7 @@ land never judges by a read from before the latest deploy end it knows of; it wa
 **The deadline.** `deployAfterMin` counts from the oldest commit on main that a deployable has not
 shipped, or from this merge when that is older. A deployable that a deploy would not run (held,
 blocked, or waiting for one that is) is left out: its backlog waits for the owner, and counting it
-would leave every deadline in the past. With no such commit the deadline counts from the time of
-the main tip.
+would leave every deadline in the past. With no such commit the deadline counts from this merge.
 
 **Time limits.** Nothing a land waits for may freeze the line: each `gh` call gets 60 s, each
 `git fetch` 120 s, and the mirror lock and the merge lock 5 minutes. Before the merge each of these

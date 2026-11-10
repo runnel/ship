@@ -2,7 +2,7 @@ import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { landDeps } from '../lib/land.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { contains, decide, landedChanges, liveFor, readLiveCache, recordFloors, waitLive } from '../lib/land-live.mjs';
 import { recordDeployEnd } from '../lib/land-deploy.mjs';
@@ -592,4 +592,48 @@ test('floors that diverge (a force-push) go to the later record, whichever land 
   assert.deepEqual(l.starts, []);
   assert.ok(l.s.lines.some((x) => x.includes('… waiting for t/api app to be live at or past bbbbbbb')), l.s.lines.join('\n'));
   assert.ok(!l.s.lines.some((x) => x.includes('aaaaaaa')));
+});
+
+test('a floor behind nothing but a docs commit is met: the required deployable is live at the commit before it', async () => {
+  // t/api's app is live at its deploy; a docs-only commit then lands on t/api main and is the floor. The
+  // live commit is behind the floor, but nothing of the app's files is pending (requiredState's rule).
+  const rq = await requiresSetup({ apiLive: (_, second) => at(second) });
+  const docs = await commitFiles(rq.other.work, { 'README.md': 'docs' }, 'docs only');
+  await git(['push', '--quiet', 'origin', 'main'], rq.other.work);
+  const l = await landed({ from: rq.s, ack: [], land: { liveWaitHours: 0.5 } });
+  assert.equal(await l.wait({ floors: { 't/api': docs } }), 0, l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1);
+  assert.ok(l.s.lines.includes(`✓ requires t/api app: live at or past ${docs.slice(0, 7)}`), l.s.lines.join('\n'));
+});
+
+test('a merge that lands between the decision and the freeze, with a floor not met, is not shipped by the deploy', async () => {
+  // A's floor (t/api at otherFirst) is met, so the land decides to deploy. Before the runner has frozen
+  // what it ships, B merges on top with a floor that is not met (t/api live at otherFirst, floor
+  // otherSecond). The runner judges the tip it actually deploys, so it refuses: B is not shipped.
+  const rq = await requiresSetup();
+  const l = await landed({ from: rq.s, ack: [] });
+  const start = l.d.startDeploy;
+  l.d.startDeploy = async (args) => {
+    const b = await commitFiles(l.s.work, { 'app/src/a.ts': '3' }, 'b change (#10)');
+    await git(['push', '--quiet', l.d.remoteUrl(), 'main'], l.s.work);
+    await recordFloors({ d: l.d, repo: 't/r', mergeSha: b, floors: { 't/api': rq.otherSecond } });
+    return start(args);
+  };
+  assert.equal(await l.wait({ floors: { 't/api': rq.otherFirst } }), 3, l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1);
+  assert.match(l.s.lines.join('\n'), new RegExp(`✗ requires t/api app: live at ${rq.otherFirst.slice(0, 7)}, before ${rq.otherSecond.slice(0, 7)} — deploy that first`));
+  assert.equal((await l.s.cloud.wranglerCalls()).filter((c) => c.cmd === 'versions upload').length, 0, 'nothing was uploaded');
+});
+
+test('the migrations the tip\'s config watches decide the migration gate, not the merge commit\'s: no deploy is started every tick', async () => {
+  // The tip's config also watches db2/, where an uncleared migration sits. The deploy judges the tip, so
+  // it would refuse at once and stop at the migration gate; the land must wait there too, not start
+  // a deploy at every tick.
+  const l = await landed({ land: { liveWaitHours: 0.5 } });
+  const config = (await readFile(join(l.s.work, 'ship.config.mjs'), 'utf8')).replace("['db/*.sql']", "['db/*.sql', 'db2/*.sql']");
+  await commitFiles(l.s.work, { 'ship.config.mjs': config, 'db2/002.sql': '' }, 'watch db2 (#10)');
+  await git(['push', '--quiet', l.d.remoteUrl(), 'main'], l.s.work);
+  assert.equal(await l.wait(), 3, l.s.lines.join('\n'));
+  assert.deepEqual(l.starts, [], 'the migration gate holds the deploy back');
+  assert.ok(l.s.lines.includes('… waiting for migration db2/002.sql (#10)'), l.s.lines.join('\n'));
 });
