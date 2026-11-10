@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { landDeps } from '../lib/land.mjs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { contains, landedChanges, liveFor } from '../lib/land-live.mjs';
+import { contains, decide, landedChanges, liveFor } from '../lib/land-live.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { landDir } from '../lib/land-line.mjs';
 import { clearHold, writeHold } from '../lib/state.mjs';
@@ -201,4 +201,61 @@ test('contains: a commit the mirror lacks is fetched for once; one still missing
   assert.equal(await contains({ d, repo: 't/r', mirror: r.mirror, ancestor: s.head, sha: later }), true, 'fetched, then found');
   assert.equal(await contains({ d, repo: 't/r', mirror: r.mirror, ancestor: s.head, sha: 'a'.repeat(40) }), false, 'not there even after the fetch');
   assert.equal(await contains({ d, repo: 't/r', mirror: r.mirror, ancestor: 'b'.repeat(40), sha: later }), false, 'an ancestor the mirror lacks');
+});
+
+const MERGE = 'a'.repeat(40);
+const TIP = 'b'.repeat(40);
+const LAND = { deployAfterMin: 60, debounceSec: 120, liveWaitHours: 12 };
+const T0 = Date.parse('2026-11-10T12:00:00Z');
+const facts = (over = {}) => ({
+  tip: TIP, live: { app: { sha: TIP, contains: false, blocked: false } }, holds: {}, uncleared: [], tipUncleared: [], migrations: [],
+  requires: [], deployRunning: false, deployedOk: false, failed: null, lineEmpty: true, tipAtMs: T0 - 10_000, oldestUnliveAtMs: T0 - 10_000, ...over,
+});
+const step = (f, extra = {}) => decide({ facts: f, pr: 7, mergeSha: MERGE, touched: ['app'], added: [], land: LAND, nowMs: T0, quietSinceMs: 0, ...extra });
+
+test('decide, step 1: live by ancestry; held, blocked or no live commit never count', () => {
+  assert.deepEqual(step(facts({ live: { app: { sha: TIP, contains: true, blocked: false } } })), { done: 0, line: '✓ PR #7 is live (merged as aaaaaaa): app at bbbbbbb' });
+  assert.notEqual(step(facts({ live: { app: { sha: TIP, contains: true, blocked: true } } })).done, 0);
+  assert.notEqual(step(facts({ live: { app: { sha: null, contains: false, blocked: false } } })).done, 0);
+  const held = step(facts({ live: { app: { sha: TIP, contains: true, blocked: false } }, holds: { app: { reason: 'probe failed', at: null } } }));
+  assert.deepEqual(held, { done: 3, line: '✗ PR #7 merged as aaaaaaa but not live: app is held since ?: probe failed — the owner decides; ship status' });
+});
+
+test('decide: a migration-only PR is live once its migration is cleared, and waits until then', () => {
+  const only = { touched: [], added: ['db/002_x.sql'] };
+  assert.deepEqual(step(facts({ uncleared: ['db/002_x.sql'], tipUncleared: [{ file: 'db/002_x.sql', ours: true, by: '#7' }] }), only), { wait: 'migration' });
+  assert.deepEqual(step(facts(), only), { done: 0, line: '✓ PR #7 is live (merged as aaaaaaa): 1 migration(s) cleared' });
+});
+
+test('decide, steps 6 and 2–4 in order: a failed deploy, a migration at the tip, a hold, a requirement', () => {
+  const failed = { tip: TIP, code: 1, log: '/x.out' };
+  assert.deepEqual(step(facts({ failed, tipUncleared: [{ file: 'db/9.sql', ours: false, by: '#12' }] })), { done: 3, line: '✗ PR #7 merged as aaaaaaa but not live: the deploy of main@bbbbbbb ended with exit 1 (output: /x.out) — the owner decides; ship status' });
+  assert.deepEqual(step(facts({ tipUncleared: [{ file: 'db/9.sql', ours: false, by: '#12' }], holds: { app: { reason: 'x', at: null } } })), { wait: 'migration' }, 'the migration gate comes before the hold');
+  assert.equal(step(facts({ holds: { app: { reason: 'x', at: null } } })).done, 3);
+  const unmet = { repo: 't/api', deployable: 'app', floor: 'c'.repeat(40), met: false, now: 'live at ddddddd' };
+  assert.deepEqual(step(facts({ requires: [unmet] })), { wait: 'requires', line: '… waiting for t/api app to be live at or past ccccccc (live at ddddddd)' });
+  assert.deepEqual(step(facts({ deployRunning: true })), { wait: 'deploying', line: '… a deploy of this repository is running; waiting for it to end' });
+});
+
+test('decide: a tip whose deploy ended ok is not deployed again; it waits for the live cache', () => {
+  const r = step(facts({ deployedOk: true }));
+  assert.equal(r.deploy, undefined);
+  assert.equal(r.wait, 'live');
+  assert.match(r.line, /^… the deploy of main@bbbbbbb ended ok; waiting for it to show as live/);
+  assert.equal(step(facts({ deployedOk: true, holds: { app: { reason: 'x', at: null } } })).done, 3, 'a hold still ends the land');
+  assert.equal(step(facts({ deployedOk: true, live: { app: { sha: TIP, contains: true, blocked: false } } })).done, 0, 'live wins');
+});
+
+test('decide: a change with no net effect counts as live by the caller\'s `contains`', () => {
+  // gather sets contains when the cache says live and the merge is an ancestor of its mainSha,
+  // even though the live commit never moved past the merge.
+  assert.equal(step(facts({ live: { app: { sha: MERGE, contains: true, blocked: false } } })).done, 0);
+});
+
+test('decide, step 5: deploy once the line has been quiet for debounceSec, or at deployAfterMin', () => {
+  assert.equal(step(facts({ tipAtMs: T0 - 119_000 })).wait, 'debounce');
+  assert.deepEqual(step(facts({ tipAtMs: T0 - 120_000 })), { deploy: true, why: 'the land line has been quiet for 120 s' });
+  assert.equal(step(facts({ tipAtMs: T0 - 600_000 }), { quietSinceMs: T0 - 60_000 }).wait, 'debounce', 'the line was busy a minute ago');
+  assert.equal(step(facts({ lineEmpty: false, tipAtMs: T0 - 600_000, oldestUnliveAtMs: T0 - 59 * 60_000 })).wait, 'debounce');
+  assert.deepEqual(step(facts({ lineEmpty: false, tipAtMs: T0 - 600_000, oldestUnliveAtMs: T0 - 60 * 60_000 })), { deploy: true, why: 'a merge has waited 60 min' });
 });

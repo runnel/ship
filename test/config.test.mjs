@@ -160,3 +160,14 @@ test('liveHost is checked even without probes', () => {
   // A versioned deployable needs probes, so use the direct `tick` with its probes removed to reach the rule.
   assert.throws(() => validateConfig(withDeploy({ deployables: [app, { ...tick, probes: [], liveHost: 'garbage' }] })), /liveHost must be https:\/\/host/);
 });
+
+test('land: defaults, positive numbers, no unknown keys', () => {
+  assert.deepEqual(validateConfig(base).land, { deployAfterMin: 60, debounceSec: 120, liveWaitHours: 12 });
+  assert.deepEqual(validateConfig({ ...base, land: { debounceSec: 30 } }).land, { deployAfterMin: 60, debounceSec: 30, liveWaitHours: 12 });
+  assert.equal(validateConfig({ ...base, land: { liveWaitHours: 0.5 } }).land.liveWaitHours, 0.5);
+  assert.throws(() => validateConfig({ ...base, land: { deployAfterMin: 0 } }), /land: deployAfterMin must be a positive number/);
+  assert.throws(() => validateConfig({ ...base, land: { soon: 1 } }), /land: unknown key soon/);
+  assert.equal(validateConfig({ ...base, land: { liveWaitHours: 24 } }).land.liveWaitHours, 24);
+  assert.throws(() => validateConfig({ ...base, land: { liveWaitHours: 25 } }), /land: liveWaitHours must be at most 24 \(deploy records are kept a day\)/);
+  assert.throws(() => validateConfig({ ...base, land: 5 }), ConfigError);
+});
