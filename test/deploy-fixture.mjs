@@ -3,6 +3,8 @@ import { commitFiles, fakeGh, git, makeOrigin, tempDir } from './helpers.mjs';
 import { runDeploy } from '../lib/deploy.mjs';
 import { addAcks } from '../lib/state.mjs';
 import { fakeCloud } from './fake-cloud.mjs';
+import { ownerInfo } from '../lib/lock.mjs';
+import { recordDeployStart, runDetachedDeploy } from '../lib/land-deploy.mjs';
 
 // `docsOnly` and `appIgnore` are JS array literals for the config's docsOnly and the app's ignore.
 // `builtSha` is a file path: the app's build writes the commit it was run at into it.
@@ -76,3 +78,13 @@ export async function requiresSetup({ apiLive = (first) => at(first) } = {}) {
   s.deps.remoteUrl = (repo) => (repo === 't/api' ? other.origin : origin);
   return { s, other, otherFirst, otherSecond };
 }
+
+// What d.startDeploy does, here in this process and to the end: the deploy a land would start detached.
+export const inProcessDeploy = (starts) => async ({ d, repo, cwd, tip, floors }) => {
+  const id = `t${starts.length + 1}`;
+  starts.push({ tip, at: d.now() });
+  const log = join(d.logRoot, `${id}.out`);
+  await recordDeployStart({ d, repo, id, tip, log, owner: await ownerInfo() });
+  await runDetachedDeploy({ cwd, repo, tip, floors, id, log }, d);
+  return { id, log, pid: process.pid };
+};
