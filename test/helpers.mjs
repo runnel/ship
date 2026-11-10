@@ -353,3 +353,27 @@ export const killQuietly = (pid, { kill = (p, sig) => process.kill(p, sig) } = {
   if (!isPid(pid) || pid === process.pid || provenGone.has(pid)) return;
   try { kill(pid, 'SIGKILL'); } catch { /* gone */ }
 };
+
+// A remote whose helper never answers (git looks for git-remote-<scheme> on PATH, so the remote URL
+// is `hang::nowhere`), and with `gh` a `gh` that never answers either. Puts its bin first on PATH;
+// `restore` puts PATH back and kills the helpers by the pids they recorded, never by pattern.
+export async function hangingRemote({ gh = false } = {}) {
+  const bin = await tempDir('bin-');
+  const pidFile = join(bin, 'helper.pids');
+  await writeFile(join(bin, 'git-remote-hang'), `#!/bin/sh\necho $$ >> '${pidFile}'\nexec sleep 5\n`);
+  await chmod(join(bin, 'git-remote-hang'), 0o755);
+  if (gh) {
+    await writeFile(join(bin, 'gh'), '#!/bin/sh\nexec sleep 5\n');
+    await chmod(join(bin, 'gh'), 0o755);
+  }
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}:${path}`;
+  const pids = async () => (await readFile(pidFile, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(Number);
+  return {
+    bin, url: 'hang::nowhere', pids,
+    restore: async () => {
+      process.env.PATH = path;
+      for (const pid of await pids()) killQuietly(pid);
+    },
+  };
+}

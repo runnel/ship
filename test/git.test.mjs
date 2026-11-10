@@ -6,7 +6,7 @@ import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWor
 import { validateConfig } from '../lib/config.mjs';
 import { classify } from '../lib/classify.mjs';
 import { capture } from '../lib/proc.mjs';
-import { makeOrigin, commitFiles, git, tempDir } from './helpers.mjs';
+import { makeOrigin, commitFiles, git, hangingRemote, isGone, tempDir } from './helpers.mjs';
 
 async function branchAndMain({ feat, main }) {
   const o = await makeOrigin({ 'a.txt': 'a\n' });
@@ -228,32 +228,19 @@ test('a mirror fetch with a time limit is stopped then and says so', { timeout: 
   const o = await makeOrigin({ 'a.txt': 'a\n' });
   const root = join(o.root, 'mirrors');
   const mirror = await ensureMirror('t/r', { root, url: o.origin });
-  // A remote whose helper never answers: git looks for git-remote-<scheme> on PATH.
-  const bin = await tempDir('bin-');
-  const pidFile = join(bin, 'helper.pids');
-  await writeFile(join(bin, 'git-remote-hang'), `#!/bin/sh\necho $$ >> '${pidFile}'\nexec sleep 5\n`);
-  await chmod(join(bin, 'git-remote-hang'), 0o755);
-  await capture('git', ['--git-dir', mirror, 'remote', 'set-url', 'origin', 'hang::nowhere']);
-  const path = process.env.PATH;
-  process.env.PATH = `${bin}:${path}`;
+  const hang = await hangingRemote();
+  await capture('git', ['--git-dir', mirror, 'remote', 'set-url', 'origin', hang.url]);
   try {
     await assert.rejects(ensureMirror('t/r', { root, url: o.origin, fetchTimeoutMs: 1500 }),
       (e) => e.timedOut === true && /^git fetch of t\/r took longer than 1\.5 s$/.test(e.message));
     await assert.rejects(fetchCommit(mirror, 'd'.repeat(40), 7, { timeoutMs: 1500 }),
       (e) => e.timedOut === true && /^git fetch of pull\/7\/head took longer than 1\.5 s$/.test(e.message));
+    // The fetch's remote helper died with it (checked before the cleanup below could hide a leak):
+    // one helper per timed-out fetch, none still running.
+    const pids = await hang.pids();
+    assert.equal(pids.length, 2, 'each fetch started one helper');
+    for (const pid of pids) assert.equal(await isGone(pid, 1000), true, `helper ${pid} still running`);
   } finally {
-    process.env.PATH = path;
-    // Whatever the assertions found, leave no helper behind.
-    for (const p of (await readFile(pidFile, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(Number)) {
-      try { process.kill(p, 'SIGKILL'); } catch { /* gone */ }
-    }
-  }
-  // The fetch's remote helper died with it: one helper per timed-out fetch, none still running.
-  const pids = (await readFile(pidFile, 'utf8')).split('\n').filter(Boolean).map(Number);
-  assert.equal(pids.length, 2);
-  for (const pid of pids) {
-    const gone = () => { try { process.kill(pid, 0); return false; } catch (e) { return e.code === 'ESRCH'; } };
-    for (let i = 0; i < 50 && !gone(); i++) await new Promise((r) => setTimeout(r, 20));
-    assert.ok(gone(), `helper ${pid} still running`);
+    await hang.restore();
   }
 });
