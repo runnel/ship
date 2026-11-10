@@ -140,8 +140,11 @@ test('a lock wait with a time limit ends then and says what was held; without on
     (e) => e.timedOut === true && e.message === 'the merge lock of t/r was held by another process for longer than 0.2 s');
   const d = { tmpRoot: root, pollMs: 10, lockWaitMs: 200, mirrorRoot: join(root, 'm'), remoteUrl: () => join(root, 'nowhere.git') };
   const mirrorLock = await acquire(join(root, 'locks', 'mirror-t__r'), await ownerInfo({ repo: 't/r' }));
-  await assert.rejects(syncMirror({ repo: 't/r', d, mainBranch: 'main' }), /^Error: the mirror lock of t\/r was held by another process for longer than 0\.2 s$/);
+  await assert.rejects(syncMirror({ repo: 't/r', d, mainBranch: 'main' }),
+    (e) => e.timedOut === true && e.message === 'the mirror lock of t/r was held by another process for longer than 0.2 s');
   await mirrorLock();
+  const noOpts = await lockWithin(join(root, 'locks', 'free'), await ownerInfo()); // options are optional
+  await noOpts();
   const later = lockWithin(dir, await ownerInfo(), { pollMs: 10, what: 'the merge lock of t/r' });
   setTimeout(() => held(), 300);
   const release = await later;

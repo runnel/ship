@@ -230,17 +230,30 @@ test('a mirror fetch with a time limit is stopped then and says so', { timeout: 
   const mirror = await ensureMirror('t/r', { root, url: o.origin });
   // A remote whose helper never answers: git looks for git-remote-<scheme> on PATH.
   const bin = await tempDir('bin-');
-  await writeFile(join(bin, 'git-remote-hang'), '#!/bin/sh\nexec sleep 5\n');
+  const pidFile = join(bin, 'helper.pids');
+  await writeFile(join(bin, 'git-remote-hang'), `#!/bin/sh\necho $$ >> '${pidFile}'\nexec sleep 5\n`);
   await chmod(join(bin, 'git-remote-hang'), 0o755);
   await capture('git', ['--git-dir', mirror, 'remote', 'set-url', 'origin', 'hang::nowhere']);
   const path = process.env.PATH;
   process.env.PATH = `${bin}:${path}`;
   try {
-    await assert.rejects(ensureMirror('t/r', { root, url: o.origin, fetchTimeoutMs: 300 }),
-      (e) => e.timedOut === true && /^git fetch of t\/r took longer than 0\.3 s$/.test(e.message));
-    await assert.rejects(fetchCommit(mirror, 'd'.repeat(40), 7, { timeoutMs: 300 }),
-      (e) => e.timedOut === true && /^git fetch of pull\/7\/head took longer than 0\.3 s$/.test(e.message));
+    await assert.rejects(ensureMirror('t/r', { root, url: o.origin, fetchTimeoutMs: 1500 }),
+      (e) => e.timedOut === true && /^git fetch of t\/r took longer than 1\.5 s$/.test(e.message));
+    await assert.rejects(fetchCommit(mirror, 'd'.repeat(40), 7, { timeoutMs: 1500 }),
+      (e) => e.timedOut === true && /^git fetch of pull\/7\/head took longer than 1\.5 s$/.test(e.message));
   } finally {
     process.env.PATH = path;
+    // Whatever the assertions found, leave no helper behind.
+    for (const p of (await readFile(pidFile, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(Number)) {
+      try { process.kill(p, 'SIGKILL'); } catch { /* gone */ }
+    }
+  }
+  // The fetch's remote helper died with it: one helper per timed-out fetch, none still running.
+  const pids = (await readFile(pidFile, 'utf8')).split('\n').filter(Boolean).map(Number);
+  assert.equal(pids.length, 2);
+  for (const pid of pids) {
+    const gone = () => { try { process.kill(pid, 0); return false; } catch (e) { return e.code === 'ESRCH'; } };
+    for (let i = 0; i < 50 && !gone(); i++) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(gone(), `helper ${pid} still running`);
   }
 });
