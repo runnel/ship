@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
-import { mkdir, readdir, symlink } from 'node:fs/promises';
+import { mkdir, readdir, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runCheck } from '../lib/check.mjs';
-import { setupCheck as setup, CONFIG, git, tempDir, commitFiles, fakeGh, statusesOf } from './helpers.mjs';
+import { runCheck, checkOnce, readResult, writeResult } from '../lib/check.mjs';
+import { setupCheck as setup, CONFIG, git, tempDir, commitFiles, fakeGh, statusesOf, prepareCheck } from './helpers.mjs';
 
 test('a green check of the PR merged with main', async () => {
   const s = await setup();
@@ -323,4 +323,52 @@ test('a heavy check on battery power warns and goes on; a light or docs-only one
   const plugged = await setup({ checkExtra: { lane: 'heavy' } });
   assert.equal(await runCheck({ cwd: plugged.work, deps: { ...plugged.deps, onBattery: async () => false } }), 0);
   assert.ok(!warned(plugged));
+});
+
+test('checkOnce marks a merge conflict as one; a result is written for reuse unless the check was stopped', async () => {
+  const s = await setup({ featFiles: { 'a.txt': 'feature\n' }, mainFiles: { 'a.txt': 'main\n' } });
+  const p = await prepareCheck(s);
+  const result = await checkOnce({ ...p, land: true });
+  assert.equal(result.state, 'failure');
+  assert.equal(result.conflict, true);
+  await writeResult(p.d, 't/r', p.info.headSha, result, p.mainSha);
+  const back = await readResult(p.d, 't/r', p.info.headSha);
+  assert.equal(back.mainSha, p.mainSha);
+  assert.equal(back.description, result.description);
+  assert.ok(back.at > 0);
+  await writeResult(p.d, 't/r', 'b'.repeat(40), { state: 'stopped', description: 'x', exitCode: 2 }, p.mainSha);
+  assert.equal(await readResult(p.d, 't/r', 'b'.repeat(40)), null, 'a stopped check leaves nothing to reuse');
+});
+
+test('readResult gives null for a torn or malformed file, not a rejection', async () => {
+  const s = await setup();
+  const p = await prepareCheck(s);
+  const dir = join(p.d.tmpRoot, 'checks');
+  await mkdir(dir, { recursive: true });
+  for (const [sha, text] of [['c', '{ "state": "succ'], ['d', ''], ['e', 'null']]) {
+    await writeFile(join(dir, `t__r__${sha.repeat(40)}.json`), text);
+    assert.equal(await readResult(p.d, 't/r', sha.repeat(40)), null, JSON.stringify(text));
+  }
+});
+
+test('a verdict that could not be posted is an error, not a merge conflict', async () => {
+  const s = await setup({ featFiles: { 'a.txt': 'feature\n' }, mainFiles: { 'a.txt': 'main\n' }, ghOptions: { apiFail: { match: 'state=failure' } } });
+  const p = await prepareCheck(s);
+  const result = await checkOnce({ ...p, d: { ...p.d, verdictRetryMs: 5 }, land: true });
+  assert.equal(result.state, 'error', s.lines.join('\n'));
+  assert.equal('conflict' in result, false);
+});
+
+test('checkOnce returns an error, not a rejection, when the first (queued) status cannot be posted', async () => {
+  const s = await setup({ ghOptions: { apiFail: { match: 'state=pending' } } });
+  const p = await prepareCheck(s);
+  const result = await checkOnce({ ...p, land: true });
+  assert.deepEqual(result, { state: 'error', description: 'the queued status could not be posted', exitCode: 1 });
+  assert.match(s.lines.join('\n'), /✗ local-ci not started: GitHub did not take the queued status/);
+});
+
+test('a direct ship check whose queued status cannot be posted exits 1 with one line saying so', async () => {
+  const s = await setup({ ghOptions: { apiFail: { match: 'state=pending' } } });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1, s.lines.join('\n'));
+  assert.match(s.lines.join('\n'), /✗ local-ci not started: GitHub did not take the queued status/);
 });

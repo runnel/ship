@@ -6,7 +6,9 @@ import { access, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
-import { atTestEnd, fakeGh, makeOrigin, stopBackground, tempDir, tracked } from './helpers.mjs';
+import { atTestEnd, fakeGh, hangingRemote, makeOrigin, stopBackground, tempDir, tracked } from './helpers.mjs';
+import { capture } from '../lib/proc.mjs';
+import { ensureMirror } from '../lib/git.mjs';
 import { openTree, prRefs, shipsText, syncMirror } from '../lib/repo.mjs';
 
 // However a test ends, the lock it took and the sync waiting behind it end with it.
@@ -110,4 +112,20 @@ test('shipsText names the PRs and counts commits without one', () => {
   assert.equal(shipsText(['a (#9)', 'b (#12)', 'direct fix']), 'ships 3 commit(s): #9 #12 + 1 without a PR number');
   assert.equal(shipsText(['a (#9)', 'b (#12)']), 'ships 2 commit(s): #9 #12');
   assert.equal(shipsText(['direct fix']), 'ships 1 commit(s)');
+});
+
+test('syncMirror passes the gh and fetch time limits on', async () => {
+  const { origin, root } = await makeOrigin({ 'a.txt': 'a' });
+  const hang = await hangingRemote({ gh: true });
+  const mirrorRoot = join(root, 'm');
+  const mirror = await ensureMirror('t/r', { root: mirrorRoot, url: origin });
+  await capture('git', ['--git-dir', mirror, 'remote', 'set-url', 'origin', hang.url]);
+  const d = { gh: join(hang.bin, 'gh'), remoteUrl: () => hang.url, mirrorRoot, tmpRoot: join(root, 'tmp'), pollMs: 10, out: () => {} };
+  try {
+    await assert.rejects(syncMirror({ repo: 't/r', d: { ...d, ghTimeoutMs: 300 } }), (e) => e.timedOut === true);
+    await assert.rejects(syncMirror({ repo: 't/r', d: { ...d, fetchTimeoutMs: 1500 }, mainBranch: 'main' }),
+      (e) => e.timedOut === true && /^git fetch of t\/r took longer than 1\.5 s$/.test(e.message));
+  } finally {
+    await hang.restore();
+  }
 });

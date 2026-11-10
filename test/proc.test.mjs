@@ -4,8 +4,8 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
-import { buildEnv, run, capture, ownsItsGroup } from '../lib/proc.mjs';
-import { assertGone, killQuietly, readPid, tempDir } from './helpers.mjs';
+import { buildEnv, run, capture, captureWithin, ownsItsGroup } from '../lib/proc.mjs';
+import { assertGone, isGone, killQuietly, readPid, tempDir } from './helpers.mjs';
 
 const tmp = () => tempDir('proc-');
 
@@ -160,4 +160,32 @@ try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
   child.stdout.on('data', (b) => { out += b; });
   await new Promise((resolve) => child.on('close', resolve));
   assert.deepEqual(JSON.parse(out), { stopped: 0, alive: true });
+});
+
+test('captureWithin kills the tree at the limit and is not held back by a process the walk cannot reach', { timeout: 30_000 }, async () => {
+  const dir = await tmp();
+  const pidFile = join(dir, 'orphan.pid');
+  // A double fork: the subshell exits at once, so the sleep is re-parented to init and `pgrep -P` cannot find it.
+  const started = Date.now();
+  try {
+    await assert.rejects(captureWithin('sh', ['-c', `(sleep 4 & echo $! > '${pidFile}') ; sleep 10`], 400),
+      (e) => e.timedOut === true);
+    assert.ok(Date.now() - started < 2500, `settled after ${Date.now() - started} ms`);
+  } finally {
+    const pid = await readPid(pidFile);
+    if (pid) killQuietly(pid);
+  }
+});
+
+test('captureWithin leaves no descendant of a timed-out command running', { timeout: 30_000 }, async () => {
+  const dir = await tmp();
+  const pidFile = join(dir, 'child.pid');
+  await assert.rejects(captureWithin('sh', ['-c', `sleep 10 & echo $! > '${pidFile}'; wait`], 400), (e) => e.timedOut === true);
+  const pid = await readPid(pidFile);
+  try {
+    assert.ok(pid, 'the child never recorded its pid');
+    assert.equal(await isGone(pid, 1000), true);
+  } finally {
+    if (pid) killQuietly(pid);
+  }
 });

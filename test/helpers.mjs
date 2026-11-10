@@ -7,6 +7,9 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { capture, isPid } from '../lib/proc.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
+import { LANE_PRIORITY } from '../lib/shared.mjs';
+import { ensureMirror, fetchCommit, revParse } from '../lib/git.mjs';
+import { checkDeps } from '../lib/check.mjs';
 
 // One scratch root per test process, removed when the process exits.
 const ROOT = mkdtempSync(join(tmpdir(), 'ship-tests-'));
@@ -264,7 +267,7 @@ export async function longLine(s) {
   await mkdir(s.deps.tmpRoot, { recursive: true, mode: 0o700 });
   const lane = join(s.deps.tmpRoot, 'lanes', 'heavy');
   const holder = await acquire(lane, await ownerInfo({ repo: 'o/x', pr: 1 }));
-  const waiter = acquire(lane, await ownerInfo({ repo: 'o/x', pr: 2 }), { priority: 1, pollMs: 5 }).then((release) => release());
+  const waiter = acquire(lane, await ownerInfo({ repo: 'o/x', pr: 2 }), { priority: LANE_PRIORITY.check, pollMs: 5 }).then((release) => release());
   const free = atTestEnd(async () => { await holder(); await waiter; });
   await waitUntil(async () => (await readdir(join(s.deps.tmpRoot, 'lanes'))).some((n) => n.startsWith('heavy.q-') && n.endsWith('.json')), 'the waiter is in line');
   return { free };
@@ -352,3 +355,40 @@ export const killQuietly = (pid, { kill = (p, sig) => process.kill(p, sig) } = {
   if (!isPid(pid) || pid === process.pid || provenGone.has(pid)) return;
   try { kill(pid, 'SIGKILL'); } catch { /* gone */ }
 };
+
+// A remote whose helper never answers (git looks for git-remote-<scheme> on PATH, so the remote URL
+// is `hang::nowhere`), and with `gh` a `gh` that never answers either. Puts its bin first on PATH;
+// `restore` puts PATH back and kills the helpers by the pids they recorded, never by pattern.
+export async function hangingRemote({ gh = false } = {}) {
+  const bin = await tempDir('bin-');
+  const pidFile = join(bin, 'helper.pids');
+  await writeFile(join(bin, 'git-remote-hang'), `#!/bin/sh\necho $$ >> '${pidFile}'\nexec sleep 5\n`);
+  await chmod(join(bin, 'git-remote-hang'), 0o755);
+  if (gh) {
+    await writeFile(join(bin, 'gh'), '#!/bin/sh\nexec sleep 5\n');
+    await chmod(join(bin, 'gh'), 0o755);
+  }
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}:${path}`;
+  const pids = async () => (await readFile(pidFile, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(Number);
+  return {
+    bin, url: 'hang::nowhere', pids,
+    restore: async () => {
+      process.env.PATH = path;
+      for (const pid of await pids()) killQuietly(pid);
+    },
+  };
+}
+
+// What runCheck does before checkOnce, for a test that calls checkOnce itself: the mirror with the
+// head of the pull request and main, and the deps the way runCheck fills them in.
+export async function prepareCheck(s, { headRef = 'feat', number = 7 } = {}) {
+  const mirror = await ensureMirror('t/r', { root: s.deps.mirrorRoot, url: s.origin });
+  const headSha = (await git(['rev-parse', headRef], s.work)).trim();
+  await fetchCommit(mirror, headSha, number);
+  const mainSha = await revParse(mirror, 'refs/heads/main');
+  return {
+    d: { ...checkDeps(), ...s.deps }, repo: 't/r', main: 'main', mainSha, mirror,
+    info: { number, headSha, headRef, base: 'main', fork: false, state: 'OPEN' },
+  };
+}

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseChecked, judgeStatus, staleFiles, staleReason, runMerge } from '../lib/merge.mjs';
+import { parseChecked, judgeStatus, judgeLandStatus, squashMerge, staleFiles, staleReason, runMerge } from '../lib/merge.mjs';
 import { setupCheck as setup, git, tempDir, commitFiles, fakeGh } from './helpers.mjs';
 
 const HEAD = 'a'.repeat(40);
@@ -261,4 +261,48 @@ test('two ship merges of one repository take turns', async () => {
   assert.deepEqual(r.codes, [0, 0], r.lines.join('\n'));
   assert.equal(r.merges.length, 2);
   assert.equal(r.lines.filter((l) => l === '… another ship merge of t/r is running — waiting for it').length, 1, r.lines.join('\n'));
+});
+
+test('judgeLandStatus wants a success against exactly the main it is given', () => {
+  const MAIN = `52d4c19${'a'.repeat(33)}`;
+  const judge = (description, extra = {}) => judgeLandStatus({ state: 'success', description, ...extra }, { pr: 7, headSha: HEAD, main: 'main', mainSha: MAIN });
+  assert.equal(judge('app · vs main@52d4c19 · 4s').ok, true);
+  assert.equal(judge('docs-only · vs main@52d4c19').ok, true);
+  assert.equal(judge('app · vs main@1234567 · 4s').reason, 'local-ci on aaaaaaa checked main@1234567, not main@52d4c19, the main ship land merges onto; run ship land --pr 7');
+  assert.match(judge('app · vs release@52d4c19 · 4s').reason, /checked release@52d4c19, not main@52d4c19/);
+  assert.match(judge('app · vs main@52d4c19 · 4s', { bot: true, postedBy: 'x[bot]' }).reason, /not by ship check; run ship land --pr 7$/);
+  assert.equal(judgeLandStatus(null, { pr: 7, headSha: HEAD, main: 'main', mainSha: MAIN }).reason, 'no local-ci status on aaaaaaa; run ship land --pr 7');
+  assert.equal(judgeStatus(null, { pr: 7, headSha: HEAD }).reason, 'no local-ci status on aaaaaaa; run ship check --pr 7', 'ship merge\'s advice is unchanged');
+});
+
+// A fake gh for PR #7 at head bbb…; `prSequence` is what the Nth `gh pr view` says (mergedSha reads
+// one too).
+async function mergeFixture(ghOptions = {}) {
+  const head = 'b'.repeat(40);
+  const pr = { number: 7, headRefOid: head, headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'OPEN', mergeCommit: null };
+  const fake = await fakeGh(await tempDir(), { pr, ...ghOptions });
+  return { head, fake, d: { gh: fake.gh, mergeTimeoutMs: 5000, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) } };
+}
+const views = async (fake) => (await fake.calls()).filter((c) => c[0] === 'pr' && c[1] === 'view').length;
+
+test('squashMerge: a merge, a refusal read once, and an outcome read again until it settles', async () => {
+  const ok = await mergeFixture({ prSequence: [{ state: 'MERGED', mergeCommit: { oid: 'f'.repeat(40) } }] });
+  assert.deepEqual(await squashMerge({ d: ok.d, repo: 't/r', number: 7, headSha: ok.head }), { merged: true, sha: 'f'.repeat(40), why: null, killed: false });
+
+  const refused = await mergeFixture({ mergeFail: 'Pull request is not mergeable' });
+  const r = await squashMerge({ d: refused.d, repo: 't/r', number: 7, headSha: refused.head });
+  assert.deepEqual([r.merged, r.now.state, r.why, r.killed], [false, 'OPEN', 'Pull request is not mergeable', false]);
+  assert.equal(await views(refused.fake), 1, 'without readForMs the PR is read once, as ship merge does');
+
+  const late = await mergeFixture({ mergeFail: 'HTTP 502', prSequence: [{}, {}, { state: 'MERGED', mergeCommit: { oid: 'e'.repeat(40) } }] });
+  assert.deepEqual(await squashMerge({ d: late.d, repo: 't/r', number: 7, headSha: late.head, readForMs: 5000, readEveryMs: 1 }),
+    { merged: true, sha: 'e'.repeat(40), why: 'HTTP 502', killed: false });
+
+  const moved = await mergeFixture({ mergeFail: 'Head branch was modified', prSequence: [{}, { headRefOid: 'c'.repeat(40) }] });
+  const m = await squashMerge({ d: moved.d, repo: 't/r', number: 7, headSha: moved.head, readForMs: 5000, readEveryMs: 1 });
+  assert.deepEqual([m.merged, m.now.headSha], [false, 'c'.repeat(40)]);
+
+  const dark = await mergeFixture({ mergeFail: 'connection reset', prSequence: [{ fail: true }] });
+  const x = await squashMerge({ d: dark.d, repo: 't/r', number: 7, headSha: dark.head, readForMs: 30, readEveryMs: 1 });
+  assert.deepEqual([x.merged, x.now], [false, null]);
 });

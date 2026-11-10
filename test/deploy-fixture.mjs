@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { commitFiles, fakeGh, git, makeOrigin, tempDir } from './helpers.mjs';
 import { runDeploy } from '../lib/deploy.mjs';
+import { addAcks } from '../lib/state.mjs';
 import { fakeCloud } from './fake-cloud.mjs';
 
 // `docsOnly` and `appIgnore` are JS array literals for the config's docsOnly and the app's ignore.
@@ -54,4 +55,24 @@ export async function setupDeploy({ options = {}, seed, change = null, probe = h
   };
   const deploy = (names = [], dryRun = false, redeploy = false) => runDeploy({ cwd: work, names, dryRun, redeploy, deps });
   return { cloud, lines, deploy, deps, first, head, root, work };
+}
+
+// t/r requires t/api's app; t/api has two commits on main and its app is live at the first.
+// `apiLive(otherFirst, otherSecond)` replaces t/api's seed: a worker state, or null for a worker never deployed.
+export async function requiresSetup({ apiLive = (first) => at(first) } = {}) {
+  const other = await makeOrigin({ 'ship.config.mjs': `export default { repo: 't/api', checks: [{ name: 'u', paths: ['**'], steps: ['true'] }],
+    deployables: [{ name: 'app', worker: 'example-api', cwd: '.', paths: ['src/**'], mode: 'direct' }],
+    credentials: { file: '/unused', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } } };\n`, 'src/x.ts': '1', 'wrangler.json': '{"name":"example-api"}' });
+  const otherFirst = (await git(['rev-parse', 'HEAD'], other.work)).trim();
+  const otherSecond = await commitFiles(other.work, { 'src/x.ts': '2' }, 'api change');
+  await git(['push', '--quiet', 'origin', 'main'], other.work);
+  const s = await setupDeploy({
+    options: { requires: "[{ repo: 't/api', deployable: 'app' }]" },
+    seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first), ...(apiLive(otherFirst, otherSecond) ? { 'example-api': apiLive(otherFirst, otherSecond) } : {}) }),
+    change: { 'app/src/a.ts': '2' },
+  });
+  await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);
+  const origin = s.deps.remoteUrl();
+  s.deps.remoteUrl = (repo) => (repo === 't/api' ? other.origin : origin);
+  return { s, other, otherFirst, otherSecond };
 }

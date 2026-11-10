@@ -5,9 +5,10 @@ import { mkdir, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { ownerInfo, processStartTime } from '../lib/lock.mjs';
-import { parseLogName, runtimeOf, readHistory, usualFor, readLanes, snapshot, render, runQueue } from '../lib/queue.mjs';
-import { tempDir } from './helpers.mjs';
+import { acquire, ownerInfo, processStartTime } from '../lib/lock.mjs';
+import { parseLogName, runtimeOf, readHistory, usualFor, readLanes, snapshot, render, runQueue, kindOf } from '../lib/queue.mjs';
+import { LANE_PRIORITY } from '../lib/shared.mjs';
+import { tempDir, waitUntil } from './helpers.mjs';
 
 const MIN = 60_000;
 const NOW = Date.parse('2026-11-01T16:30:00Z');
@@ -224,8 +225,8 @@ test('waiters: how long each has waited and when it should start, from the holde
   const history = [...runs('acme/app', 'check', [5, 5, 5]), ...runs('acme/app', 'deploy', [8, 8, 8])];
   const waiters = [
     { priority: 0, arrivedAt: NOW - 90_000, owner: { repo: 'acme/app', command: 'deploy app' } },
-    { priority: 1, arrivedAt: NOW - 4 * MIN, owner: { repo: 'acme/app', pr: 13 } },
-    { priority: 1, arrivedAt: NOW - 2 * MIN, owner: { repo: 'acme/app', pr: 14 } },
+    { priority: LANE_PRIORITY.check, arrivedAt: NOW - 4 * MIN, owner: { repo: 'acme/app', pr: 13 } },
+    { priority: LANE_PRIORITY.check, arrivedAt: NOW - 2 * MIN, owner: { repo: 'acme/app', pr: 14 } },
   ];
   const [heavy] = await snapshot({ nowMs: NOW, history, lanes: [{ name: 'heavy', holder, stale: false, waiters }] });
   // the holder has ~2m left; then 8m of deploy, then 5m of PR #13
@@ -331,4 +332,45 @@ test('a check on Cloudflare is listed with its commit, next to one on GitHub, an
   assert.match(on(/^on Cloudflare: acme\/app PR #14/), /starting$/, 'between taking the place and the push');
   assert.ok(!lines.some((l) => /cloudflare-|github-|stuck/.test(l)), lines.join('\n'));
   assert.ok(lines.includes('heavy lane: free'));
+});
+
+test('a waiter is labelled deploy work, land check or check by its priority', () => {
+  assert.deepEqual(LANE_PRIORITY, { deploy: 0, land: 1, check: 2 });
+  assert.equal(kindOf(LANE_PRIORITY.deploy), 'deploy work, ahead of checks');
+  assert.equal(kindOf(LANE_PRIORITY.land), 'land check, ahead of other checks');
+  assert.equal(kindOf(LANE_PRIORITY.check), 'check');
+});
+
+test('a land check is labelled as one on the screen', async () => {
+  const holder = await live({ repo: 'acme/app', pr: 12 }, { since: new Date(NOW - MIN).toISOString() });
+  const waiters = [
+    { priority: LANE_PRIORITY.land, arrivedAt: NOW - MIN, owner: { repo: 'acme/app', pr: 15 } },
+    { priority: LANE_PRIORITY.check, arrivedAt: NOW - 3 * MIN, owner: { repo: 'acme/app', pr: 13 } },
+  ];
+  const [heavy] = await snapshot({ nowMs: NOW, history: [], lanes: [{ name: 'heavy', holder, stale: false, waiters }] });
+  const lines = render([heavy]);
+  assert.match(lines.find((l) => l.includes('PR #15')), / {2}· {2}land check, ahead of other checks {2}· {2}/);
+  assert.match(lines.find((l) => l.includes('PR #13')), / {2}· {2}check {2}· {2}/);
+});
+
+test('a land ticket filed after a check ticket is served first through the real lock ordering', { timeout: 30_000 }, async () => {
+  const tmpRoot = await tempDir();
+  await mkdir(join(tmpRoot, 'lanes'), { recursive: true });
+  const dir = join(tmpRoot, 'lanes', 'heavy');
+  const holder = await acquire(dir, await ownerInfo({ repo: 'acme/app', command: 'holder' }));
+  const served = [];
+  const wait = async (name, priority) => {
+    const release = await acquire(dir, await ownerInfo({ repo: 'acme/app', command: name }), { priority, pollMs: 5 });
+    served.push(name);
+    await release();
+  };
+  const check = wait('check', LANE_PRIORITY.check);
+  const waiters = async () => (await readLanes(tmpRoot)).find((l) => l.name === 'heavy').waiters;
+  await waitUntil(async () => (await waiters()).length === 1, 'the check is in line');
+  const land = wait('land', LANE_PRIORITY.land);
+  await waitUntil(async () => (await waiters()).length === 2, 'the land is in line');
+  assert.deepEqual((await waiters()).map((w) => w.owner.command), ['land', 'check'], 'the line shows the land first');
+  await holder();
+  await Promise.all([check, land]);
+  assert.deepEqual(served, ['land', 'check']);
 });

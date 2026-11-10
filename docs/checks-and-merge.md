@@ -48,8 +48,8 @@ system time zone; `SHIP_TZ=UTC` (any IANA name) overrides it.
 
 A lane is first come, first served. A check or deploy step that wants a lane files a ticket in
 `$SHIP_TMP/lanes` and starts only when its ticket is first, so it cannot lose to a waiter that
-happens to poll at a luckier moment. Work that `ship deploy` does (its setup, deploy-time checks and
-builds) goes ahead of waiting pull request checks; whoever holds the lane is never interrupted. The
+happens to poll at a luckier moment. The heavy lane has three classes: work that `ship deploy` does (its setup,
+deploy-time checks and builds) goes first, then land checks (`ship land`, coming), then `ship check` runs; whoever holds the lane is never interrupted. The
 waiting line says the place: `… waiting for the heavy lane (3rd in line): acme/app PR #12 since 17:21`
 (who holds the lane now), repeated whenever the place changes and at least once a minute. A waiter
 that is killed does not hold the others up: the next one removes the ticket of a process that is
@@ -76,7 +76,8 @@ Stopping only ends work in progress: a check that has finished posts its verdict
 `ship queue` shows the lanes on one screen, read only. For each lane it shows the holder (the pull
 request or command, how long it has held the lane, the usual run time, and how long ago its log
 was last written) and the waiters in line order with how long each has waited and when it should
-start. The usual time is the median of the latest 20 runs of that kind in that repository, and the
+start. `ship queue` labels each waiter `deploy work, ahead of checks`, `land check, ahead of other
+checks` or `check`. The usual time is the median of the latest 20 runs of that kind in that repository, and the
 90th percentile is the top of the range; both come from `~/.ship/logs/`. A deploy's log spans all
 of its turns at the lane, so a deploy's figure is for the whole deploy. With fewer than 3 runs
 there is no estimate. The estimate is the holder's time left plus the usual time of each waiter

@@ -4,8 +4,9 @@ import { writeFile, mkdir, chmod, utimes, rm, readdir } from 'node:fs/promises';
 import { readdirSync } from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { dirname, join } from 'node:path';
-import { acquire as acquireLock, tryLock, ownerInfo, isStale, readOwner, processStartTime } from '../lib/lock.mjs';
+import { basename, dirname, join } from 'node:path';
+import { once } from 'node:events';
+import { acquire as acquireLock, tryLock, ownerInfo, isStale, readOwner, processStartTime, liveAhead } from '../lib/lock.mjs';
 import { atTestEnd, stopBackground, tempDir, waitUntil } from './helpers.mjs';
 
 // However a test ends, the locks it took, the waiters in line and the processes it started end with it.
@@ -467,4 +468,22 @@ test('arrivedAt is the place in line: a waiter that comes back goes ahead of a l
   await holder();
   await Promise.all([later, back]);
   assert.deepEqual(order, ['back', 'later']);
+});
+
+test('liveAhead with a ticket at the end of the line lists every live waiter in order and removes the dead', { timeout: 30_000 }, async () => {
+  const dir = await lockDir();
+  const holder = await acquire(dir, await ownerInfo({ label: 'holder' }));
+  const first = await lineUp(dir, async () => acquire(dir, await ownerInfo({ label: 'first' }), { priority: 1, pollMs: 10 }).then((r) => r()));
+  const second = await lineUp(dir, async () => acquire(dir, await ownerInfo({ label: 'second' }), { priority: 1, pollMs: 10 }).then((r) => r()));
+  // Behind both of them, so only a look at the whole line reaches it.
+  const dead = spawn(process.execPath, ['-e', '0'], { stdio: 'ignore' });
+  await once(dead, 'close');
+  const deadName = `${basename(dir)}.q-01-${String(Date.now() + 1e9).padStart(15, '0')}-000000-dead.json`;
+  await writeFile(join(dirname(dir), deadName), JSON.stringify({ pid: dead.pid, startTime: null, nonce: 'dead', label: 'dead' }));
+  const waiting = await liveAhead(dir, { name: '\uffff', left: true });
+  assert.deepEqual(waiting.map((o) => o.label), ['first', 'second']);
+  assert.ok(!ticketsOf(dir).includes(deadName), 'the dead waiter\'s ticket is removed');
+  await holder();
+  await first();
+  await second();
 });

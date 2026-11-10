@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import { commitFiles, git, makeOrigin } from './helpers.mjs';
 import { addAcks, writeHold } from '../lib/state.mjs';
 import { UsageError } from '../lib/shared.mjs';
-import { at, setupDeploy } from './deploy-fixture.mjs';
+import { at, requiresSetup, setupDeploy } from './deploy-fixture.mjs';
+import { requiredState, runDeploy } from '../lib/deploy.mjs';
+import { deployDeps } from '../lib/repo.mjs';
 
 test('nothing pending: already live, no build, exit 0', async () => {
   const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }) });
@@ -149,6 +151,54 @@ test('requires: a pending deployable of another repo stops the deploy', async ()
   assert.equal(await s.deploy(), 1);
   assert.match(s.lines.join('\n'), /requires t\/api app: pending/);
   assert.deepEqual(await s.cloud.wranglerCalls(), []);
+});
+
+test('requires with a floor: live at or past the floor is enough, before it the deploy stops; without one, today\'s rule', async () => {
+  const { s, otherFirst, otherSecond } = await requiresSetup();
+  const req = { repo: 't/api', deployable: 'app' };
+  const d = { ...deployDeps(), ...s.deps };
+  assert.match(await requiredState({ d, req }), /^pending /, 'no floor: it must be live at its main');
+  assert.equal(await requiredState({ d, req, floor: otherFirst }), 'live');
+  assert.equal(await requiredState({ d, req, floor: otherSecond }), `live at ${otherFirst.slice(0, 7)}, before ${otherSecond.slice(0, 7)}`);
+
+  assert.equal(await runDeploy({ cwd: s.work, floors: { 't/api': otherSecond }, deps: s.deps }), 1);
+  assert.match(s.lines.join('\n'), /✗ requires t\/api app: live at [0-9a-f]{7}, before [0-9a-f]{7} — deploy that first/);
+  assert.equal(await runDeploy({ cwd: s.work, floors: { 't/api': otherFirst }, deps: s.deps }), 0, s.lines.join('\n'));
+  assert.ok(s.lines.includes(`✓ requires t/api app: live at or past ${otherFirst.slice(0, 7)}`), s.lines.join('\n'));
+});
+
+test('a floor past the live commit is met when nothing of the deployable changed in between', async () => {
+  const { s, other, otherSecond } = await requiresSetup({ apiLive: (_, second) => at(second) });
+  const docs = await commitFiles(other.work, { 'README.md': 'docs only' }, 'docs');
+  await git(['push', '--quiet', 'origin', 'main'], other.work);
+  const d = { ...deployDeps(), ...s.deps };
+  const req = { repo: 't/api', deployable: 'app' };
+  assert.equal(await requiredState({ d, req, floor: docs }), 'live');
+  const code = await commitFiles(other.work, { 'src/x.ts': '3' }, 'api change again');
+  await git(['push', '--quiet', 'origin', 'main'], other.work);
+  assert.equal(await requiredState({ d, req, floor: code }), `live at ${otherSecond.slice(0, 7)}, before ${code.slice(0, 7)}`);
+});
+
+test('a floor is refused when the required deployable is held, blocked or never deployed, or the floor is not on its main', async () => {
+  const req = { repo: 't/api', deployable: 'app' };
+  const stateFor = async (s, floor) => requiredState({ d: { ...deployDeps(), ...s.deps }, req, floor });
+
+  const held = await requiresSetup();
+  await writeHold(held.s.deps.stateRoot, 't/api', 'app', { reason: 'rolled back by the owner' });
+  assert.match(await stateFor(held.s, held.otherFirst), /^held \(.*rolled back by the owner/);
+
+  const blocked = await requiresSetup({ apiLive: () => at('f'.repeat(40)) });
+  assert.match(await stateFor(blocked.s, blocked.otherFirst), /^blocked \(live commit fffffff is not in t\/api\)/);
+
+  const none = await requiresSetup({ apiLive: () => null });
+  assert.equal(await stateFor(none.s, none.otherFirst), 'not deployed yet');
+
+  const { s, other, otherFirst } = await requiresSetup();
+  assert.equal(await stateFor(s, 'e'.repeat(40)), 'eeeeeee is not in t/api');
+  await git(['checkout', '--quiet', '-b', 'side', otherFirst], other.work);
+  const side = await commitFiles(other.work, { 'src/x.ts': 'side' }, 'not on main');
+  await git(['push', '--quiet', 'origin', 'side:refs/heads/side'], other.work);
+  assert.equal(await stateFor(s, side), `${side.slice(0, 7)} is not on the main of t/api`);
 });
 
 // The nth read of a Worker's deployments fails. For a versioned deployable the 1st is the plan and

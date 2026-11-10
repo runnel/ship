@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { readdirSync } from 'node:fs';
-import { repoKeyOf, runSteps, newLogFile, withLane, acquireShared, laneWaitReporter, ordinal, LANE_PRIORITY } from '../lib/shared.mjs';
-import { ownerInfo } from '../lib/lock.mjs';
+import { repoKeyOf, runSteps, newLogFile, withLane, acquireShared, laneWaitReporter, ordinal, LANE_PRIORITY, lockWithin } from '../lib/shared.mjs';
+import { acquire, ownerInfo } from '../lib/lock.mjs';
+import { syncMirror } from '../lib/repo.mjs';
 import { tempDir, waitUntil } from './helpers.mjs';
 
 test('repoKeyOf', () => {
@@ -129,4 +130,23 @@ test('a lane serves deploy work before checks and each in arrival order, one at 
   assert.equal(maxInside, 1);
   assert.equal(tickets(), 0);
   assert.equal(readdirSync(join(dir, 'lanes')).length, 0);
+});
+
+test('a lock wait with a time limit ends then and says what was held; without one it waits', async () => {
+  const root = await tempDir('lockwithin-');
+  const dir = join(root, 'locks', 'merge-t__r');
+  const held = await acquire(dir, await ownerInfo({ repo: 't/r', command: 'another merge' }));
+  await assert.rejects(lockWithin(dir, await ownerInfo(), { pollMs: 10, waitMs: 200, what: 'the merge lock of t/r' }),
+    (e) => e.timedOut === true && e.message === 'the merge lock of t/r was held by another process for longer than 0.2 s');
+  const d = { tmpRoot: root, pollMs: 10, lockWaitMs: 200, mirrorRoot: join(root, 'm'), remoteUrl: () => join(root, 'nowhere.git') };
+  const mirrorLock = await acquire(join(root, 'locks', 'mirror-t__r'), await ownerInfo({ repo: 't/r' }));
+  await assert.rejects(syncMirror({ repo: 't/r', d, mainBranch: 'main' }),
+    (e) => e.timedOut === true && e.message === 'the mirror lock of t/r was held by another process for longer than 0.2 s');
+  await mirrorLock();
+  const noOpts = await lockWithin(join(root, 'locks', 'free'), await ownerInfo()); // options are optional
+  await noOpts();
+  const later = lockWithin(dir, await ownerInfo(), { pollMs: 10, what: 'the merge lock of t/r' });
+  setTimeout(() => held(), 300);
+  const release = await later;
+  await release();
 });

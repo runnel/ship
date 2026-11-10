@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, readFile, mkdir, readdir, utimes } from 'node:fs/promises';
+import { access, readFile, mkdir, readdir, utimes, writeFile, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile, isAncestor, listTree, commitsTouching, subject, lastCommitBefore } from '../lib/git.mjs';
 import { validateConfig } from '../lib/config.mjs';
 import { classify } from '../lib/classify.mjs';
 import { capture } from '../lib/proc.mjs';
-import { makeOrigin, commitFiles, git, tempDir } from './helpers.mjs';
+import { makeOrigin, commitFiles, git, hangingRemote, isGone, tempDir } from './helpers.mjs';
 
 async function branchAndMain({ feat, main }) {
   const o = await makeOrigin({ 'a.txt': 'a\n' });
@@ -222,4 +222,29 @@ test('lastCommitBefore follows the first parents: a side commit merged later is 
   assert.notEqual(feat1, main1);
   assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:30Z'), main1);
   assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:50Z'), merged);
+});
+
+test('a mirror fetch with a time limit is stopped then and says so', { timeout: 30_000 }, async () => {
+  const o = await makeOrigin({ 'a.txt': 'a\n' });
+  const root = join(o.root, 'mirrors');
+  const mirror = await ensureMirror('t/r', { root, url: o.origin });
+  const hang = await hangingRemote();
+  await capture('git', ['--git-dir', mirror, 'remote', 'set-url', 'origin', hang.url]);
+  try {
+    // A kill that lands before git has started the remote helper leaves no pid: repeat the call (at
+    // most 5 times) until one is recorded. Every call must still be stopped and say so.
+    const stoppedFetch = async (call, message) => {
+      const before = (await hang.pids()).length;
+      for (let i = 0; i < 5 && (await hang.pids()).length === before; i++) {
+        await assert.rejects(call(), (e) => e.timedOut === true && message.test(e.message));
+      }
+      assert.ok((await hang.pids()).length > before, 'the fetch started a helper');
+    };
+    await stoppedFetch(() => ensureMirror('t/r', { root, url: o.origin, fetchTimeoutMs: 1500 }), /^git fetch of t\/r took longer than 1\.5 s$/);
+    await stoppedFetch(() => fetchCommit(mirror, 'd'.repeat(40), 7, { timeoutMs: 1500 }), /^git fetch of pull\/7\/head took longer than 1\.5 s$/);
+    // The fetch's remote helpers died with them (checked before the cleanup below could hide a leak).
+    for (const pid of await hang.pids()) assert.equal(await isGone(pid, 1000), true, `helper ${pid} still running`);
+  } finally {
+    await hang.restore();
+  }
 });
