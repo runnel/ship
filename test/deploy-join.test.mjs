@@ -272,7 +272,9 @@ test('a deploy with other requires floors does not join: its verdict would not b
   assert.ok(plain.lead);
   const floored = await enter({ 't/api': 'c'.repeat(40) });
   assert.ok(floored.lead, 'a land\'s runner leads its own deploy rather than take a manual one\'s verdict');
-  assert.ok((await enter({})).follow, 'deploys without floors still join each other');
+  const joined = await enter({});
+  assert.ok(joined.follow, 'deploys without floors still join each other');
+  assert.equal(joined.follow.key, JSON.stringify({ names: [], redeploy: false }), 'a floor-less key is the key from before floors existed');
   assert.ok((await enter({ 't/api': 'c'.repeat(40) })).follow, 'and so do deploys with the same floors');
   await plain.lead.end({ code: 0 });
   await floored.lead.end({ code: 0 });

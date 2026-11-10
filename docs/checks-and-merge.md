@@ -49,8 +49,7 @@ system time zone; `SHIP_TZ=UTC` (any IANA name) overrides it.
 A lane is first come, first served. A check or deploy step that wants a lane files a ticket in
 `$SHIP_TMP/lanes` and starts only when its ticket is first, so it cannot lose to a waiter that
 happens to poll at a luckier moment. The heavy lane has three classes: work that `ship deploy` does (its setup,
-deploy-time checks and builds) goes first, then land checks (`ship land`, coming), then optional
-checks; whoever holds the lane is never interrupted. The
+deploy-time checks and builds) goes first, then land checks (`ship land`, coming), then `ship check` runs; whoever holds the lane is never interrupted. The
 waiting line says the place: `… waiting for the heavy lane (3rd in line): acme/app PR #12 since 17:21`
 (who holds the lane now), repeated whenever the place changes and at least once a minute. A waiter
 that is killed does not hold the others up: the next one removes the ticket of a process that is

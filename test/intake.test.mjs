@@ -50,7 +50,7 @@ test('a leader whose process is gone is not joined', async () => {
   await mkdir(dir, { recursive: true });
   const feed = join(dir, '000000000000001-dead.out');
   await writeFile(feed, '');
-  await writeFile(join(dir, '000000000000001-dead.json'), JSON.stringify({ id: 'dead', key: JSON.stringify({ names: [], redeploy: false, floors: [] }), phase: 'open', pid: 2 ** 22 + 12345, pgid: null, startTime: null, since: new Date().toISOString(), feed }));
+  await writeFile(join(dir, '000000000000001-dead.json'), JSON.stringify({ id: 'dead', key: JSON.stringify({ names: [], redeploy: false }), phase: 'open', pid: 2 ** 22 + 12345, pgid: null, startTime: null, since: new Date().toISOString(), feed }));
   assert.ok((await s.enter()).lead);
   assert.deepEqual((await readdir(dir)).filter((f) => f.endsWith('.json') && f.includes('dead')), [], 'its entry is removed');
 });

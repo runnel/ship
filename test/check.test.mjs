@@ -358,3 +358,17 @@ test('a verdict that could not be posted is an error, not a merge conflict', asy
   assert.equal(result.state, 'error', s.lines.join('\n'));
   assert.equal('conflict' in result, false);
 });
+
+test('checkOnce returns an error, not a rejection, when the first (queued) status cannot be posted', async () => {
+  const s = await setup({ ghOptions: { apiFail: { match: 'state=pending' } } });
+  const p = await prepareCheck(s);
+  const result = await checkOnce({ ...p, land: true });
+  assert.deepEqual(result, { state: 'error', description: 'the queued status could not be posted', exitCode: 1 });
+  assert.match(s.lines.join('\n'), /✗ local-ci not started: GitHub did not take the queued status/);
+});
+
+test('a direct ship check whose queued status cannot be posted exits 1 with one line saying so', async () => {
+  const s = await setup({ ghOptions: { apiFail: { match: 'state=pending' } } });
+  assert.equal(await runCheck({ cwd: s.work, deps: s.deps }), 1, s.lines.join('\n'));
+  assert.match(s.lines.join('\n'), /✗ local-ci not started: GitHub did not take the queued status/);
+});
