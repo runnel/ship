@@ -7,6 +7,7 @@ import { contains, decide, landedChanges, liveFor } from '../lib/land-live.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { landDir } from '../lib/land-line.mjs';
 import { clearHold, writeHold } from '../lib/state.mjs';
+import { localTime } from '../lib/report.mjs';
 import { commitTimeMs, mirrorPath } from '../lib/git.mjs';
 import { syncMirror } from '../lib/repo.mjs';
 import { at, setupDeploy } from './deploy-fixture.mjs';
@@ -209,7 +210,7 @@ const LAND = { deployAfterMin: 60, debounceSec: 120, liveWaitHours: 12 };
 const T0 = Date.parse('2026-11-10T12:00:00Z');
 const facts = (over = {}) => ({
   tip: TIP, live: { app: { sha: TIP, contains: false, blocked: false } }, holds: {}, uncleared: [], tipUncleared: [], migrations: [],
-  requires: [], deployRunning: false, deployedOk: false, failed: null, lineEmpty: true, tipAtMs: T0 - 10_000, oldestUnliveAtMs: T0 - 10_000, ...over,
+  requires: [], deployRunning: false, deployedOk: null, failed: null, lineEmpty: true, tipAtMs: T0 - 10_000, oldestUnliveAtMs: T0 - 10_000, ...over,
 });
 const step = (f, extra = {}) => decide({ facts: f, pr: 7, mergeSha: MERGE, touched: ['app'], added: [], land: LAND, nowMs: T0, quietSinceMs: 0, ...extra });
 
@@ -237,13 +238,39 @@ test('decide, steps 6 and 2–4 in order: a failed deploy, a migration at the ti
   assert.deepEqual(step(facts({ deployRunning: true })), { wait: 'deploying', line: '… a deploy of this repository is running; waiting for it to end' });
 });
 
-test('decide: a tip whose deploy ended ok is not deployed again; it waits for the live cache', () => {
-  const r = step(facts({ deployedOk: true }));
+test('decide: the current tip whose deploy ended ok is not deployed again; it waits for the live cache', () => {
+  const r = step(facts({ deployedOk: { tip: TIP } }));
   assert.equal(r.deploy, undefined);
-  assert.equal(r.wait, 'live');
-  assert.match(r.line, /^… the deploy of main@bbbbbbb ended ok; waiting for it to show as live/);
-  assert.equal(step(facts({ deployedOk: true, holds: { app: { reason: 'x', at: null } } })).done, 3, 'a hold still ends the land');
-  assert.equal(step(facts({ deployedOk: true, live: { app: { sha: TIP, contains: true, blocked: false } } })).done, 0, 'live wins');
+  assert.deepEqual(r, { wait: 'live', line: '… the deploy of main@bbbbbbb ended ok; waiting for it to show as live' });
+  assert.equal(step(facts({ deployedOk: { tip: TIP }, live: { app: { sha: TIP, contains: true, blocked: false } } })).done, 0, 'live wins');
+});
+
+test('decide: an ok deploy of an older tip is ignored; this merge deploys on debounce or deadline', () => {
+  const OLD = 'c'.repeat(40);
+  assert.deepEqual(step(facts({ deployedOk: { tip: OLD }, tipAtMs: T0 - 120_000 })), { deploy: true, why: 'the land line has been quiet for 120 s' });
+  assert.deepEqual(step(facts({ deployedOk: { tip: OLD }, lineEmpty: false, tipAtMs: T0 - 600_000, oldestUnliveAtMs: T0 - 60 * 60_000 })), { deploy: true, why: 'a merge has waited 60 min' });
+  assert.equal(step(facts({ deployedOk: { tip: OLD }, tipAtMs: T0 - 10_000 })).wait, 'debounce');
+});
+
+test('decide: failed, a migration, a hold, a requirement and a running deploy all outrank a matching deployedOk', () => {
+  const ok = { deployedOk: { tip: TIP } };
+  assert.equal(step(facts({ ...ok, failed: { tip: TIP, code: 1, log: '/x.out' } })).done, 3);
+  assert.equal(step(facts({ ...ok, tipUncleared: [{ file: 'db/9.sql', ours: false, by: '#12' }] })).wait, 'migration');
+  assert.equal(step(facts({ ...ok, holds: { app: { reason: 'x', at: null } } })).done, 3);
+  assert.equal(step(facts({ ...ok, requires: [{ repo: 't/api', deployable: 'app', floor: 'c'.repeat(40), now: 'd'.repeat(7), met: false }] })).wait, 'requires');
+  assert.equal(step(facts({ ...ok, deployRunning: true })).wait, 'deploying');
+});
+
+test('decide: no backlog (null) counts the deadline from the tip, not from 1970', () => {
+  const r = step(facts({ lineEmpty: false, tipAtMs: T0 - 10_000, oldestUnliveAtMs: null }));
+  assert.equal(r.wait, 'debounce');
+  assert.deepEqual(step(facts({ lineEmpty: false, tipAtMs: T0 - 60 * 60_000, oldestUnliveAtMs: null })), { deploy: true, why: 'a merge has waited 60 min' });
+});
+
+test('decide: the debounce wait line names the quiet time and the deadline', () => {
+  const r = step(facts({ lineEmpty: false, tipAtMs: T0 - 10_000, oldestUnliveAtMs: T0 - 10 * 60_000 }));
+  const when = localTime(new Date(T0 + 50 * 60_000).toISOString());
+  assert.deepEqual(r, { wait: 'debounce', line: `… merged as aaaaaaa; the deploy starts once the land line has been quiet for 120 s, or by ${when}` });
 });
 
 test('decide: a change with no net effect counts as live by the caller\'s `contains`', () => {

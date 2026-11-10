@@ -168,6 +168,9 @@ test('land: defaults, positive numbers, no unknown keys', () => {
   assert.throws(() => validateConfig({ ...base, land: { deployAfterMin: 0 } }), /land: deployAfterMin must be a positive number/);
   assert.throws(() => validateConfig({ ...base, land: { soon: 1 } }), /land: unknown key soon/);
   assert.equal(validateConfig({ ...base, land: { liveWaitHours: 24 } }).land.liveWaitHours, 24);
+  assert.equal(validateConfig({ ...base, land: { deployAfterMin: 1440 } }).land.deployAfterMin, 1440);
+  assert.throws(() => validateConfig({ ...base, land: { deployAfterMin: 1441 } }), /land: deployAfterMin must be at most 1440/);
+  assert.throws(() => validateConfig({ ...base, land: { deployAfterMin: Infinity } }), /land: deployAfterMin must be at most 1440/);
   assert.throws(() => validateConfig({ ...base, land: { liveWaitHours: 25 } }), /land: liveWaitHours must be at most 24 \(deploy records are kept a day\)/);
   assert.throws(() => validateConfig({ ...base, land: 5 }), ConfigError);
 });
