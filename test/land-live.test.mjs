@@ -611,7 +611,7 @@ test('a merge that lands between the decision and the freeze, with a floor not m
   // what it ships, B merges on top with a floor that is not met (t/api live at otherFirst, floor
   // otherSecond). The runner judges the tip it actually deploys, so it refuses: B is not shipped.
   const rq = await requiresSetup();
-  const l = await landed({ from: rq.s, ack: [] });
+  const l = await landed({ from: rq.s, ack: [], land: { liveWaitHours: 0.5 } });
   const start = l.d.startDeploy;
   l.d.startDeploy = async (args) => {
     const b = await commitFiles(l.s.work, { 'app/src/a.ts': '3' }, 'b change (#10)');
@@ -619,7 +619,10 @@ test('a merge that lands between the decision and the freeze, with a floor not m
     await recordFloors({ d: l.d, repo: 't/r', mergeSha: b, floors: { 't/api': rq.otherSecond } });
     return start(args);
   };
+  // The refusal is the floor's wait, not a failure: the land ends 3 only when liveWaitHours is up, and no
+  // second deploy starts while the floor is not met.
   assert.equal(await l.wait({ floors: { 't/api': rq.otherFirst } }), 3, l.s.lines.join('\n'));
+  assert.match(l.s.lines.at(-1), /not live after 0\.5 h/);
   assert.equal(l.starts.length, 1);
   assert.match(l.s.lines.join('\n'), new RegExp(`✗ requires t/api app: live at ${rq.otherFirst.slice(0, 7)}, before ${rq.otherSecond.slice(0, 7)} — deploy that first`));
   assert.equal((await l.s.cloud.wranglerCalls()).filter((c) => c.cmd === 'versions upload').length, 0, 'nothing was uploaded');
@@ -636,4 +639,46 @@ test('the migrations the tip\'s config watches decide the migration gate, not th
   assert.equal(await l.wait(), 3, l.s.lines.join('\n'));
   assert.deepEqual(l.starts, [], 'the migration gate holds the deploy back');
   assert.ok(l.s.lines.includes('… waiting for migration db2/002.sql (#10)'), l.s.lines.join('\n'));
+});
+
+test('a deploy refused at a later merge\'s floor is not a failure of this land: it waits for the floor, then ships', async () => {
+  const rq = await requiresSetup();
+  let n0 = null;
+  const l = await landed({ from: rq.s, ack: [], onTick: async (n, { s }) => {
+    if (n !== 12) return;
+    n0 = n;
+    const v = s.cloud.addVersion('example-api', { message: `sha:${rq.otherSecond} x` });
+    s.cloud.addDeployment('example-api', v.id, { message: `sha:${rq.otherSecond} x` });
+  } });
+  const start = l.d.startDeploy;
+  let first = true;
+  l.d.startDeploy = async (args) => {
+    if (first) {
+      first = false;
+      const b = await commitFiles(l.s.work, { 'app/src/a.ts': '3' }, 'b change (#10)');
+      await git(['push', '--quiet', l.d.remoteUrl(), 'main'], l.s.work);
+      await recordFloors({ d: l.d, repo: 't/r', mergeSha: b, floors: { 't/api': rq.otherSecond } });
+    }
+    return start(args);
+  };
+  assert.equal(await l.wait({ floors: { 't/api': rq.otherFirst } }), 0, l.s.lines.join('\n'));
+  assert.equal(n0, 12, 'the required deployable went live at the floor');
+  assert.equal(l.starts.length, 2, 'the refused deploy, then the one that ships');
+  assert.ok(l.s.lines.some((x) => x.startsWith('✗ requires t/api app:')), 'the first was refused at B\'s floor');
+  assert.ok(l.s.lines.some((x) => x.startsWith(`… waiting for t/api app to be live at or past ${rq.otherSecond.slice(0, 7)}`)), l.s.lines.join('\n'));
+});
+
+test('the requirements of the tip\'s config count, not only the merge commit\'s', async () => {
+  const rq = await requiresSetup();
+  const off = (await readFile(join(rq.s.work, 'ship.config.mjs'), 'utf8'));
+  const l = await landed({ from: rq.s, ack: [], land: { liveWaitHours: 0.5 }, merge: async (s) => {
+    const sha = await commitFiles(s.work, { 'ship.config.mjs': off.replace("requires: [{ repo: 't/api', deployable: 'app' }]", 'requires: []'), 'app/src/a.ts': '5' }, 'merge without requires (#11)');
+    await git(['push', '--quiet', s.deps.remoteUrl(), 'main'], s.work);
+    return sha;
+  } });
+  await commitFiles(l.s.work, { 'ship.config.mjs': off }, 'require t/api (#12)');
+  await git(['push', '--quiet', l.d.remoteUrl(), 'main'], l.s.work);
+  assert.equal(await l.wait({ floors: {} }), 3, l.s.lines.join('\n'));
+  assert.deepEqual(l.starts, [], 'the land waits for t/api like the deploy would');
+  assert.ok(l.s.lines.some((x) => x.startsWith('… waiting for t/api app to be live at or past')), l.s.lines.join('\n'));
 });

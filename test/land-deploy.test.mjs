@@ -9,6 +9,7 @@ import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { addAcks } from '../lib/state.mjs';
 import { landDir } from '../lib/land-line.mjs';
 import { deployRunning, migrationRefusal, readDeploys, recordDeployEnd, recordDeployStart, runDetachedDeploy, startDetachedDeploy } from '../lib/land-deploy.mjs';
+import { REQUIRES_REFUSED } from '../lib/deploy.mjs';
 import { at, requiresSetup, setupDeploy } from './deploy-fixture.mjs';
 import { atTestEnd, isAlive, isGone, killQuietly, stopBackground, tempDir, waitUntil } from './helpers.mjs';
 
@@ -170,4 +171,22 @@ test('ended records pair with their start by tip and id, so equal ids of differe
   const r = await readDeploys({ d, repo: 't/r' });
   assert.deepEqual(r.running.map((x) => x.tip), [other]);
   assert.deepEqual(r.ended.map((x) => x.tip), [TIP]);
+});
+
+test('a deploy refused at a requires floor is recorded as waiting for it, not as a failure; the refusal text is pinned', async () => {
+  assert.equal(REQUIRES_REFUSED, '✗ requires ');
+  const rq = await requiresSetup();
+  const code = await runDetachedDeploy({ cwd: rq.s.work, repo: 't/r', tip: rq.s.head, floors: { 't/api': rq.otherSecond }, id: 'r1', log: '/r1.out' }, rq.s.deps);
+  assert.equal(code, 1);
+  assert.ok(rq.s.lines.some((l) => /^✗ requires t\/api app: live at [0-9a-f]{7}, before [0-9a-f]{7} — deploy that first$/.test(l)), rq.s.lines.join('\n'));
+  assert.deepEqual((await readDeploys({ d: rq.s.deps, repo: 't/r' })).ended.map((x) => [x.code, x.migrationsWaiting, x.requiresWaiting]), [[1, false, true]]);
+});
+
+test('requiresRefused: only the last refusal counts', () => {
+  const g = migrationRefusal();
+  g.see('✗ requires t/api app: pending (x) — deploy that first');
+  assert.equal(g.requiresRefused(), true);
+  g.see('✗ deploy-time check unit is red on main@abc1234; nothing deployed');
+  assert.equal(g.requiresRefused(), false);
+  assert.equal(g.refused(), false);
 });

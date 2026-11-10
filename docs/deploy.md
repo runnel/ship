@@ -247,7 +247,7 @@ the same pick the land makes before it starts the deploy. The deploy's `requires
 the commit it planned, and when main moves while it waits, for the commit it would move to, with
 every requirement asked again. An unmet floor stops the deploy as an unmet `requires` does today
 (`✗ requires …`, nothing shipped; when main moved it keeps the head it planned and says so), and a
-land treats that like any deploy that did not ship. `ship deploy` called directly passes no such
+land does not count it a failure: the end record says `requiresWaiting` (as `migrationsWaiting` does for a migration refusal), and the lands wait and decide again at the next tick, when the unmet combined floor holds the deploy back until it is met. `ship deploy` called directly passes no such
 function and judges as before.
 
 ## Clearing migrations
