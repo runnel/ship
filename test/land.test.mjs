@@ -10,7 +10,7 @@ import { ensureMirror, fetchCommit, mirrorPath } from '../lib/git.mjs';
 import { postStatus } from '../lib/github.mjs';
 import { acquire, ownerInfo, readOwner } from '../lib/lock.mjs';
 import { headLockDir, landDir, slotDir } from '../lib/land-line.mjs';
-import { atTestEnd, commitFiles, fakeGh, git, hangingRemote, setupCheck, statusesOf, stopBackground, tempDir, tracked, waitUntil } from './helpers.mjs';
+import { atTestEnd, commitFiles, fakeGh, git, hangingRemote, isGone, killQuietly, readPid, setupCheck, statusesOf, stopBackground, tempDir, tracked, waitUntil } from './helpers.mjs';
 
 afterEach(stopBackground, { timeout: 30_000 });
 
@@ -66,6 +66,12 @@ test('a docs-only PR merges without a check run', async () => {
   const s = await setupLand({ featFiles: { 'README.md': 'r\n' }, steps: () => ['exit 9'] });
   assert.ok((await inSlot(s)).merged, s.lines.join('\n'));
   assert.match((await s.statuses()).at(-1).description, /^docs-only · vs main@[0-9a-f]{7}$/);
+});
+
+test('apiFail still fails a status post under setupLand', async () => {
+  const s = await setupLand({ ghOptions: { apiFail: { match: 'state=success' } } });
+  assert.deepEqual(await inSlot(s), { code: 4 }, s.lines.join('\n'));
+  assert.equal((await s.merges()).length, 0);
 });
 
 test('red gives exit 1 and a merge conflict exit 2; neither merges', async () => {
@@ -258,6 +264,25 @@ test('the same PR and head landing twice: refused; a new head joins the line and
   await release();
   assert.equal(await second, 0, s.lines.join('\n'));
   assert.equal((await s.merges()).at(-1)[7], newHead);
+});
+
+test('the head probe of a waiting land has the gh time limit: no gh child outlives the land', { timeout: 60_000 }, async () => {
+  const s = await setupLand();
+  const pidsFile = join(s.root, 'gh-hung.pids');
+  const pidsOf = async () => (await readFile(pidsFile, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(Number);
+  atTestEnd(() => { for (const pid of pidsOf.last ?? []) killQuietly(pid); });
+  const release = await holdSlot(s);
+  const landing = land(s, { deps: { doomedPollMs: 50, doomedConfirmMs: 5, ghTimeoutMs: 1000 } });
+  await waitUntil(async () => (await tickets(s)).length === 1, 'the land waits in line');
+  await writeFile(join(s.root, 'pr-live.json'), '{"hangMs":20000}');
+  await waitUntil(async () => (await pidsOf()).length > 0, 'a probe read hangs');
+  await waitUntil(async () => (await pidsOf()).length > 1, 'the hung probe read was given up, the next one started');
+  await writeFile(join(s.root, 'pr-live.json'), '{}');
+  await release();
+  assert.equal(await landing, 0, s.lines.join('\n'));
+  const pids = await pidsOf();
+  pidsOf.last = pids;
+  for (const pid of pids) assert.equal(await isGone(pid), true, `the hung gh child ${pid} is gone`);
 });
 
 test('an optional ship check of the same head: the land waits for it outside the line, then reuses its green', { timeout: 60_000 }, async () => {

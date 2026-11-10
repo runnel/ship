@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- `ship land` checks and merges a pull request through a serial line per repository ([Land](docs/checks-and-merge.md#land)). It stops at the merge for now: a pull request that touches a deployable exits 3, "run ship deploy". Every land writes a line to `~/.ship/land/<owner>__<repo>.jsonl`.
+- `ship land` checks and merges a pull request through a serial line per repository ([Land](docs/checks-and-merge.md#land)). It stops at the merge for now: a pull request that touches a deployable or adds a migration exits 3, "run ship deploy". Every land writes a line to `~/.ship/land/<owner>__<repo>.jsonl`.
 
 ### Changed
 

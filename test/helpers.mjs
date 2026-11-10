@@ -110,10 +110,13 @@ export async function makeOrigin(files) {
 // request is from then on, e.g. { fail: true } for a GitHub that stops answering).
 // liveStatuses = true: the statuses call answers with what was posted to `statuses/<sha>`, newest first,
 // posted by `{ login: 'owner', type: 'User' }`.
-// `pr-live.json` also takes `hangMs` (every later `gh pr view` waits that long) and `fail: true` (every
+// `pr-live.json` also takes `hangMs` (every later `gh pr view` waits that long and first appends its pid to `<dir>/gh-hung.pids`) and `fail: true` (every
 // later `gh pr view` fails).
 // The pull request can also change while a check runs: every `gh pr view` merges the JSON in
 // `<dir>/pr-live.json` (when it exists) over its answer, last (see setPr in setupCheck).
+// Order of a `gh api` call: apiFailTimes, apiFail and apiDelay apply first, to every answer below; only a call
+// none of the failures matched is answered by liveStatuses, then statuses, then cloudflare, github, and last
+// the empty reply. (setupLand always turns liveStatuses on, so a failure option must win over it.)
 // apiFailTimes = { match, times }: the first `times` `gh api` calls whose arguments contain `match` fail.
 // github = { usage, dispatchFail, runs, runReadFails, jobs, jobLog }: the Actions side. `usage` answers
 // the billing report (undefined: gh fails); `dispatchFail` makes the dispatch fail; `runs` = [overrides…]
@@ -143,6 +146,7 @@ if (args[0] === 'pr' && args[1] === 'view') {
   if (entry.fail) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
   let live = {};
   try { live = JSON.parse(fs.readFileSync(${JSON.stringify(join(dir, 'pr-live.json'))}, 'utf8')); } catch { /* the pull request is as it was */ }
+  if (live.hangMs) fs.appendFileSync(${JSON.stringify(join(dir, 'gh-hung.pids'))}, process.pid + '\\n');
   if (live.hangMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, live.hangMs);
   if (live.fail) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
   reply({ ...${JSON.stringify(pr)}, ...entry, ...live });
@@ -173,6 +177,22 @@ if (args[0] === 'pr' && args[1] === 'merge') {
   if (${JSON.stringify(mergeFail)}) { process.stderr.write(${JSON.stringify(mergeFail)} + '\\n'); process.exit(1); }
   reply({});
 }
+let ms = 0;
+if (args[0] === 'api') {
+  const failTimes = ${JSON.stringify(apiFailTimes)};
+  if (failTimes && args.join(' ').includes(failTimes.match)) {
+    const counter = ${JSON.stringify(join(dir, 'gh-api-fail.count'))};
+    let n = 0;
+    try { n = Number(fs.readFileSync(counter, 'utf8')) || 0; } catch { /* first call */ }
+    fs.writeFileSync(counter, String(n + 1));
+    if (n < failTimes.times) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
+  }
+  const fail = ${JSON.stringify(apiFail)};
+  if (fail && args.join(' ').includes(fail.match)) { process.stderr.write('fake gh: forced failure'); process.exit(1); }
+  const delay = ${JSON.stringify(apiDelay)};
+  ms = delay && args.join(' ').includes(delay.match) ? delay.ms : 0;
+}
+const pause = () => { if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 if (${JSON.stringify(liveStatuses)} && args[0] === 'api') {
   const field = (k) => (args.find((x) => x.startsWith(k + '=')) ?? '').slice(k.length + 1);
   const fileOf = (sha) => ${JSON.stringify(dir)} + '/statuses-' + sha + '.json';
@@ -180,13 +200,14 @@ if (${JSON.stringify(liveStatuses)} && args[0] === 'api') {
   const posted = args[1] === '-X' && args[2] === 'POST' && /\\/statuses\\/([0-9a-f]+)$/.exec(args[3]);
   if (posted) {
     fs.writeFileSync(fileOf(posted[1]), JSON.stringify([{ context: field('context'), state: field('state'), description: field('description'), creator: { login: 'owner', type: 'User' } }, ...listOf(posted[1])]));
+    pause();
     reply({});
   }
   const read = /\\/commits\\/([0-9a-f]+)\\/statuses/.exec(args[1]);
-  if (read) reply(listOf(read[1]));
+  if (read) { pause(); reply(listOf(read[1])); }
 }
 const asked = ${JSON.stringify(statuses)} !== null && args[0] === 'api' && /\\/commits\\/([0-9a-f]+)\\/statuses/.exec(args[1]);
-if (asked) reply(${JSON.stringify(statuses)}[asked[1]] ?? []);
+if (asked) { pause(); reply(${JSON.stringify(statuses)}[asked[1]] ?? []); }
 const cloudflare = ${JSON.stringify(cloudflare)};
 const builds = cloudflare && args[0] === 'api' && /\\/commits\\/([0-9a-f]+)\\/check-runs/.exec(args[1]);
 if (builds) {
@@ -234,18 +255,6 @@ if (github && args[0] === 'api') {
 if (args[0] === 'repo' && args[1] === 'view') reply(${JSON.stringify(repo)});
 if (args[0] === 'run' && args[1] === 'list') reply(${JSON.stringify(runs)});
 if (args[0] === 'api') {
-  const failTimes = ${JSON.stringify(apiFailTimes)};
-  if (failTimes && args.join(' ').includes(failTimes.match)) {
-    const counter = ${JSON.stringify(join(dir, 'gh-api-fail.count'))};
-    let n = 0;
-    try { n = Number(fs.readFileSync(counter, 'utf8')) || 0; } catch { /* first call */ }
-    fs.writeFileSync(counter, String(n + 1));
-    if (n < failTimes.times) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
-  }
-  const fail = ${JSON.stringify(apiFail)};
-  if (fail && args.join(' ').includes(fail.match)) { process.stderr.write('fake gh: forced failure'); process.exit(1); }
-  const delay = ${JSON.stringify(apiDelay)};
-  const ms = delay && args.join(' ').includes(delay.match) ? delay.ms : 0;
   setTimeout(() => { fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(['done', ...args]) + '\\n'); reply({}); }, ms);
 } else {
   process.stderr.write('fake gh: unhandled ' + args.join(' '));

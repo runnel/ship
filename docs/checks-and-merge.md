@@ -220,8 +220,9 @@ Exit codes:
 | 130 | interrupted |
 
 **The ledger.** Every land appends one JSON line to `~/.ship/land/<owner>__<repo>.jsonl` (the
-logs are pruned after 14 days, this is not): the pull request (`pr`, or the ref in `branch` when
-it is not a number), the `head`, when it joined the line, got the slot and merged (`joinedAt`,
+logs are pruned after 14 days, this is not): the pull request (`pr`: the number, given or, for a land
+started with a branch name, read from GitHub once the pull request was found, else `null`; `branch`: the ref
+when it is not a number, so such a line carries both), the `head`, when it joined the line, got the slot and merged (`joinedAt`,
 `slotAt`, `mergedAt`), `endedAt` and the exit `code`. Refusals, early errors and interrupts
 (130) write a line too, with the times that were reached; a land whose repository cannot be read
 from the clone writes to `~/.ship/land/unknown.jsonl`. Nothing rotates the file; a line that
