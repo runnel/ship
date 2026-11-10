@@ -103,6 +103,15 @@ export async function makeOrigin(files) {
 // that commit (an empty list for any other sha, as GitHub does for a commit without statuses).
 // mergeFail = 'reason': `gh pr merge` fails (exit 1) with that reason on stderr, as gh does when GitHub refuses.
 // mergeDelayMs: `gh pr merge` answers only after that long (a hung call).
+// origin = '<bare repo path>', squash = true: `gh pr merge` squashes the pinned head (--match-head-commit)
+// onto that origin's main, as GitHub does, refusing a head that is not the pull request's current one,
+// and records the pull request as MERGED with its merge commit in `<dir>/pr-live.json`.
+// afterMerge = { … }: merged into `<dir>/pr-live.json` when `gh pr merge` is called (what the pull
+// request is from then on, e.g. { fail: true } for a GitHub that stops answering).
+// liveStatuses = true: the statuses call answers with what was posted to `statuses/<sha>`, newest first,
+// posted by `{ login: 'owner', type: 'User' }`.
+// `pr-live.json` also takes `hangMs` (every later `gh pr view` waits that long) and `fail: true` (every
+// later `gh pr view` fails).
 // The pull request can also change while a check runs: every `gh pr view` merges the JSON in
 // `<dir>/pr-live.json` (when it exists) over its answer, last (see setPr in setupCheck).
 // apiFailTimes = { match, times }: the first `times` `gh api` calls whose arguments contain `match` fail.
@@ -114,7 +123,7 @@ export async function makeOrigin(files) {
 // [[overrides…]…] is what the Nth read lists (the last one repeating): one check run per entry, each made
 // from a green run of the Workers Builds app named `name`, on the commit that was asked about, with the
 // overrides on top; `readFails` makes the first reads fail.
-export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false, statuses = null, mergeFail = null, mergeDelayMs = 0, github = null, cloudflare = null, apiFailTimes = null }) {
+export async function fakeGh(dir, { pr, prSequence = [], repo = { defaultBranchRef: { name: 'main' } }, runs = [], apiDelay = null, apiFail = null, openPrs = [], prListFail = false, statuses = null, mergeFail = null, mergeDelayMs = 0, github = null, cloudflare = null, apiFailTimes = null, origin = null, squash = false, afterMerge = null, liveStatuses = false }) {
   const log = join(dir, 'gh.log');
   const script = join(dir, 'gh');
   const viewCount = join(dir, 'gh-pr-view.count');
@@ -134,6 +143,8 @@ if (args[0] === 'pr' && args[1] === 'view') {
   if (entry.fail) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
   let live = {};
   try { live = JSON.parse(fs.readFileSync(${JSON.stringify(join(dir, 'pr-live.json'))}, 'utf8')); } catch { /* the pull request is as it was */ }
+  if (live.hangMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, live.hangMs);
+  if (live.fail) { process.stderr.write('HTTP 502: Bad Gateway\\n'); process.exit(1); }
   reply({ ...${JSON.stringify(pr)}, ...entry, ...live });
 }
 if (args[0] === 'pr' && args[1] === 'list') {
@@ -142,8 +153,37 @@ if (args[0] === 'pr' && args[1] === 'list') {
 }
 if (args[0] === 'pr' && args[1] === 'merge') {
   if (${JSON.stringify(mergeDelayMs)} > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${JSON.stringify(mergeDelayMs)});
+  const liveFile = ${JSON.stringify(join(dir, 'pr-live.json'))};
+  const readLive = () => { try { return JSON.parse(fs.readFileSync(liveFile, 'utf8')); } catch { return {}; } };
+  if (${JSON.stringify(squash)}) {
+    const { execFileSync } = require('node:child_process');
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@localhost', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@localhost' };
+    const git = (...a) => execFileSync('git', ['--git-dir', ${JSON.stringify(origin)}, ...a], { env, encoding: 'utf8' }).trim();
+    const current = { ...${JSON.stringify(pr)}, ...readLive() };
+    const pinned = args[args.indexOf('--match-head-commit') + 1];
+    if (current.headRefOid !== pinned) { process.stderr.write('Head branch was modified. Review and try the merge again.\\n'); process.exit(1); }
+    const main = git('rev-parse', 'refs/heads/main');
+    const tree = git('merge-tree', '--write-tree', main, pinned).split('\\n')[0];
+    const sha = git('commit-tree', tree, '-p', main, '-m', current.headRefName + ' (#' + current.number + ')');
+    git('update-ref', 'refs/heads/main', sha, main);
+    fs.writeFileSync(liveFile, JSON.stringify({ ...readLive(), state: 'MERGED', mergeCommit: { oid: sha } }));
+  }
+  const after = ${JSON.stringify(afterMerge)};
+  if (after) fs.writeFileSync(liveFile, JSON.stringify({ ...readLive(), ...after }));
   if (${JSON.stringify(mergeFail)}) { process.stderr.write(${JSON.stringify(mergeFail)} + '\\n'); process.exit(1); }
   reply({});
+}
+if (${JSON.stringify(liveStatuses)} && args[0] === 'api') {
+  const field = (k) => (args.find((x) => x.startsWith(k + '=')) ?? '').slice(k.length + 1);
+  const fileOf = (sha) => ${JSON.stringify(dir)} + '/statuses-' + sha + '.json';
+  const listOf = (sha) => { try { return JSON.parse(fs.readFileSync(fileOf(sha), 'utf8')); } catch { return []; } };
+  const posted = args[1] === '-X' && args[2] === 'POST' && /\\/statuses\\/([0-9a-f]+)$/.exec(args[3]);
+  if (posted) {
+    fs.writeFileSync(fileOf(posted[1]), JSON.stringify([{ context: field('context'), state: field('state'), description: field('description'), creator: { login: 'owner', type: 'User' } }, ...listOf(posted[1])]));
+    reply({});
+  }
+  const read = /\\/commits\\/([0-9a-f]+)\\/statuses/.exec(args[1]);
+  if (read) reply(listOf(read[1]));
 }
 const asked = ${JSON.stringify(statuses)} !== null && args[0] === 'api' && /\\/commits\\/([0-9a-f]+)\\/statuses/.exec(args[1]);
 if (asked) reply(${JSON.stringify(statuses)}[asked[1]] ?? []);
@@ -244,7 +284,7 @@ export async function setupCheck({
   await git(['checkout', '--quiet', 'feat'], work);
   await git(['remote', 'set-url', 'origin', 'https://github.com/t/r.git'], work);
   const pr = { number: 7, headRefOid: head, headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'OPEN', ...prOverrides };
-  const fake = await fakeGh(root, { pr, ...ghOptions });
+  const fake = await fakeGh(root, { pr, origin, ...ghOptions });
   const lines = [];
   const { signal } = testOver;
   const deps = {

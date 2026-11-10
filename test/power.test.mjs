@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { drawsFromBattery, onBatteryPower } from '../lib/power.mjs';
+import { drawsFromBattery, keepAwake, onBatteryPower } from '../lib/power.mjs';
 
 test('pmset says which power source the machine draws from', () => {
   const ac = "Now drawing from 'AC Power'\n -InternalBattery-0 (id=4653155)\t100%; charged; 0:00 remaining present: true\n";
@@ -20,4 +20,17 @@ test('only macOS is asked, and a failing pmset means no warning', async () => {
   assert.equal(await onBatteryPower({ platform: 'darwin', run }), true);
   assert.deepEqual(asked[0].slice(0, 2), ['pmset', ['-g', 'batt']]);
   assert.equal(await onBatteryPower({ platform: 'darwin', run: async () => { throw new Error('spawn pmset ENOENT'); } }), false);
+});
+
+test('keepAwake runs caffeinate -i bound to this process on macOS only; stop ends it; a missing binary is no error', () => {
+  const started = [];
+  const killed = [];
+  const spawnFn = (cmd, args, opts) => { started.push({ cmd, args, detached: opts.detached }); return { on() {}, unref() {}, kill: () => killed.push(cmd) }; };
+  keepAwake({ platform: 'linux', spawnFn }).stop();
+  assert.deepEqual(started, []);
+  const awake = keepAwake({ platform: 'darwin', spawnFn, pid: 4242 });
+  assert.deepEqual(started, [{ cmd: 'caffeinate', args: ['-i', '-w', '4242'], detached: true }]);
+  awake.stop();
+  assert.deepEqual(killed, ['caffeinate']);
+  assert.doesNotThrow(() => keepAwake({ platform: 'darwin', spawnFn: () => { throw new Error('spawn caffeinate ENOENT'); } }).stop());
 });

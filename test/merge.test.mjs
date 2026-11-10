@@ -295,8 +295,8 @@ test('squashMerge: a merge, a refusal read once, and an outcome read again until
   assert.equal(await views(refused.fake), 1, 'without readForMs the PR is read once, as ship merge does');
 
   const late = await mergeFixture({ mergeFail: 'HTTP 502', prSequence: [{}, {}, { state: 'MERGED', mergeCommit: { oid: 'e'.repeat(40) } }] });
-  assert.deepEqual(await squashMerge({ d: late.d, repo: 't/r', number: 7, headSha: late.head, readForMs: 5000, readEveryMs: 1 }),
-    { merged: true, sha: 'e'.repeat(40), why: 'HTTP 502', killed: false });
+  const l = await squashMerge({ d: late.d, repo: 't/r', number: 7, headSha: late.head, readForMs: 5000, readEveryMs: 1 });
+  assert.deepEqual([l.merged, l.sha, l.why, l.killed, l.now.state, l.now.headSha], [true, 'e'.repeat(40), 'HTTP 502', false, 'MERGED', late.head], 'the answer that showed the merge comes back with it');
 
   const moved = await mergeFixture({ mergeFail: 'Head branch was modified', prSequence: [{}, { headRefOid: 'c'.repeat(40) }] });
   const m = await squashMerge({ d: moved.d, repo: 't/r', number: 7, headSha: moved.head, readForMs: 5000, readEveryMs: 1 });
