@@ -58,7 +58,8 @@ export async function setupDeploy({ options = {}, seed, change = null, probe = h
 }
 
 // t/r requires t/api's app; t/api has two commits on main and its app is live at the first.
-export async function requiresSetup() {
+// `apiLive(otherFirst, otherSecond)` replaces t/api's seed: a worker state, or null for a worker never deployed.
+export async function requiresSetup({ apiLive = (first) => at(first) } = {}) {
   const other = await makeOrigin({ 'ship.config.mjs': `export default { repo: 't/api', checks: [{ name: 'u', paths: ['**'], steps: ['true'] }],
     deployables: [{ name: 'app', worker: 'example-api', cwd: '.', paths: ['src/**'], mode: 'direct' }],
     credentials: { file: '/unused', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } } };\n`, 'src/x.ts': '1', 'wrangler.json': '{"name":"example-api"}' });
@@ -67,7 +68,7 @@ export async function requiresSetup() {
   await git(['push', '--quiet', 'origin', 'main'], other.work);
   const s = await setupDeploy({
     options: { requires: "[{ repo: 't/api', deployable: 'app' }]" },
-    seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first), 'example-api': at(otherFirst) }),
+    seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first), ...(apiLive(otherFirst, otherSecond) ? { 'example-api': apiLive(otherFirst, otherSecond) } : {}) }),
     change: { 'app/src/a.ts': '2' },
   });
   await addAcks(s.deps.stateRoot, 't/r', ['db/001.sql']);

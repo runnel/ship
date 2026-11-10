@@ -167,6 +167,40 @@ test('requires with a floor: live at or past the floor is enough, before it the 
   assert.ok(s.lines.includes(`✓ requires t/api app: live at or past ${otherFirst.slice(0, 7)}`), s.lines.join('\n'));
 });
 
+test('a floor past the live commit is met when nothing of the deployable changed in between', async () => {
+  const { s, other, otherSecond } = await requiresSetup({ apiLive: (_, second) => at(second) });
+  const docs = await commitFiles(other.work, { 'README.md': 'docs only' }, 'docs');
+  await git(['push', '--quiet', 'origin', 'main'], other.work);
+  const d = { ...deployDeps(), ...s.deps };
+  const req = { repo: 't/api', deployable: 'app' };
+  assert.equal(await requiredState({ d, req, floor: docs }), 'live');
+  const code = await commitFiles(other.work, { 'src/x.ts': '3' }, 'api change again');
+  await git(['push', '--quiet', 'origin', 'main'], other.work);
+  assert.equal(await requiredState({ d, req, floor: code }), `live at ${otherSecond.slice(0, 7)}, before ${code.slice(0, 7)}`);
+});
+
+test('a floor is refused when the required deployable is held, blocked or never deployed, or the floor is not on its main', async () => {
+  const req = { repo: 't/api', deployable: 'app' };
+  const stateFor = async (s, floor) => requiredState({ d: { ...deployDeps(), ...s.deps }, req, floor });
+
+  const held = await requiresSetup();
+  await writeHold(held.s.deps.stateRoot, 't/api', 'app', { reason: 'rolled back by the owner' });
+  assert.match(await stateFor(held.s, held.otherFirst), /^held \(.*rolled back by the owner/);
+
+  const blocked = await requiresSetup({ apiLive: () => at('f'.repeat(40)) });
+  assert.match(await stateFor(blocked.s, blocked.otherFirst), /^blocked \(live commit fffffff is not in t\/api\)/);
+
+  const none = await requiresSetup({ apiLive: () => null });
+  assert.equal(await stateFor(none.s, none.otherFirst), 'not deployed yet');
+
+  const { s, other, otherFirst } = await requiresSetup();
+  assert.equal(await stateFor(s, 'e'.repeat(40)), 'eeeeeee is not in t/api');
+  await git(['checkout', '--quiet', '-b', 'side', otherFirst], other.work);
+  const side = await commitFiles(other.work, { 'src/x.ts': 'side' }, 'not on main');
+  await git(['push', '--quiet', 'origin', 'side:refs/heads/side'], other.work);
+  assert.equal(await stateFor(s, side), `${side.slice(0, 7)} is not on the main of t/api`);
+});
+
 // The nth read of a Worker's deployments fails. For a versioned deployable the 1st is the plan and
 // the 2nd the re-read just before the promote, so nothing of ours is live when it fails.
 function failDeploymentsRead(s, worker, nth, error) {

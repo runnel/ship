@@ -277,3 +277,14 @@ test('a deploy with other requires floors does not join: its verdict would not b
   await plain.lead.end({ code: 0 });
   await floored.lead.end({ code: 0 });
 });
+
+test('the join key does not depend on the locale, and a floor of null is no floor', async () => {
+  const base = { tmpRoot: await tempDir('intake-'), pollMs: 10 };
+  const enter = (requiresFloors) => enterDeploy({ d: { ...base, requiresFloors }, repo: 't/r', names: [], redeploy: false });
+  const sha = 'c'.repeat(40);
+  const first = await enter({ 'acme/z': sha, 'acme/t': sha });
+  assert.ok(first.lead);
+  assert.ok((await enter({ 'acme/t': sha, 'acme/z': sha })).follow, 'the same floors in another order join');
+  assert.ok((await enter({ 'acme/t': sha, 'acme/z': sha, 'acme/n': null })).follow, 'a null floor is no floor');
+  await first.lead.end({ code: 0 });
+});
