@@ -576,3 +576,20 @@ test('an error starting the deploy is said once and tried again next tick, not t
   assert.equal(l.s.lines.filter((x) => x === '! could not decide or start the deploy (spawn boom); trying again every 30 s').length, 1);
   assert.equal(l.starts.length, 1);
 });
+
+test('floors that diverge (a force-push) go to the later record, whichever land looks', async () => {
+  const rq = await requiresSetup();
+  const l = await landed({ from: rq.s, ack: [], land: { liveWaitHours: 0.06 } });
+  const b = await commitFiles(l.s.work, { 'app/src/a.ts': '3' }, 'b change (#10)');
+  await git(['push', '--quiet', l.d.remoteUrl(), 'main'], l.s.work);
+  const put = (mergeSha, floor, at) => writeFile(join(landDir(l.d, 't/r'), 'floors', `${mergeSha}.json`), JSON.stringify({ mergeSha, floors: { 't/api': floor }, at }));
+  await mkdir(join(landDir(l.d, 't/r'), 'floors'), { recursive: true });
+  const now = l.clock.t;
+  // neither commit is in t/api's history: neither is an ancestor of the other
+  await put(l.s.head, 'a'.repeat(40), new Date(now - 60_000).toISOString());
+  await put(b, 'b'.repeat(40), new Date(now - 30_000).toISOString());
+  assert.equal(await l.wait({ floors: { 't/api': rq.otherFirst } }), 3);
+  assert.deepEqual(l.starts, []);
+  assert.ok(l.s.lines.some((x) => x.includes('… waiting for t/api app to be live at or past bbbbbbb')), l.s.lines.join('\n'));
+  assert.ok(!l.s.lines.some((x) => x.includes('aaaaaaa')));
+});

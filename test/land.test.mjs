@@ -2,6 +2,7 @@ import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { readdirSync } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { abortedError } from '../lib/shared.mjs';
@@ -510,25 +511,48 @@ test('ship land end to end: checked, merged, deployed detached once the line is 
 
 test('an interrupt while waiting for live: the land ends 130 and leaves its ledger line, the deploy is not started', { timeout: 90_000 }, async () => {
   const { s, deps, starts } = await setupLandLive();
-  const sleep = async () => { throw abortedError(); };
+  // Only the wait for live sleeps this long: the interrupt cannot come from anywhere earlier.
+  const sleep = async (ms) => { if (ms === 30_000) throw abortedError(); return deps.sleep(ms); };
   await assert.rejects(land(s, { deps: { ...deps, sleep } }), (e) => e.aborted === true);
+  assert.ok(s.lines.some((l) => /^▸ PR #7 merged as [0-9a-f]{7}; waiting until it is live \(app\)$/.test(l)), s.lines.join('\n'));
   assert.deepEqual(starts, []);
   assert.equal((await ledger(s)).at(-1).code, 130);
 });
 
-test('afterMerge records the floors of its requirements at the merge, per merge commit', { timeout: 90_000 }, async () => {
+async function apiOrigin() {
   const other = await makeOrigin({ 'ship.config.mjs': `export default { repo: 't/api', checks: [{ name: 'u', paths: ['**'], steps: ['true'] }],
     deployables: [{ name: 'app', worker: 'example-api', cwd: '.', paths: ['src/**'], mode: 'direct' }],
     credentials: { file: '/unused', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } } };\n`, 'src/x.ts': '1', 'wrangler.json': '{"name":"example-api"}' });
-  const apiMain = (await git(['rev-parse', 'HEAD'], other.work)).trim();
-  const { s, deps } = await setupLandLive({
-    requires: "[{ repo: 't/api', deployable: 'app' }]", workers: { 'example-api': at(apiMain) },
-    remote: (origin) => (repo) => (repo === 't/api' ? other.origin : origin),
-  });
-  assert.equal(await land(s, { deps }), 0, s.lines.join('\n'));
+  return { other, apiMain: (await git(['rev-parse', 'HEAD'], other.work)).trim() };
+}
+const REQUIRES_API = "[{ repo: 't/api', deployable: 'app' }]";
+
+test('the floors are read before the merge and recorded under the merge commit before the land waits', { timeout: 90_000 }, async () => {
+  const { other, apiMain } = await apiOrigin();
+  const { s, deps } = await setupLandLive({ requires: REQUIRES_API, workers: { 'example-api': at(apiMain) }, remote: (origin) => (repo) => (repo === 't/api' ? other.origin : origin) });
+  let atWait = null;
+  const out = (l) => {
+    s.lines.push(l);
+    if (/^▸ PR #7 merged as/.test(l)) atWait = readdirSync(join(landDir({ tmpRoot: s.deps.tmpRoot }, 't/r'), 'floors'));
+  };
+  assert.equal(await land(s, { deps: { ...deps, out } }), 0, s.lines.join('\n'));
   const merged = await s.originMain();
+  assert.deepEqual(atWait, [`${merged}.json`], 'the record existed when afterMerge started');
   const rec = JSON.parse(await readFile(join(landDir({ tmpRoot: s.deps.tmpRoot }, 't/r'), 'floors', `${merged}.json`), 'utf8'));
   assert.deepEqual(rec.floors, { 't/api': apiMain });
+});
+
+test('floors that cannot be read are an error before the merge: exit 4, nothing merged', { timeout: 90_000 }, async () => {
+  const { other, apiMain } = await apiOrigin();
+  let broken = false;
+  const { s, deps } = await setupLandLive({ requires: REQUIRES_API, workers: { 'example-api': at(apiMain) },
+    remote: (origin) => (repo) => { if (repo === 't/api') { if (broken) throw new Error('unreachable'); return other.origin; } return origin; } });
+  const before = await s.originMain();
+  broken = true;
+  assert.equal(await land(s, { deps }), 4, s.lines.join('\n'));
+  assert.match(s.lines.at(-1), /^✗ PR #7 not merged: could not read the floors of the requirements \(.+\); landing again is safe$/);
+  assert.equal((await s.merges()).length, 0);
+  assert.equal(await s.originMain(), before);
 });
 
 test('two lands started at the same moment: the one that meets the other on the head lock refuses as a duplicate (exit 2)', async () => {
