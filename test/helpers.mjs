@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { capture, isPid } from '../lib/proc.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
+import { LANE_PRIORITY } from '../lib/shared.mjs';
 
 // One scratch root per test process, removed when the process exits.
 const ROOT = mkdtempSync(join(tmpdir(), 'ship-tests-'));
@@ -264,7 +265,7 @@ export async function longLine(s) {
   await mkdir(s.deps.tmpRoot, { recursive: true, mode: 0o700 });
   const lane = join(s.deps.tmpRoot, 'lanes', 'heavy');
   const holder = await acquire(lane, await ownerInfo({ repo: 'o/x', pr: 1 }));
-  const waiter = acquire(lane, await ownerInfo({ repo: 'o/x', pr: 2 }), { priority: 1, pollMs: 5 }).then((release) => release());
+  const waiter = acquire(lane, await ownerInfo({ repo: 'o/x', pr: 2 }), { priority: LANE_PRIORITY.check, pollMs: 5 }).then((release) => release());
   const free = atTestEnd(async () => { await holder(); await waiter; });
   await waitUntil(async () => (await readdir(join(s.deps.tmpRoot, 'lanes'))).some((n) => n.startsWith('heavy.q-') && n.endsWith('.json')), 'the waiter is in line');
   return { free };

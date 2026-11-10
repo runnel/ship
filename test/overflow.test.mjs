@@ -8,6 +8,7 @@ import { acquire, ownerInfo, tryLock } from '../lib/lock.mjs';
 import { minutesUsed, daysLeftInMonth, reserveVerdict, recentRuns, overflowGate, PENDING_WINDOW_MS } from '../lib/overflow.mjs';
 import { runGroupsHere } from '../lib/run-groups.mjs';
 import { validateConfig, ConfigError } from '../lib/config.mjs';
+import { LANE_PRIORITY } from '../lib/shared.mjs';
 import { commitFiles, fakeGh, git, killQuietly, longLine, makeOrigin, setupCheck, spawnCheckLeader, stopBackground, tempDir, tracked, waitUntil } from './helpers.mjs';
 
 // However a test ends, the lane it held and the check it started end with it.
@@ -384,7 +385,7 @@ test('it comes back to the place it had, ahead of whoever arrived while it was a
   const line = await longLine(s);
   const check = runCheck({ cwd: s.work, deps: s.deps });
   await waitUntil(async () => (await dispatches(s)).length === 1, 'it has gone');
-  const latecomer = acquire(join(s.deps.tmpRoot, 'lanes', 'heavy'), await ownerInfo({ repo: 'o/x', pr: 4 }), { priority: 1, pollMs: 5 })
+  const latecomer = acquire(join(s.deps.tmpRoot, 'lanes', 'heavy'), await ownerInfo({ repo: 'o/x', pr: 4 }), { priority: LANE_PRIORITY.check, pollMs: 5 })
     .then(async (release) => { await appendFile(order, 'latecomer\n'); await release(); });
   await waitUntil(() => says(s, /back in line/), 'it comes back');
   const tickets = async () => (await readdir(join(s.deps.tmpRoot, 'lanes'))).filter((n) => n.startsWith('heavy.q-') && n.endsWith('.json'));
