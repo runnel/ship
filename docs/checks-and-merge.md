@@ -210,7 +210,7 @@ cache, and does the first of these that applies:
    the main it was planned against has the merge: a change and its revert have no net effect and
    leave the live commit where it was.
 2. **A failed deploy: exit 3.** A deploy that ended with a code other than 0, after this land's
-   merge, for a main that has the merge, and that was not waiting for a migration (below). Nobody
+   merge, for a main that has the merge, and that was not waiting for a migration or for a requires floor (below). Nobody
    starts another deploy for that tip: the owner decides (`ship status`).
 3. **Migrations at the tip.** A migration file on main that is not cleared for deploy holds every
    deploy. The pull request that added it prints the hint how to clear it (`! PR #42 added

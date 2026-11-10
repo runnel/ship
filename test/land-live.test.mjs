@@ -5,7 +5,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { contains, decide, landedChanges, liveFor, readLiveCache, recordFloors, waitLive } from '../lib/land-live.mjs';
-import { recordDeployEnd } from '../lib/land-deploy.mjs';
+import { recordDeployEnd, recordDeployStart } from '../lib/land-deploy.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { iso, landDir } from '../lib/land-line.mjs';
 import { addAcks, clearHold, writeHold } from '../lib/state.mjs';
@@ -681,4 +681,18 @@ test('the requirements of the tip\'s config count, not only the merge commit\'s'
   assert.equal(await l.wait({ floors: {} }), 3, l.s.lines.join('\n'));
   assert.deepEqual(l.starts, [], 'the land waits for t/api like the deploy would');
   assert.ok(l.s.lines.some((x) => x.startsWith('… waiting for t/api app to be live at or past')), l.s.lines.join('\n'));
+});
+
+test('a deploy refused at a floor the land judged met is not started again every tick: at most one within liveCacheMs', async () => {
+  const rq = await requiresSetup();
+  const l = await landed({ from: rq.s, ack: [], land: { liveWaitHours: 0.05 } }); // 180 s, under liveCacheMs (300 s)
+  l.d.startDeploy = async ({ d, repo, tip }) => {
+    l.starts.push({ tip, at: d.now() });
+    const id = `r${l.starts.length}`;
+    await recordDeployStart({ d, repo, id, tip, log: '/dev/null', owner: await ownerInfo() });
+    await recordDeployEnd({ d, repo, id, tip, code: 1, log: '/dev/null', requiresWaiting: true });
+    return { id, log: '/dev/null', pid: process.pid };
+  };
+  assert.equal(await l.wait({ floors: { 't/api': rq.otherFirst } }), 3, l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1, 'refused once, not again within liveCacheMs');
 });

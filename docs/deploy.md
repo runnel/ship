@@ -205,7 +205,7 @@ has been quiet for `debounceSec` (no land waits or checks, and main has not move
 waited `deployAfterMin` ([`land` config](configuration.md#land)). It never starts one while a deploy
 of the repository runs (its own, or any that holds the deploy lock), and never again for a tip that a
 deploy has already ended for: not when it ended 0 (it is shipped), not when it failed (the owner
-decides). The one exception is a deploy that stopped at the migration gate, below. Lands that
+decides). The exceptions are a deploy that stopped at the migration gate and one that refused at a `requires` floor (`requiresWaiting`), below; a refusal at a floor the land judged met is not retried for `liveCacheMs`. Lands that
 decide at the same moment take a lock, so only one starts it.
 
 The deploy is **detached**: its own session and process group, nothing ties it to the land, so a
