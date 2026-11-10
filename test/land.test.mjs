@@ -4,6 +4,9 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fakeCloud } from './fake-cloud.mjs';
+import { FILES, at, configText, healthy, inProcessDeploy } from './deploy-fixture.mjs';
+import { addAcks } from '../lib/state.mjs';
 import { landDeps, landInSlot, reusable, runLand } from '../lib/land.mjs';
 import { runCheck } from '../lib/check.mjs';
 import { ensureMirror, fetchCommit, mirrorPath } from '../lib/git.mjs';
@@ -474,15 +477,26 @@ test('an error after the merge is exit 3: "merged, but ship failed after the mer
   assert.equal(s.lines.at(-1), '✗ PR #7 merged, but ship failed after the merge (boom) — ship status');
 });
 
-// A config with one deployable, for the PR B interim: Task 14 replaces this test.
-const WITH_APP = `export default { repo: 't/r', docsOnly: ['*.md'], checks: [{ name: 'unit', paths: ['**'], steps: ['true'] }],
-  deployables: [{ name: 'app', worker: 'example-app', cwd: '.', paths: ['src/**'], mode: 'direct' }],
-  credentials: { file: '/unused', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } } };\n`;
-
-test('interim: a PR that touches a deployable is merged and not deployed by this version (exit 3)', async () => {
-  const s = await setupLand({ configText: WITH_APP });
-  assert.equal(await land(s), 3, s.lines.join('\n'));
-  assert.match(s.lines.at(-1), /^! PR #7 merged as [0-9a-f]{7} and touches app; this version of ship land does not deploy yet — run ship deploy$/);
+test('ship land end to end: checked, merged, deployed detached once the line is quiet, and live', { timeout: 90_000 }, async () => {
+  const cloudDir = join(await tempDir('cloud-'), 'cloud');
+  const s = await setupLand({ configText: configText(join(cloudDir, 'bin', 'wrangler')), baseFiles: FILES, featFiles: { 'app/src/a.ts': 'export const a = 2;\n' } });
+  const first = (await git(['--git-dir', s.origin, 'rev-list', '--max-parents=0', 'main'], s.work)).trim();
+  const cloud = await fakeCloud({ dir: cloudDir, workers: { 'example-app': at(first), 'example-tick': at(first) }, probe: healthy,
+    hosts: { 'https://app.example.com': 'example-app', 'https://tick.example.com': 'example-tick' } });
+  const stateRoot = join(s.root, 'state');
+  await addAcks(stateRoot, 't/r', ['db/001.sql']);
+  const clock = { t: Date.now() };
+  const starts = [];
+  const deps = {
+    stateRoot, fetch: cloud.fetch, readCredentials: async () => ({ CLOUDFLARE_API_TOKEN: 'tok', CLOUDFLARE_ACCOUNT_ID: 'acc' }),
+    probeWindowMs: 0, probeIntervalMs: 1000, now: () => clock.t, sleep: async (ms) => { clock.t += ms; },
+    startDeploy: inProcessDeploy(starts),
+  };
+  assert.equal(await land(s, { deps }), 0, s.lines.join('\n'));
+  assert.equal(starts.length, 1);
+  const merged = await s.originMain();
+  assert.equal(s.lines.at(-1), `✓ PR #7 is live (merged as ${merged.slice(0, 7)}): app at ${merged.slice(0, 7)}`);
+  assert.match((await cloud.state('example-app')).deployments.at(-1).annotations['workers/message'], new RegExp(`^sha:${merged} `));
 });
 
 test('two lands started at the same moment: the one that meets the other on the head lock refuses as a duplicate (exit 2)', async () => {
