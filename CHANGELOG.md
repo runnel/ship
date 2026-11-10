@@ -4,6 +4,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Added
+
+- `ship land` checks and merges a pull request through a serial line per repository ([Land](docs/checks-and-merge.md#land)). It stops at the merge for now: a pull request that touches a deployable exits 3, "run ship deploy". Every land writes a line to `~/.ship/land/<owner>__<repo>.jsonl`.
+
 ### Changed
 
 - The heavy lane has a land priority class between deploy work and checks, for the coming `ship land`; `ship queue` labels each waiter `deploy work, ahead of checks`, `land check, ahead of other checks` or `check`.

@@ -83,6 +83,7 @@ All options are in [Configure a repository](docs/configuration.md).
 ship check            # the PR of the current branch (push first)
 ship check --pr 42
 ship merge --pr 42    # merge a PR that passed, unless main changed under its check
+ship land --pr 42     # check, merge (and soon deploy) through the serial line
 ship queue            # who holds each lane, who waits, and for how long
 ```
 
