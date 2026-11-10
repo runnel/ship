@@ -8,6 +8,8 @@ import { join, dirname } from 'node:path';
 import { capture, isPid } from '../lib/proc.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { LANE_PRIORITY } from '../lib/shared.mjs';
+import { ensureMirror, fetchCommit, revParse } from '../lib/git.mjs';
+import { checkDeps } from '../lib/check.mjs';
 
 // One scratch root per test process, removed when the process exits.
 const ROOT = mkdtempSync(join(tmpdir(), 'ship-tests-'));
@@ -375,5 +377,18 @@ export async function hangingRemote({ gh = false } = {}) {
       process.env.PATH = path;
       for (const pid of await pids()) killQuietly(pid);
     },
+  };
+}
+
+// What runCheck does before checkOnce, for a test that calls checkOnce itself: the mirror with the
+// head of the pull request and main, and the deps the way runCheck fills them in.
+export async function prepareCheck(s, { headRef = 'feat', number = 7 } = {}) {
+  const mirror = await ensureMirror('t/r', { root: s.deps.mirrorRoot, url: s.origin });
+  const headSha = (await git(['rev-parse', headRef], s.work)).trim();
+  await fetchCommit(mirror, headSha, number);
+  const mainSha = await revParse(mirror, 'refs/heads/main');
+  return {
+    d: { ...checkDeps(), ...s.deps }, repo: 't/r', main: 'main', mainSha, mirror,
+    info: { number, headSha, headRef, base: 'main', fork: false, state: 'OPEN' },
   };
 }

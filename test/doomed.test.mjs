@@ -1,13 +1,14 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, readdir } from 'node:fs/promises';
+import { access, chmod, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { runCheck as realRunCheck } from '../lib/check.mjs';
+import { runCheck as realRunCheck, checkOnce } from '../lib/check.mjs';
 import { acquire, ownerInfo, readOwner } from '../lib/lock.mjs';
 import { acquireShared } from '../lib/shared.mjs';
 import { mirrorPath } from '../lib/git.mjs';
-import { watchDoomed } from '../lib/doomed.mjs';
-import { setupCheck as setup, atTestEnd, git, tempDir, commitFiles, waitUntil, readPid, assertGone, killQuietly, stopBackground, tracked } from './helpers.mjs';
+import { watchDoomed, whyDoomed } from '../lib/doomed.mjs';
+import { hangingRemote, isGone } from './helpers.mjs';
+import { setupCheck as setup, atTestEnd, git, tempDir, commitFiles, waitUntil, readPid, assertGone, killQuietly, stopBackground, tracked, prepareCheck } from './helpers.mjs';
 
 // However a test ends, the lane it held and the check waiting for it end with it.
 afterEach(stopBackground, { timeout: 30_000 });
@@ -289,4 +290,56 @@ test('watchDoomed reuses a look that is recent enough', async () => {
   await w.now(0);
   assert.equal(looks, 2);
   w.stop();
+});
+
+test('a land check is not stopped by main gaining a recheckOnMainChange file, only by its pull request', { timeout: 30_000 }, async () => {
+  const s = await setup({ configText: RECHECK_CONFIG() });
+  const holder = await holdLane(s);
+  const p = await prepareCheck(s);
+  const run = checkOnce({ ...p, d: { ...p.d, ...FAST }, land: true });
+  await waitingForLane(s);
+  await pushMain(s, { 'db/001_add.sql': 'select 1;\n' });
+  const views = async () => (await s.calls()).filter((c) => c[0] === 'pr' && c[1] === 'view').length;
+  const seen = await views();
+  await waitUntil(async () => (await views()) >= seen + 2, 'two more looks');
+  assert.ok(!s.lines.some((l) => l.includes('stopped checking')), s.lines.join('\n'));
+  await s.setPr({ headRefOid: 'f'.repeat(40) });
+  const result = await run;
+  assert.equal(result.state, 'stopped');
+  assert.ok(s.lines.some((l) => /the head of PR #7 moved to fffffff; run ship land --pr 7 for it/.test(l)), s.lines.join('\n'));
+  await assertNoVerdict(s);
+  await holder.release();
+});
+
+test('whyDoomed gives its gh reads the time limit it is passed, and a hung gh then cannot freeze the look', { timeout: 30_000 }, async () => {
+  const hang = await hangingRemote({ gh: true });
+  try {
+    const d = { gh: join(hang.bin, 'gh'), sleep: async () => {}, doomedConfirmMs: 0 };
+    const look = { d, repo: 't/r', pr: 7, headSha: 'a'.repeat(40), main: 'main', mainSha: 'b'.repeat(40), recheck: [] };
+    const started = Date.now();
+    await assert.rejects(whyDoomed({ ...look, timeoutMs: 300 }), (e) => e.timedOut === true);
+    assert.ok(Date.now() - started < 4000, 'it gave up long before the hung gh would have answered');
+  } finally {
+    await hang.restore();
+  }
+});
+
+test('checkOnce in land mode kills a gh look of the doomed watcher that hangs past the land time limit', { timeout: 30_000 }, async () => {
+  const s = await setup({ configText: RECHECK_CONFIG() });
+  const holder = await holdLane(s);
+  const p = await prepareCheck(s);
+  const bin = await tempDir('gh-');
+  const flag = join(bin, 'hang');
+  const pids = join(bin, 'pids');
+  const wrapper = join(bin, 'gh');
+  await writeFile(wrapper, `#!/bin/sh\nif [ -e '${flag}' ] && [ "$1 $2" = "pr view" ]; then echo $$ >> '${pids}'; exec sleep 30; fi\nexec '${s.gh}' "$@"\n`);
+  await chmod(wrapper, 0o755);
+  const run = checkOnce({ ...p, d: { ...p.d, ...FAST, gh: wrapper, ghTimeoutMs: 8000 }, land: true });
+  await waitingForLane(s);
+  await writeFile(flag, '');
+  await waitUntil(async () => (await readFile(pids, 'utf8').catch(() => '')).trim() !== '', 'a look that hangs');
+  const pid = Number((await readFile(pids, 'utf8')).split('\n')[0]);
+  await waitUntil(() => isGone(pid), 'the hung look is killed at the land time limit, not the watcher\'s 30 s');
+  await holder.release();
+  await run;
 });

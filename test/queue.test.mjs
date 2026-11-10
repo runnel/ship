@@ -5,10 +5,10 @@ import { mkdir, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { ownerInfo, processStartTime } from '../lib/lock.mjs';
+import { acquire, ownerInfo, processStartTime } from '../lib/lock.mjs';
 import { parseLogName, runtimeOf, readHistory, usualFor, readLanes, snapshot, render, runQueue, kindOf } from '../lib/queue.mjs';
 import { LANE_PRIORITY } from '../lib/shared.mjs';
-import { tempDir } from './helpers.mjs';
+import { tempDir, waitUntil } from './helpers.mjs';
 
 const MIN = 60_000;
 const NOW = Date.parse('2026-11-01T16:30:00Z');
@@ -351,4 +351,26 @@ test('a land check is labelled as one on the screen', async () => {
   const lines = render([heavy]);
   assert.match(lines.find((l) => l.includes('PR #15')), / {2}· {2}land check, ahead of other checks {2}· {2}/);
   assert.match(lines.find((l) => l.includes('PR #13')), / {2}· {2}check {2}· {2}/);
+});
+
+test('a land ticket filed after a check ticket is served first through the real lock ordering', { timeout: 30_000 }, async () => {
+  const tmpRoot = await tempDir();
+  await mkdir(join(tmpRoot, 'lanes'), { recursive: true });
+  const dir = join(tmpRoot, 'lanes', 'heavy');
+  const holder = await acquire(dir, await ownerInfo({ repo: 'acme/app', command: 'holder' }));
+  const served = [];
+  const wait = async (name, priority) => {
+    const release = await acquire(dir, await ownerInfo({ repo: 'acme/app', command: name }), { priority, pollMs: 5 });
+    served.push(name);
+    await release();
+  };
+  const check = wait('check', LANE_PRIORITY.check);
+  const waiters = async () => (await readLanes(tmpRoot)).find((l) => l.name === 'heavy').waiters;
+  await waitUntil(async () => (await waiters()).length === 1, 'the check is in line');
+  const land = wait('land', LANE_PRIORITY.land);
+  await waitUntil(async () => (await waiters()).length === 2, 'the land is in line');
+  assert.deepEqual((await waiters()).map((w) => w.owner.command), ['land', 'check'], 'the line shows the land first');
+  await holder();
+  await Promise.all([check, land]);
+  assert.deepEqual(served, ['land', 'check']);
 });

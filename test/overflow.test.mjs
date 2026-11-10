@@ -9,7 +9,8 @@ import { minutesUsed, daysLeftInMonth, reserveVerdict, recentRuns, overflowGate,
 import { runGroupsHere } from '../lib/run-groups.mjs';
 import { validateConfig, ConfigError } from '../lib/config.mjs';
 import { LANE_PRIORITY } from '../lib/shared.mjs';
-import { commitFiles, fakeGh, git, killQuietly, longLine, makeOrigin, setupCheck, spawnCheckLeader, stopBackground, tempDir, tracked, waitUntil } from './helpers.mjs';
+import { checkOnce } from '../lib/check.mjs';
+import { atTestEnd, prepareCheck, commitFiles, fakeGh, git, killQuietly, longLine, makeOrigin, setupCheck, spawnCheckLeader, stopBackground, tempDir, tracked, waitUntil } from './helpers.mjs';
 
 // However a test ends, the lane it held and the check it started end with it.
 afterEach(stopBackground, { timeout: 30_000 });
@@ -596,4 +597,23 @@ test('overflow.cloudflare config: what is refused', () => {
     { ...GOOD, env: [] }, { ...GOOD, env: { nope: { A: 'b' } } }, { ...GOOD, env: { unit: 'A=b' } }, { ...GOOD, env: { unit: { A: 1 } } }, { ...GOOD, env: { unit: { 'A-B': 'x' } } },
     { ...GOOD, nope: 1 },
   ]) assert.throws(() => validateConfig(withCloudflare(bad)), ConfigError, JSON.stringify(bad));
+});
+
+test('a land check never overflows: second in line behind deploy work, it waits here and asks nobody', { timeout: 60_000 }, async () => {
+  const s = await setup();
+  await mkdir(s.deps.tmpRoot, { recursive: true, mode: 0o700 });
+  const lane = join(s.deps.tmpRoot, 'lanes', 'heavy');
+  const holder = await acquire(lane, await ownerInfo({ repo: 'o/x', command: 'deploy' }));
+  const deployWork = acquire(lane, await ownerInfo({ repo: 'o/x', command: 'deploy setup' }), { priority: LANE_PRIORITY.deploy, pollMs: 5 }).then((release) => release());
+  const free = atTestEnd(async () => { await holder(); await deployWork; });
+  const p = await prepareCheck(s);
+  const run = checkOnce({ ...p, land: true });
+  await waitUntil(async () => (await readdir(join(s.deps.tmpRoot, 'lanes'))).some((n) => n.startsWith('heavy.q-01-')), 'the land check is in line as a land');
+  await waitUntil(() => says(s, /waiting for the heavy lane \(2nd in line\)/), 'it is second, behind the deploy work');
+  await free();
+  const result = await run;
+  assert.equal(result.state, 'success', s.lines.join('\n'));
+  assert.doesNotMatch(result.description, /on (GitHub|Cloudflare)/);
+  assert.equal((await dispatches(s)).length, 0);
+  assert.equal((await billingReads(s)).length, 0, 'a land check does not even ask about the minutes');
 });
