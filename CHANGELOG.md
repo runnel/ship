@@ -4,8 +4,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Changed
+
+- The heavy lane has a land priority class between deploy work and checks, for the coming `ship land`; `ship queue` labels each waiter `deploy work, ahead of checks`, `land check, ahead of other checks` or `check`.
+- Ship-internal helpers (check, merge and deploy reads) are exported for the coming `ship land`; no behaviour change.
+- A timed-out `git fetch` now kills the whole process tree, including git's remote helper. Time limits are opt-in, and only `ship land` will set them, so today's commands are unaffected.
+- `ship deploy`'s join key now includes the (empty) floors. During an upgrade, a deploy started by the new version does not join a leader still running the old one; it waits for the lock instead.
+
 ### Fixed
 
+- `ship check` re-checks a head whose stored result file is torn or malformed, instead of failing.
 - A check on Cloudflare Workers Builds whose build has not started after 5 minutes goes back in line, instead of waiting out `timeoutMin` for a build that may have been skipped: a skipped build leaves no check run to read.
 
 ## 0.1 - 2026-11-03
