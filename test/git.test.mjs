@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { access, readFile, mkdir, readdir, utimes, writeFile, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
-import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile, isAncestor, listTree, commitsTouching, subject, lastCommitBefore } from '../lib/git.mjs';
+import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile, isAncestor, listTree, commitsTouching, subject, lastCommitBefore, commitTimeMs, addedIn } from '../lib/git.mjs';
 import { validateConfig } from '../lib/config.mjs';
 import { classify } from '../lib/classify.mjs';
 import { capture } from '../lib/proc.mjs';
@@ -247,4 +247,16 @@ test('a mirror fetch with a time limit is stopped then and says so', { timeout: 
   } finally {
     await hang.restore();
   }
+});
+
+test('commitTimeMs and addedIn: a commit\'s time, and the commit that added a file', async () => {
+  const o = await makeOrigin({ 'a.txt': 'a\n' });
+  const added = await commitFiles(o.work, { 'db/002_x.sql': '' }, 'add a migration (#12)');
+  await commitFiles(o.work, { 'db/002_x.sql': 'changed' }, 'change it');
+  await git(['push', '--quiet', 'origin', 'main'], o.work);
+  const mirror = await ensureMirror('t/r', { root: join(o.root, 'mirrors'), url: o.origin });
+  assert.deepEqual(await addedIn(mirror, 'refs/heads/main', 'db/002_x.sql'), { sha: added, subject: 'add a migration (#12)' });
+  assert.equal(await addedIn(mirror, 'refs/heads/main', 'db/none.sql'), null);
+  const t = await commitTimeMs(mirror, added);
+  assert.ok(Math.abs(t - Date.now()) < 120_000 && t % 1000 === 0, String(t));
 });
