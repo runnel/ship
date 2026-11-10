@@ -7,6 +7,7 @@ import { atTestEnd, commitFiles, git, stopBackground, tempDir, tracked, waitUnti
 import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { addAcks, writeHold } from '../lib/state.mjs';
 import { runDeploy as realRunDeploy } from '../lib/deploy.mjs';
+import { enterDeploy } from '../lib/intake.mjs';
 import { at, setupDeploy as makeDeploy } from './deploy-fixture.mjs';
 
 // However a test ends, the lanes it held and the deploys waiting behind them end with it.
@@ -262,4 +263,17 @@ exec '${s.deps.gh}' "$@"
   assert.equal(await s.deploy(), 0, s.lines.join('\n'));
   assert.match(s.lines.join('\n'), /! could not re-read main \(reading main again took longer than 300 ms\): deploying main@\w+ as planned/);
   assert.match(await deployMessage(s), new RegExp(`^sha:${s.head} `));
+});
+
+test('a deploy with other requires floors does not join: its verdict would not be the caller\'s', async () => {
+  const base = { tmpRoot: await tempDir('intake-'), pollMs: 10 };
+  const enter = (requiresFloors) => enterDeploy({ d: { ...base, requiresFloors }, repo: 't/r', names: [], redeploy: false });
+  const plain = await enter({});
+  assert.ok(plain.lead);
+  const floored = await enter({ 't/api': 'c'.repeat(40) });
+  assert.ok(floored.lead, 'a land\'s runner leads its own deploy rather than take a manual one\'s verdict');
+  assert.ok((await enter({})).follow, 'deploys without floors still join each other');
+  assert.ok((await enter({ 't/api': 'c'.repeat(40) })).follow, 'and so do deploys with the same floors');
+  await plain.lead.end({ code: 0 });
+  await floored.lead.end({ code: 0 });
 });

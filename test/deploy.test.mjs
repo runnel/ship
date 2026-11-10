@@ -5,7 +5,9 @@ import { join } from 'node:path';
 import { commitFiles, git, makeOrigin } from './helpers.mjs';
 import { addAcks, writeHold } from '../lib/state.mjs';
 import { UsageError } from '../lib/shared.mjs';
-import { at, setupDeploy } from './deploy-fixture.mjs';
+import { at, requiresSetup, setupDeploy } from './deploy-fixture.mjs';
+import { requiredState, runDeploy } from '../lib/deploy.mjs';
+import { deployDeps } from '../lib/repo.mjs';
 
 test('nothing pending: already live, no build, exit 0', async () => {
   const s = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at(first) }) });
@@ -149,6 +151,20 @@ test('requires: a pending deployable of another repo stops the deploy', async ()
   assert.equal(await s.deploy(), 1);
   assert.match(s.lines.join('\n'), /requires t\/api app: pending/);
   assert.deepEqual(await s.cloud.wranglerCalls(), []);
+});
+
+test('requires with a floor: live at or past the floor is enough, before it the deploy stops; without one, today\'s rule', async () => {
+  const { s, otherFirst, otherSecond } = await requiresSetup();
+  const req = { repo: 't/api', deployable: 'app' };
+  const d = { ...deployDeps(), ...s.deps };
+  assert.match(await requiredState({ d, req }), /^pending /, 'no floor: it must be live at its main');
+  assert.equal(await requiredState({ d, req, floor: otherFirst }), 'live');
+  assert.equal(await requiredState({ d, req, floor: otherSecond }), `live at ${otherFirst.slice(0, 7)}, before ${otherSecond.slice(0, 7)}`);
+
+  assert.equal(await runDeploy({ cwd: s.work, floors: { 't/api': otherSecond }, deps: s.deps }), 1);
+  assert.match(s.lines.join('\n'), /✗ requires t\/api app: live at [0-9a-f]{7}, before [0-9a-f]{7} — deploy that first/);
+  assert.equal(await runDeploy({ cwd: s.work, floors: { 't/api': otherFirst }, deps: s.deps }), 0, s.lines.join('\n'));
+  assert.ok(s.lines.includes(`✓ requires t/api app: live at or past ${otherFirst.slice(0, 7)}`), s.lines.join('\n'));
 });
 
 // The nth read of a Worker's deployments fails. For a versioned deployable the 1st is the plan and
