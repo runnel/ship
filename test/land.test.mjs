@@ -317,18 +317,18 @@ test('red frees the slot and the head lock; so does a time limit hit in the slot
 
 // runLand in a child process that leads its own process group, as bin/ship.mjs makes ship do.
 // `out.text` is what it prints; `exited` resolves with its exit code; the test's end kills the group.
-function spawnLand(s) {
+function spawnLand(s, { pollMs = 10 } = {}) {
   const script = `
 import { runLand } from ${JSON.stringify(new URL('../lib/land.mjs', import.meta.url).href)};
 import { isInterrupted } from ${JSON.stringify(new URL('../lib/interrupt.mjs', import.meta.url).href)};
 const a = JSON.parse(process.argv[1]);
-const deps = { gh: a.gh, remoteUrl: () => a.origin, mirrorRoot: a.mirrorRoot, tmpRoot: a.tmpRoot, logRoot: a.logRoot, stateRoot: a.stateRoot, pollMs: 10,
+const deps = { gh: a.gh, remoteUrl: () => a.origin, mirrorRoot: a.mirrorRoot, tmpRoot: a.tmpRoot, logRoot: a.logRoot, stateRoot: a.stateRoot, pollMs: a.pollMs ?? 10,
   keepAwake: () => ({ stop() {} }), out: (l) => process.stdout.write(l + '\\n') };
 let code;
 try { code = await runLand({ cwd: a.cwd, pr: '7', deps }); } catch (e) { code = e?.aborted || isInterrupted() ? 130 : 1; }
 process.exitCode = code;
 `;
-  const args = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot, stateRoot: s.deps.stateRoot });
+  const args = JSON.stringify({ gh: s.gh, origin: s.origin, cwd: s.work, mirrorRoot: s.deps.mirrorRoot, tmpRoot: s.deps.tmpRoot, logRoot: s.deps.logRoot, stateRoot: s.deps.stateRoot, pollMs });
   const child = spawn(process.execPath, ['--input-type=module', '-e', script, args], { detached: true, stdio: ['ignore', 'pipe', 'inherit'] });
   atTestEnd(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } });
   const out = { text: '' };
@@ -339,10 +339,12 @@ process.exitCode = code;
 test('an interrupt while only queued leaves the line and posts no status', { timeout: 60_000 }, async () => {
   const s = await setupLand();
   const release = await holdSlot(s);
-  const l = spawnLand(s);
+  // A poll longer than the test: the land's main flow cannot see the interrupt before the process exits.
+  const l = spawnLand(s, { pollMs: 20_000 });
   await waitUntil(() => l.out.text.includes('waiting in the land line'), 'the land waits in line');
   process.kill(-l.child.pid, 'SIGINT');
   assert.equal(await l.exited, 130);
+  assert.deepEqual((await ledger(s)).map((e) => [e.pr, e.code]), [[7, 130]], 'the interrupt unwind writes the ledger line');
   assert.deepEqual(statusesOf(await s.calls()), [], 'no status: an optional green on the head stays');
   assert.deepEqual(await tickets(s), []);
   assert.equal(await readOwner(headLockDir(s.deps, 't/r', await headOf(s))), null);
@@ -393,6 +395,7 @@ test('a ledger that cannot be written is said once, and the land still ends as i
   await writeFile(join(s.deps.stateRoot, 'land'), 'in the way').catch(async () => { await mkdir(s.deps.stateRoot, { recursive: true }); await writeFile(join(s.deps.stateRoot, 'land'), 'in the way'); });
   assert.equal(await land(s), 0, s.lines.join('\n'));
   assert.equal(s.lines.filter((l) => l.startsWith('! could not write the land ledger: ')).length, 1);
+  assert.match(s.lines.at(-1), /^✓ PR #7 landed as [0-9a-f]{7}/, 'the last line names the PR and the merge commit');
 });
 
 test('an error before the PR is read is exit 4, not 1, and leaves a ledger line: not a clone with a GitHub origin', async () => {
@@ -402,14 +405,18 @@ test('an error before the PR is read is exit 4, not 1, and leaves a ledger line:
   assert.match(s.lines.at(-1), /^✗ PR 7 not merged: .*; landing again is safe$/);
   const [entry] = await ledger(s, 'unknown.jsonl');
   assert.deepEqual([entry.pr, entry.head, entry.code], [7, null, 4]);
+  assert.equal(await runLand({ cwd: nowhere, deps: s.deps }), 4, 'no --pr either');
+  assert.match(s.lines.at(-1), /^✗ not landed: /);
 });
 
 test('a land of another PR with the same head on the head lock is waited for, not refused as a duplicate', { timeout: 30_000 }, async () => {
   const s = await setupLand();
   const release = await acquire(headLockDir(s.deps, 't/r', await headOf(s)), await ownerInfo({ repo: 't/r', pr: 99, headSha: 'f'.repeat(40), land: true }));
+  const head7 = (await headOf(s)).slice(0, 7);
   let done = false;
   const landing = land(s).then((c) => { done = true; return c; });
-  await new Promise((resolve) => setTimeout(resolve, 400));
+  await waitUntil(() => s.lines.some((l) => l === `… a land of PR #99 holds the head lock of ${'' + head7} — waiting for it`), 'the land says whom it waits for');
+  assert.ok(!s.lines.some((l) => l.includes('optional ship check')), 'it is not an optional check');
   assert.equal(done, false, s.lines.join('\n'));
   await release();
   assert.equal(await landing, 0, s.lines.join('\n'));
