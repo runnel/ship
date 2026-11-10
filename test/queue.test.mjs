@@ -395,3 +395,30 @@ test('ship queue shows each repository\'s land line: the holder, the live waiter
   assert.deepEqual((await readdir(dir)).sort(), before, 'read only');
   assert.deepEqual(await readLandLines(await tempDir()), [], 'no land lines: nothing to show');
 });
+
+test('renderLand: a free slot with a waiter, and a holder whose process is gone', () => {
+  const waiter = { arrivedAt: NOW - MIN, owner: { pr: 13, headSha: '9e8d7c6'.padEnd(40, '0') } };
+  assert.deepEqual(renderLand([{ repo: 'acme/app', holder: null, stale: false, waiters: [waiter] }], NOW), [
+    'land acme/app: slot free, the first waiter is taking it, 1 waiting',
+    '   1. PR #13 @ 9e8d7c6  ·  waited 1m00s',
+  ]);
+  const out = renderLand([{ repo: 'acme/app', holder: { pr: 12, headSha: '3f2a1b9'.padEnd(40, '0'), since: new Date(NOW - MIN).toISOString() }, stale: true, waiters: [] }], NOW);
+  assert.match(out[0], /^land acme\/app: PR #12 @ 3f2a1b9 holds the slot for 1m00s/);
+  assert.equal(out[1], "  ✗ the holder's process is gone: the next in line takes the slot over");
+  assert.equal(out.length, 2);
+});
+
+test('ship queue end to end prints the land line after the lanes and before the estimates note', async () => {
+  const tmpRoot = await tempDir();
+  const logRoot = await tempDir();
+  await ticket(tmpRoot, 'heavy', { arrivedAt: NOW - MIN, owner: await live({ repo: 'acme/app', pr: 13 }) });
+  const dir = join(tmpRoot, 'land', 'acme__app');
+  await mkdir(join(dir, 'slot'), { recursive: true });
+  await writeFile(join(dir, 'slot', 'owner.json'), JSON.stringify(await live({ repo: 'acme/app', pr: 12, headSha: '3f2a1b9'.padEnd(40, '0'), land: true }, { since: new Date(NOW - 2 * MIN).toISOString() })));
+  const lines = [];
+  assert.equal(await runQueue({ deps: { tmpRoot, logRoot, out: (l) => lines.push(l), nowMs: NOW } }), 0);
+  const at = (re) => lines.findIndex((l) => re.test(l));
+  assert.ok(at(/^light lane: free$/) >= 0 && at(/^land acme\/app: PR #12/) > at(/^light lane: free$/), 'after the lanes');
+  assert.ok(at(/^Estimates use/) > at(/^land acme\/app/), 'before the estimates note');
+  assert.equal(lines.at(-1).startsWith('Estimates use'), true);
+});

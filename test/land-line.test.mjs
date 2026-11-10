@@ -6,7 +6,7 @@ import { mkdir, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { LANE_PRIORITY } from '../lib/shared.mjs';
-import { alreadyLanding, headLockDir, landDir, lineEmpty, lineState, slotDir } from '../lib/land-line.mjs';
+import { alreadyLanding, headLockDir, landDir, lineEmpty, lineState, readLandLines, slotDir } from '../lib/land-line.mjs';
 import { atTestEnd, stopBackground, tempDir } from './helpers.mjs';
 
 afterEach(stopBackground, { timeout: 30_000 });
@@ -58,4 +58,38 @@ test('alreadyLanding: the same PR and head in the slot, in line, or holding the 
   await check();
   atTestEnd(await acquire(headLockDir(e, 't/r', HEAD), await lander(7, HEAD)));
   assert.match(await alreadyLanding(e, 't/r', { pr: 7, headSha: HEAD }), /already landing/);
+});
+
+// A lock whose owner is a process that has exited.
+async function staleSlot(d, extra = {}) {
+  await mkdir(slotDir(d, 't/r'), { recursive: true });
+  await writeFile(join(slotDir(d, 't/r'), 'owner.json'), JSON.stringify({ pid: await deadPid(), startTime: null, nonce: 'stale', since: new Date().toISOString(), ...extra }));
+}
+
+test('a stale holder is no holder in lineState, but readLandLines still shows it as stale', async () => {
+  const d = await deps();
+  await staleSlot(d, { repo: 't/r', pr: 5, headSha: HEAD, land: true });
+  assert.equal((await lineState(d, 't/r')).holder, null);
+  assert.equal(lineEmpty(await lineState(d, 't/r')), true);
+  const lines = await readLandLines(d.tmpRoot);
+  assert.deepEqual(lines.map((l) => [l.repo, l.holder.pr, l.stale, l.waiters.length]), [['t/r', 5, true, 0]]);
+});
+
+test('a holder without a repository is named by its directory, with no waiters', async () => {
+  const d = await deps();
+  await mkdir(slotDir(d, 'acme/app'), { recursive: true });
+  await writeFile(join(slotDir(d, 'acme/app'), 'owner.json'), JSON.stringify({ pid: process.pid, pr: 12 }));
+  const lines = await readLandLines(d.tmpRoot);
+  assert.deepEqual(lines.map((l) => [l.repo, l.holder.pr, l.waiters.length]), [['acme/app', 12, 0]]);
+});
+
+test('alreadyLanding: a twin whose process is gone is not a duplicate', async () => {
+  const d = await deps();
+  await staleSlot(d, { repo: 't/r', pr: 7, headSha: HEAD, land: true });
+  await ticket(d, { arrivedAt: 4, owner: { pid: await deadPid(), startTime: null, nonce: 'gone', repo: 't/r', pr: 7, headSha: HEAD, land: true } });
+  assert.equal(await alreadyLanding(d, 't/r', { pr: 7, headSha: HEAD }), null);
+  const e = await deps();
+  await mkdir(headLockDir(e, 't/r', HEAD), { recursive: true });
+  await writeFile(join(headLockDir(e, 't/r', HEAD), 'owner.json'), JSON.stringify({ pid: await deadPid(), startTime: null, nonce: 'h', repo: 't/r', pr: 7, headSha: HEAD, land: true }));
+  assert.equal(await alreadyLanding(e, 't/r', { pr: 7, headSha: HEAD }), null);
 });
