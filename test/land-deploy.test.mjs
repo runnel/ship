@@ -1,7 +1,7 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { readdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -112,7 +112,7 @@ test('the detached deploy survives a SIGHUP to the land\'s process group and a S
 import { existsSync } from 'node:fs';
 import { recordDeployEnd } from ${JSON.stringify(new URL('../lib/land-deploy.mjs', import.meta.url).href)};
 export async function runDetachedDeploy(a) {
-  process.stdout.write('runner started in ' + process.cwd() + ' for ' + a.cwd + ' limits ' + a.deps.ghTimeoutMs + ' ' + a.deps.fetchTimeoutMs + '\\n');
+  process.stdout.write('runner started in ' + process.cwd() + ' for ' + a.cwd + ' leader ' + process.env.SHIP_GROUP_LEADER + ' limits ' + a.deps.ghTimeoutMs + ' ' + a.deps.fetchTimeoutMs + '\\n');
   while (!existsSync(${JSON.stringify(go)})) await new Promise((r) => setTimeout(r, 20));
   await recordDeployEnd({ d: a.deps, repo: a.repo, id: a.id, tip: a.tip, code: 0, log: a.log });
   return 0;
@@ -121,6 +121,8 @@ export async function runDetachedDeploy(a) {
   // The land: leads its own process group, as bin/ship.mjs makes ship do, starts the deploy and waits.
   const landScript = `
 import { startDetachedDeploy } from ${JSON.stringify(new URL('../lib/land-deploy.mjs', import.meta.url).href)};
+import { onInterrupt } from ${JSON.stringify(new URL('../lib/interrupt.mjs', import.meta.url).href)};
+onInterrupt(() => {});
 const a = JSON.parse(process.argv[1]);
 const s = await startDetachedDeploy({ d: a.d, repo: 't/r', cwd: a.cwd, tip: a.tip, floors: {}, runnerUrl: a.runnerUrl });
 process.stdout.write('started ' + s.pid + ' ' + s.log + '\\n');
@@ -136,7 +138,7 @@ setInterval(() => {}, 1000);
   const runnerPid = Number(pid);
   atTestEnd(() => killQuietly(runnerPid));
   await waitUntil(async () => (await readFile(log, 'utf8').catch(() => '')).includes('runner started'), 'the runner runs');
-  assert.ok((await readFile(log, 'utf8')).includes(`runner started in ${await realpath(d.tmpRoot)} for ${dir} limits 60000 120000`),
+  assert.ok((await readFile(log, 'utf8')).includes(`runner started in ${await realpath(d.tmpRoot)} for ${dir} leader 1 limits 60000 120000`),
     'it runs in $SHIP_TMP, not in the checkout a session may remove, and with the land\'s limits');
   process.kill(-landProc.pid, 'SIGHUP');
   try { process.kill(landProc.pid, 'SIGKILL'); } catch { /* the hangup ended it already */ }
@@ -146,4 +148,23 @@ setInterval(() => {}, 1000);
   await writeFile(go, '');
   await waitUntil(async () => (await readDeploys({ d, repo: 't/r' })).ended.length === 1, 'the deploy records its end');
   assert.equal(await isGone(runnerPid, 10_000), true);
+});
+
+test('a runner that cannot be spawned is an error, not a start record without a pid', async () => {
+  const dir = await tempDir('nospawn-');
+  const d = { tmpRoot: join(dir, 'tmp'), logRoot: join(dir, 'logs'), mirrorRoot: join(dir, 'm'), stateRoot: join(dir, 'state') };
+  const failing = () => { const c = new EventEmitter(); c.pid = undefined; c.unref = () => {}; return c; };
+  await assert.rejects(startDetachedDeploy({ d, repo: 't/r', cwd: dir, tip: TIP, floors: {}, spawnFn: failing }), /could not start the deploy runner/);
+  assert.deepEqual(await records(d), []);
+});
+
+test('ended records pair with their start by tip and id, so equal ids of different tips do not collide', async () => {
+  const d = { tmpRoot: await tempDir('land-') };
+  const other = 'b'.repeat(40);
+  await recordDeployStart({ d, repo: 't/r', id: 't1', tip: TIP, log: '/a.out', owner: await ownerInfo() });
+  await recordDeployStart({ d, repo: 't/r', id: 't1', tip: other, log: '/b.out', owner: await ownerInfo() });
+  await recordDeployEnd({ d, repo: 't/r', id: 't1', tip: TIP, code: 0, log: '/a.out' });
+  const r = await readDeploys({ d, repo: 't/r' });
+  assert.deepEqual(r.running.map((x) => x.tip), [other]);
+  assert.deepEqual(r.ended.map((x) => x.tip), [TIP]);
 });
