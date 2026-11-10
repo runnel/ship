@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseRepoFromUrl, prInfo, defaultBranch, postStatus, nightlyFailures, commitStatus, mergedSha } from '../lib/github.mjs';
+import { parseRepoFromUrl, prInfo, defaultBranch, postStatus, nightlyFailures, commitStatus, mergedSha, openPrFiles } from '../lib/github.mjs';
+import { writeFile, chmod } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fakeGh, tempDir } from './helpers.mjs';
 
 test('parseRepoFromUrl handles https and ssh remotes', () => {
@@ -61,4 +63,23 @@ test('commitStatus picks one context out of the statuses and says who posted it;
   assert.equal(await commitStatus({ repo: 'acme/app', sha, gh: unmerged.gh }), null);
   const api = (await fake.calls()).find((c) => c[0] === 'api');
   assert.equal(api[1], `repos/acme/app/commits/${sha}/statuses?per_page=100`);
+});
+
+test('a gh read with a time limit is stopped then and says so; without one it is not limited', async () => {
+  const dir = await tempDir();
+  const slow = join(dir, 'gh');
+  await writeFile(slow, '#!/bin/sh\nexec sleep 5\n');
+  await chmod(slow, 0o755);
+  const started = Date.now();
+  const timedOut = (re) => (e) => e.timedOut === true && re.test(e.message);
+  await assert.rejects(prInfo({ repo: 'acme/app', pr: 5, gh: slow, timeoutMs: 200 }), timedOut(/^gh pr view gave no answer within 0\.2 s$/));
+  await assert.rejects(commitStatus({ repo: 'acme/app', sha: 'c'.repeat(40), gh: slow, timeoutMs: 200 }), timedOut(/^gh api repos\/acme\/app\/commits\/c{40}\/statuses\?per_page=100 gave no answer within 0\.2 s$/));
+  await assert.rejects(mergedSha({ repo: 'acme/app', pr: 5, gh: slow, timeoutMs: 200 }), timedOut(/^gh pr view gave no answer/));
+  await assert.rejects(defaultBranch({ repo: 'acme/app', gh: slow, timeoutMs: 200 }), timedOut(/^gh repo view gave no answer/));
+  await assert.rejects(nightlyFailures({ repo: 'acme/app', branch: 'main', gh: slow, timeoutMs: 200 }), timedOut(/^gh run list gave no answer/));
+  await assert.rejects(openPrFiles({ repo: 'acme/app', gh: slow, timeoutMs: 200 }), timedOut(/^gh pr list gave no answer/));
+  assert.ok(Date.now() - started < 4000, 'six reads, each stopped at 0.2 s');
+  const pr = { number: 5, headRefOid: 'a'.repeat(40), headRefName: 'feat', baseRefName: 'main', isCrossRepository: false, state: 'OPEN' };
+  const fake = await fakeGh(await tempDir(), { pr });
+  assert.equal((await prInfo({ repo: 'acme/app', pr: 5, gh: fake.gh })).number, 5, 'no limit: as before');
 });

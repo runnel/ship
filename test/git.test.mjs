@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, readFile, mkdir, readdir, utimes } from 'node:fs/promises';
+import { access, readFile, mkdir, readdir, utimes, writeFile, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile, isAncestor, listTree, commitsTouching, subject, lastCommitBefore } from '../lib/git.mjs';
 import { validateConfig } from '../lib/config.mjs';
@@ -222,4 +222,25 @@ test('lastCommitBefore follows the first parents: a side commit merged later is 
   assert.notEqual(feat1, main1);
   assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:30Z'), main1);
   assert.equal(await lastCommitBefore(repo.gitDir, 'refs/heads/main', '2026-01-01T00:00:50Z'), merged);
+});
+
+test('a mirror fetch with a time limit is stopped then and says so', { timeout: 30_000 }, async () => {
+  const o = await makeOrigin({ 'a.txt': 'a\n' });
+  const root = join(o.root, 'mirrors');
+  const mirror = await ensureMirror('t/r', { root, url: o.origin });
+  // A remote whose helper never answers: git looks for git-remote-<scheme> on PATH.
+  const bin = await tempDir('bin-');
+  await writeFile(join(bin, 'git-remote-hang'), '#!/bin/sh\nexec sleep 5\n');
+  await chmod(join(bin, 'git-remote-hang'), 0o755);
+  await capture('git', ['--git-dir', mirror, 'remote', 'set-url', 'origin', 'hang::nowhere']);
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}:${path}`;
+  try {
+    await assert.rejects(ensureMirror('t/r', { root, url: o.origin, fetchTimeoutMs: 300 }),
+      (e) => e.timedOut === true && /^git fetch of t\/r took longer than 0\.3 s$/.test(e.message));
+    await assert.rejects(fetchCommit(mirror, 'd'.repeat(40), 7, { timeoutMs: 300 }),
+      (e) => e.timedOut === true && /^git fetch of pull\/7\/head took longer than 0\.3 s$/.test(e.message));
+  } finally {
+    process.env.PATH = path;
+  }
 });
