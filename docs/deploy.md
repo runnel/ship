@@ -197,6 +197,53 @@ heavy slot. So deploys of one repository collapse into one:
   first build, so its deploy reads main again right after it has planned, and does not wait for
   anything before that.
 
+## Deploys that ship land starts
+
+[`ship land`](checks-and-merge.md#land) deploys for the pull requests it merges. It starts a deploy
+of the repository's main when a merge it waits for is not live and one of these holds: the land line
+has been quiet for `debounceSec` (no land waits or checks, and main has not moved), or a merge has
+waited `deployAfterMin` ([`land` config](configuration.md#land)). It never starts one while a deploy
+of the repository runs (its own, or any that holds the deploy lock), and never again for a tip that a
+deploy has already ended for: not when it ended 0 (it is shipped), not when it failed (the owner
+decides). The one exception is a deploy that stopped at the migration gate, below. Lands that
+decide at the same moment take a lock, so only one starts it.
+
+The deploy is **detached**: its own session and process group, nothing ties it to the land, so a
+closed terminal or an interrupted land does not reach it (an interrupt in the promote step would
+leave a hold). It runs in `$SHIP_TMP`, not in the checkout the land was started from, which may be
+removed meanwhile. It is ship that runs there, with the land's time limits for `gh` calls and
+fetches: one that hits its limit fails that deploy like any other failure, so the lands whose merge
+it carried exit 3 and no land deploys that tip again. Its steps get the minimal environment as
+always. The land prints where its output is:
+`~/.ship/logs/<owner>__<repo>-land-deploy-<sha>-<stamp>-<id>.out`.
+
+Its record is in `$SHIP_TMP/land/<owner>__<repo>/deploys/`: `<tip>-<id>.start.json` when it starts
+(the runner's process) and `<tip>-<id>.end.json` when it ends (the exit code and the log). Records
+are kept a day, which is why `liveWaitHours` is at most 24. A start whose runner is gone without an
+end is dropped, and its tip can be deployed again. A deploy whose last `✗` line is the migration
+gate's refusal (a migration merged after the land decided, not cleared) is recorded as waiting for
+the migration, not as a failure: the lands wait at the migration gate, and the tip is deployed
+again once it is cleared. If the runner cannot be spawned, the land says so once and tries again at
+its next tick.
+
+**Collapsing with other deploys.** A land's deploy joins the rules of
+[One deploy at a time](#one-deploy-at-a-time-and-a-fresh-main), with one addition: it joins another
+deploy, or is joined by one, only when both carry the same `requires` floors, since a deploy that
+waited for a floor must not take the verdict of one that did not.
+
+**The `requires` floor.** `ship deploy` called directly keeps "live at its main" for each `requires`
+entry. Only a land passes a floor: the required repository's main when the pull request merged
+(see [Land](checks-and-merge.md#land)). A deploy a land starts is held to the newest floor of every
+merge it carries, and waits (`… waiting for <repo> <deployable> to be live at or past <sha>`) while
+one is not met. A floor is met when the deployable's files as of the floor are live, even if the
+live commit is older than the floor, when nothing it changed since is pending.
+
+**A known gap.** The detached deploy ships main as it is when the deploy freezes what it ships (it
+fetches main again once it holds the heavy lane, see above), not the exact tip the land decided on.
+A merge that lands in the seconds between that decision and the freeze is shipped under the floors
+judged for the older tip. Its own land still waits for it, and its requirement is checked by the
+deploy's own `requires` gate, but the floor it recorded was not part of that decision.
+
 ## Clearing migrations
 
 `ship deploy` stops while main has migration files (those matching `migrations.paths`) that are

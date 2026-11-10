@@ -6,7 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- `ship land` checks and merges a pull request through a serial line per repository ([Land](docs/checks-and-merge.md#land)). It stops at the merge for now: a pull request that touches a deployable or adds a migration exits 3, "run ship deploy". Every land writes a line to `~/.ship/land/<owner>__<repo>.jsonl`.
+- `ship land` checks and merges a pull request through a serial line per repository ([Land](docs/checks-and-merge.md#land)), then waits until the merge is live, starting a detached deploy when one is due ([Deploys that ship land starts](docs/deploy.md#deploys-that-ship-land-starts)). It ends 0 when the pull request is live, 3 when it merged but cannot become live. Every land writes a line to `~/.ship/land/<owner>__<repo>.jsonl`.
+- The optional `land` config block (`deployAfterMin`, `debounceSec`, `liveWaitHours`) ([Configure a repository](docs/configuration.md#land)).
 
 ### Changed
 
