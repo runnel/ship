@@ -2,14 +2,13 @@ import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { runCheck as realRunCheck } from '../lib/check.mjs';
+import { runCheck as realRunCheck, checkOnce } from '../lib/check.mjs';
 import { capture } from '../lib/proc.mjs';
 import { acquire, ownerInfo, tryLock } from '../lib/lock.mjs';
 import { minutesUsed, daysLeftInMonth, reserveVerdict, recentRuns, overflowGate, PENDING_WINDOW_MS } from '../lib/overflow.mjs';
 import { runGroupsHere } from '../lib/run-groups.mjs';
 import { validateConfig, ConfigError } from '../lib/config.mjs';
 import { LANE_PRIORITY } from '../lib/shared.mjs';
-import { checkOnce } from '../lib/check.mjs';
 import { atTestEnd, prepareCheck, commitFiles, fakeGh, git, killQuietly, longLine, makeOrigin, setupCheck, spawnCheckLeader, stopBackground, tempDir, tracked, waitUntil } from './helpers.mjs';
 
 // However a test ends, the lane it held and the check it started end with it.

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
-import { mkdir, readdir, symlink } from 'node:fs/promises';
+import { mkdir, readdir, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runCheck, checkOnce, readResult, writeResult } from '../lib/check.mjs';
@@ -338,4 +338,23 @@ test('checkOnce marks a merge conflict as one; a result is written for reuse unl
   assert.ok(back.at > 0);
   await writeResult(p.d, 't/r', 'b'.repeat(40), { state: 'stopped', description: 'x', exitCode: 2 }, p.mainSha);
   assert.equal(await readResult(p.d, 't/r', 'b'.repeat(40)), null, 'a stopped check leaves nothing to reuse');
+});
+
+test('readResult gives null for a torn or malformed file, not a rejection', async () => {
+  const s = await setup();
+  const p = await prepareCheck(s);
+  const dir = join(p.d.tmpRoot, 'checks');
+  await mkdir(dir, { recursive: true });
+  for (const [sha, text] of [['c', '{ "state": "succ'], ['d', ''], ['e', 'null']]) {
+    await writeFile(join(dir, `t__r__${sha.repeat(40)}.json`), text);
+    assert.equal(await readResult(p.d, 't/r', sha.repeat(40)), null, JSON.stringify(text));
+  }
+});
+
+test('a verdict that could not be posted is an error, not a merge conflict', async () => {
+  const s = await setup({ featFiles: { 'a.txt': 'feature\n' }, mainFiles: { 'a.txt': 'main\n' }, ghOptions: { apiFail: { match: 'state=failure' } } });
+  const p = await prepareCheck(s);
+  const result = await checkOnce({ ...p, d: { ...p.d, verdictRetryMs: 5 }, land: true });
+  assert.equal(result.state, 'error', s.lines.join('\n'));
+  assert.equal('conflict' in result, false);
 });

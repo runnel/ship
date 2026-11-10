@@ -231,15 +231,19 @@ test('a mirror fetch with a time limit is stopped then and says so', { timeout: 
   const hang = await hangingRemote();
   await capture('git', ['--git-dir', mirror, 'remote', 'set-url', 'origin', hang.url]);
   try {
-    await assert.rejects(ensureMirror('t/r', { root, url: o.origin, fetchTimeoutMs: 1500 }),
-      (e) => e.timedOut === true && /^git fetch of t\/r took longer than 1\.5 s$/.test(e.message));
-    await assert.rejects(fetchCommit(mirror, 'd'.repeat(40), 7, { timeoutMs: 1500 }),
-      (e) => e.timedOut === true && /^git fetch of pull\/7\/head took longer than 1\.5 s$/.test(e.message));
-    // The fetch's remote helper died with it (checked before the cleanup below could hide a leak):
-    // one helper per timed-out fetch, none still running.
-    const pids = await hang.pids();
-    assert.equal(pids.length, 2, 'each fetch started one helper');
-    for (const pid of pids) assert.equal(await isGone(pid, 1000), true, `helper ${pid} still running`);
+    // A kill that lands before git has started the remote helper leaves no pid: repeat the call (at
+    // most 5 times) until one is recorded. Every call must still be stopped and say so.
+    const stoppedFetch = async (call, message) => {
+      const before = (await hang.pids()).length;
+      for (let i = 0; i < 5 && (await hang.pids()).length === before; i++) {
+        await assert.rejects(call(), (e) => e.timedOut === true && message.test(e.message));
+      }
+      assert.ok((await hang.pids()).length > before, 'the fetch started a helper');
+    };
+    await stoppedFetch(() => ensureMirror('t/r', { root, url: o.origin, fetchTimeoutMs: 1500 }), /^git fetch of t\/r took longer than 1\.5 s$/);
+    await stoppedFetch(() => fetchCommit(mirror, 'd'.repeat(40), 7, { timeoutMs: 1500 }), /^git fetch of pull\/7\/head took longer than 1\.5 s$/);
+    // The fetch's remote helpers died with them (checked before the cleanup below could hide a leak).
+    for (const pid of await hang.pids()) assert.equal(await isGone(pid, 1000), true, `helper ${pid} still running`);
   } finally {
     await hang.restore();
   }

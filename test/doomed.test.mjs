@@ -1,14 +1,13 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, chmod, readdir, readFile, writeFile } from 'node:fs/promises';
+import { access, chmod, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { runCheck as realRunCheck, checkOnce } from '../lib/check.mjs';
 import { acquire, ownerInfo, readOwner } from '../lib/lock.mjs';
 import { acquireShared } from '../lib/shared.mjs';
 import { mirrorPath } from '../lib/git.mjs';
 import { watchDoomed, whyDoomed } from '../lib/doomed.mjs';
-import { hangingRemote, isGone } from './helpers.mjs';
-import { setupCheck as setup, atTestEnd, git, tempDir, commitFiles, waitUntil, readPid, assertGone, killQuietly, stopBackground, tracked, prepareCheck } from './helpers.mjs';
+import { setupCheck as setup, atTestEnd, git, tempDir, commitFiles, waitUntil, readPid, assertGone, killQuietly, stopBackground, tracked, prepareCheck, hangingRemote, isGone } from './helpers.mjs';
 
 // However a test ends, the lane it held and the check waiting for it end with it.
 afterEach(stopBackground, { timeout: 30_000 });
@@ -330,16 +329,24 @@ test('checkOnce in land mode kills a gh look of the doomed watcher that hangs pa
   const p = await prepareCheck(s);
   const bin = await tempDir('gh-');
   const flag = join(bin, 'hang');
-  const pids = join(bin, 'pids');
+  const pidFile = join(bin, 'pids');
   const wrapper = join(bin, 'gh');
-  await writeFile(wrapper, `#!/bin/sh\nif [ -e '${flag}' ] && [ "$1 $2" = "pr view" ]; then echo $$ >> '${pids}'; exec sleep 30; fi\nexec '${s.gh}' "$@"\n`);
+  await writeFile(wrapper, `#!/bin/sh\nif [ -e '${flag}' ] && [ "$1 $2" = "pr view" ]; then echo $$ >> '${pidFile}'; exec sleep 300; fi\nexec '${s.gh}' "$@"\n`);
   await chmod(wrapper, 0o755);
+  const recorded = async () => (await readFile(pidFile, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(Number);
   const run = checkOnce({ ...p, d: { ...p.d, ...FAST, gh: wrapper, ghTimeoutMs: 8000 }, land: true });
-  await waitingForLane(s);
-  await writeFile(flag, '');
-  await waitUntil(async () => (await readFile(pids, 'utf8').catch(() => '')).trim() !== '', 'a look that hangs');
-  const pid = Number((await readFile(pids, 'utf8')).split('\n')[0]);
-  await waitUntil(() => isGone(pid), 'the hung look is killed at the land time limit, not the watcher\'s 30 s');
-  await holder.release();
-  await run;
+  try {
+    await waitingForLane(s);
+    await writeFile(flag, '');
+    await waitUntil(async () => (await recorded()).length > 0, 'a look that hangs', 15_000);
+    await rm(flag); // only that one look hangs
+    const [pid] = await recorded();
+    await waitUntil(() => isGone(pid), 'the hung look is killed at the land time limit, not the watcher\'s 30 s', 15_000);
+    await holder.release();
+    assert.equal((await run).state, 'success', s.lines.join('\n'));
+  } finally {
+    for (const pid of await recorded()) killQuietly(pid);
+    await holder.release().catch(() => {});
+    await run.catch(() => {});
+  }
 });
