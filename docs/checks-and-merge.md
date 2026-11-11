@@ -10,7 +10,7 @@ ship check --pr 42
 ship check --pr 42 --github   # run it on GitHub now (see Overflow to GitHub Actions)
 ship check --pr 42 --cloudflare   # run it on Cloudflare now (see Overflow to Cloudflare Workers Builds)
 ship merge --pr 42    # merge a PR that passed, unless main changed under its check
-ship land --pr 42     # check and merge through the repository's serial line (see Land)
+ship land --pr 42     # check, merge and deploy through the repository's serial line (see Land)
 ship queue            # who holds each lane, who waits, and for how long
 ```
 
@@ -134,8 +134,8 @@ does not load); 2 refused by ship, or a usage error.
 ## Land
 
 `ship land` checks and merges one pull request through a serial line, one per repository, so that
-each pull request is checked against a main that already holds the ones landed before it. This
-version stops at the merge: it does not deploy.
+each pull request is checked against a main that already holds the ones landed before it. After
+the merge it waits until the merge is live, and starts the deploy when one is due.
 
 ```bash
 ship land             # the PR of the current branch
@@ -196,25 +196,81 @@ to: exit 2. Still open: exit 4, landing again is safe. Not readable: exit 5, the
 
 **After the merge.** The land waits for GitHub to name the merge commit and for the mirror's main
 to contain it (up to two minutes each), then gives the slot up. A pull request that touches no
-deployable and adds no migration is done: exit 0. Otherwise this version prints
-`this version of ship land does not deploy yet — run ship deploy` and exits 3.
+deployable (a pending file of one, in the merge commit's own diff) and adds no migration is done:
+exit 0. Otherwise the land waits until the merge is live (below). GitHub that does not name the
+merge commit, or a mirror that does not show it, is exit 3: ship cannot tell when it is live
+(`ship status`).
+
+**Waiting for live.** Every 30 s the land looks at the mirror, the state on disk and the live
+cache, and does the first of these that applies:
+
+1. **Live: exit 0.** Every deployable the merge touched is live, and every migration the merge
+   added is cleared. A deployable is live when its live commit has the merge commit in its history
+   (a held, blocked or unknown deployable never counts), or when the live cache says `live` and
+   the main it was planned against has the merge: a change and its revert have no net effect and
+   leave the live commit where it was.
+2. **A failed deploy: exit 3.** A deploy that ended with a code other than 0, after this land's
+   merge, for a main that has the merge, and that was not waiting for a migration or for a requires floor (below). Nobody
+   starts another deploy for that tip: the owner decides (`ship status`).
+3. **Migrations at the tip.** A migration file on main that is not cleared for deploy holds every
+   deploy. The pull request that added it prints the hint how to clear it (`! PR #42 added
+   migration(s) not cleared for deploy: …`); every other land prints `… waiting for migration
+   <file> (#<pr>)`. They wait: the owner clears it, a deploy never goes past one.
+4. **A hold on a deployable the merge touched: exit 3**, naming the hold; the owner decides.
+5. **`requires`.** Each `requires` entry of the config must be live at or past its floor (below);
+   until then the land waits and says what for.
+6. **A deploy is running.** One a land started, or any other that holds the deploy lock: the land
+   waits for it to end.
+7. **A deploy that ended 0 for this tip.** A deploy that ended with code 0 for the current tip of
+   main is never run again; the land waits for it to show as live.
+8. **Start the deploy**, once the land line has been quiet for `debounceSec`, or a merge has
+   waited `deployAfterMin` ([Deploys that ship land starts](deploy.md#deploys-that-ship-land-starts)).
+   Otherwise it says when the deploy will start.
+
+**`liveWaitHours`: exit 3.** A land that is not live after `liveWaitHours` (12 by default, at most
+24) says so and ends 3: the merge stays. A failure inside a tick (a Cloudflare read, a spawn of the
+deploy runner that fails) is said once and tried again at the next tick, until that limit.
+
+**The floors.** `requires` names a deployable of another repository that must be live before this
+one is deployed. For a land, "live" means live at or past the floor: the required repository's main
+at the moment of the merge, read before the merge while the land holds the merge lock. The
+requirements of main's config and of the pull request's are both read; a pull request whose config
+does not load under this ship (an old branch, a function config that needs files only main has) is
+held to main's `requires` only, and one the pull request adds itself is held by the strict rule
+below. A floor that cannot be read, or main's config, is exit 4 before the merge. The floors are
+recorded per merge commit in `$SHIP_TMP/land/<owner>__<repo>/floors/<sha>.json` as soon as the
+merge commit is named, and pruned after 24 hours. A deploy is held to the newest floor of every
+merge it carries, so a deploy another land starts does not skip a requirement of yours. A merge
+with no record is held to the required repository's main now.
+
+**What is live.** The land does not call Cloudflare itself. It reads
+`$SHIP_TMP/land/<owner>__<repo>/live.json`, a cache that the deploy plan refreshes: whichever land
+finds it older than 5 minutes refreshes it, one at a time. It is read again after a deploy ends,
+whether the land's own (its record) or a manual `ship deploy` (the deploy lock going free). A
+land never judges by a read from before the latest deploy end it knows of; it waits a tick.
+
+**The deadline.** `deployAfterMin` counts from the oldest commit on main that a deployable has not
+shipped, or from this merge when that is older. A deployable that a deploy would not run (held,
+blocked, or waiting for one that is) is left out: its backlog waits for the owner, and counting it
+would leave every deadline in the past. With no such commit the deadline counts from this merge.
 
 **Time limits.** Nothing a land waits for may freeze the line: each `gh` call gets 60 s, each
 `git fetch` 120 s, and the mirror lock and the merge lock 5 minutes. Before the merge each of these
-ends the land with exit 4, and landing again is safe. A step that fails after the merge ends it with 3.
+ends the land with exit 4, and landing again is safe. A step that fails after the merge ends it with 3, except a failure inside a tick of the wait for live (said once, retried).
 
 **Interrupts.** Ctrl-C while queued posts no status and gives the place up. While checking it
 behaves as `ship check` does: the status becomes `error`, the step and the worktree are cleaned
-up. After the merge nothing is undone: the merge stays. Exit 130 in every case.
+up. After the merge nothing is undone: the merge stays, and the deploy that a land started keeps
+running, as it is not tied to the land. Exit 130 in every case.
 
 Exit codes:
 
 | Exit | Meaning |
 |---|---|
-| 0 | landed; this version: merged and nothing to deploy |
+| 0 | landed: live, or merged with nothing to deploy |
 | 1 | a check step failed (the output ends with the step's last lines and the log path) |
 | 2 | refused, nothing merged: not open, from a fork, base not main, a conflict with main, a new head was pushed, the same PR and head already landing, main kept moving, a PR merged by someone else, or GitHub still shows an older head after 60 s |
-| 3 | merged, not live: this version, when the PR touches a deployable or adds a migration (run `ship deploy`), or GitHub or the mirror does not show the merge commit in time (`ship status`), or ship failed after the merge |
+| 3 | merged, not live: the deploy that carried the merge failed, a deployable it touched is held, `liveWaitHours` passed, GitHub or the mirror does not show the merge commit in time, or ship failed after the merge (`ship status`) |
 | 4 | not merged: an error in ship, the config, GitHub or a time limit, before the merge; landing again is safe |
 | 5 | the merge outcome is unknown: `gh pr merge` failed and the pull request could not be read |
 | 130 | interrupted |

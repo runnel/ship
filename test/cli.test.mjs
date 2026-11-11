@@ -137,7 +137,7 @@ test('ship migrations apply refuses to run without a terminal, before it reads o
 });
 
 test('ship land takes --pr <number> and --keep-branch: anything else is a usage error, exit 2', { timeout: 30_000 }, async () => {
-  const usage = /^ship land \[--pr <number>\] \[--keep-branch\] {3,}check and merge a pull request/;
+  const usage = /^ship land \[--pr <number>\] \[--keep-branch\] {3,}check, merge and deploy a pull request/;
   await usageError(['land', '--pr', 'feat'], 'land: --pr feat: give a pull request number', usage);
   await usageError(['land', '--admin'], 'land: .*--admin', usage);
   await usageError(['land', '12'], 'land: .*12', usage);

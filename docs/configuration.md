@@ -54,3 +54,21 @@ gh api -X PUT repos/acme/app/branches/main/protection --input - <<'EOF'
   "enforce_admins": false, "required_pull_request_reviews": null, "restrictions": null }
 EOF
 ```
+
+## Land
+
+The optional `land` block tunes `ship land` ([Land](checks-and-merge.md#land)). Every key is optional;
+the values below are the defaults. It is read from main, like the rest of the config.
+
+```js
+land: { deployAfterMin: 60, debounceSec: 120, liveWaitHours: 12 },
+```
+
+- `debounceSec`: the deploy a land starts waits until the land line of the repository has been empty
+  and main has not moved for this many seconds.
+- `deployAfterMin`: the longest a merge that is not live waits for that quiet before a land starts the
+  deploy anyway. At most 1440 (a day), and a finite number.
+- `liveWaitHours`: how long a land waits for its merge to be live before it ends with exit 3. At most
+  24, because the records of the deploys a land started are kept a day.
+
+Each must be a positive number; an unknown key in the block is a config error.

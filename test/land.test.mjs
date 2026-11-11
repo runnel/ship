@@ -1,16 +1,21 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { existsSync, readdirSync } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { abortedError } from '../lib/shared.mjs';
+import { fakeCloud } from './fake-cloud.mjs';
+import { FILES, at, configText, healthy, inProcessDeploy } from './deploy-fixture.mjs';
+import { addAcks } from '../lib/state.mjs';
 import { landDeps, landInSlot, reusable, runLand } from '../lib/land.mjs';
 import { runCheck } from '../lib/check.mjs';
 import { ensureMirror, fetchCommit, mirrorPath } from '../lib/git.mjs';
 import { postStatus } from '../lib/github.mjs';
 import { acquire, ownerInfo, readOwner } from '../lib/lock.mjs';
 import { headLockDir, landDir, slotDir } from '../lib/land-line.mjs';
-import { atTestEnd, commitFiles, fakeGh, git, hangingRemote, isGone, killQuietly, readPid, setupCheck, statusesOf, stopBackground, tempDir, tracked, waitUntil } from './helpers.mjs';
+import { atTestEnd, commitFiles, fakeGh, git, hangingRemote, makeOrigin, isGone, killQuietly, readPid, setupCheck, statusesOf, stopBackground, tempDir, tracked, waitUntil } from './helpers.mjs';
 
 afterEach(stopBackground, { timeout: 30_000 });
 
@@ -272,12 +277,18 @@ test('the head probe of a waiting land has the gh time limit: no gh child outliv
   const pidsOf = async () => (await readFile(pidsFile, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(Number);
   atTestEnd(() => { for (const pid of pidsOf.last ?? []) killQuietly(pid); });
   const release = await holdSlot(s);
-  const landing = land(s, { deps: { doomedPollMs: 50, doomedConfirmMs: 5, ghTimeoutMs: 1000 } });
+  // The limit also applies to the land's own startup `gh` calls, so it must be far above what a loaded
+  // machine needs to start the fake gh (1000 ms made the land fail at startup, never wait, and the wait
+  // below time out); the hang is longer still, so only the limit ends a hung read.
+  const landing = land(s, { deps: { doomedPollMs: 50, doomedConfirmMs: 5, ghTimeoutMs: 3000 } });
   await waitUntil(async () => (await tickets(s)).length === 1, 'the land waits in line');
-  await writeFile(join(s.root, 'pr-live.json'), '{"hangMs":20000}');
+  await writeFile(join(s.root, 'pr-live.json'), '{"hangMs":40000}');
   await waitUntil(async () => (await pidsOf()).length > 0, 'a probe read hangs');
   await waitUntil(async () => (await pidsOf()).length > 1, 'the hung probe read was given up, the next one started');
   await writeFile(join(s.root, 'pr-live.json'), '{}');
+  // A read that hangs when the land ends is only ended by the limit (the land does not wait for it), so
+  // let the one in flight run into it before the land is released.
+  await new Promise((resolve) => setTimeout(resolve, 3500));
   await release();
   assert.equal(await landing, 0, s.lines.join('\n'));
   const pids = await pidsOf();
@@ -468,15 +479,118 @@ test('an error after the merge is exit 3: "merged, but ship failed after the mer
   assert.equal(s.lines.at(-1), '✗ PR #7 merged, but ship failed after the merge (boom) — ship status');
 });
 
-// A config with one deployable, for the PR B interim: Task 14 replaces this test.
-const WITH_APP = `export default { repo: 't/r', docsOnly: ['*.md'], checks: [{ name: 'unit', paths: ['**'], steps: ['true'] }],
-  deployables: [{ name: 'app', worker: 'example-app', cwd: '.', paths: ['src/**'], mode: 'direct' }],
-  credentials: { file: '/unused', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } } };\n`;
+// PR #7 changes app (a deployable); the fake cloud has app and tick live at the first commit, and time
+// moves only when the land sleeps. `requires` is a JS array literal for the config; `extra(cloudDir)`
+// may add workers and repositories.
+async function setupLandLive({ requires = '[]', workers = {}, remote = null, headConfig = null } = {}) {
+  const cloudDir = join(await tempDir('cloud-'), 'cloud');
+  const text = configText(join(cloudDir, 'bin', 'wrangler'), { requires, ...(headConfig ? { guard: 'true' } : {}) });
+  const s = await setupLand({ configText: text, baseFiles: FILES, featFiles: { 'app/src/a.ts': 'export const a = 2;\n', ...(headConfig ? { 'ship.config.mjs': headConfig(text) } : {}) } });
+  const first = (await git(['--git-dir', s.origin, 'rev-list', '--max-parents=0', 'main'], s.work)).trim();
+  const cloud = await fakeCloud({ dir: cloudDir, workers: { 'example-app': at(first), 'example-tick': at(first), ...workers }, probe: healthy,
+    hosts: { 'https://app.example.com': 'example-app', 'https://tick.example.com': 'example-tick' } });
+  const stateRoot = join(s.root, 'state');
+  await addAcks(stateRoot, 't/r', ['db/001.sql']);
+  const clock = { t: Date.now() };
+  const starts = [];
+  const deps = {
+    stateRoot, fetch: cloud.fetch, readCredentials: async () => ({ CLOUDFLARE_API_TOKEN: 'tok', CLOUDFLARE_ACCOUNT_ID: 'acc' }),
+    probeWindowMs: 0, probeIntervalMs: 1000, now: () => clock.t, sleep: async (ms) => { clock.t += ms; },
+    startDeploy: inProcessDeploy(starts), ...(remote ? { remoteUrl: remote(s.origin) } : {}),
+  };
+  return { s, cloud, deps, starts, clock };
+}
 
-test('interim: a PR that touches a deployable is merged and not deployed by this version (exit 3)', async () => {
-  const s = await setupLand({ configText: WITH_APP });
-  assert.equal(await land(s), 3, s.lines.join('\n'));
-  assert.match(s.lines.at(-1), /^! PR #7 merged as [0-9a-f]{7} and touches app; this version of ship land does not deploy yet — run ship deploy$/);
+test('ship land end to end: checked, merged, deployed detached once the line is quiet, and live', { timeout: 90_000 }, async () => {
+  const { s, cloud, deps, starts } = await setupLandLive();
+  assert.equal(await land(s, { deps }), 0, s.lines.join('\n'));
+  assert.equal(starts.length, 1);
+  const merged = await s.originMain();
+  assert.equal(s.lines.at(-1), `✓ PR #7 is live (merged as ${merged.slice(0, 7)}): app at ${merged.slice(0, 7)}`);
+  assert.match((await cloud.state('example-app')).deployments.at(-1).annotations['workers/message'], new RegExp(`^sha:${merged} `));
+});
+
+test('an interrupt while waiting for live: the land ends 130 and leaves its ledger line, the deploy is not started', { timeout: 90_000 }, async () => {
+  const { s, deps, starts } = await setupLandLive();
+  // Only the wait for live sleeps this long: the interrupt cannot come from anywhere earlier.
+  const sleep = async (ms) => { if (ms === 30_000) throw abortedError(); return deps.sleep(ms); };
+  await assert.rejects(land(s, { deps: { ...deps, sleep } }), (e) => e.aborted === true);
+  assert.ok(s.lines.some((l) => /^▸ PR #7 merged as [0-9a-f]{7}; waiting until it is live \(app\)$/.test(l)), s.lines.join('\n'));
+  assert.deepEqual(starts, []);
+  assert.equal((await ledger(s)).at(-1).code, 130);
+});
+
+async function apiOrigin() {
+  const other = await makeOrigin({ 'ship.config.mjs': `export default { repo: 't/api', checks: [{ name: 'u', paths: ['**'], steps: ['true'] }],
+    deployables: [{ name: 'app', worker: 'example-api', cwd: '.', paths: ['src/**'], mode: 'direct' }],
+    credentials: { file: '/unused', map: { CLOUDFLARE_API_TOKEN: 'T', CLOUDFLARE_ACCOUNT_ID: 'A' } } };\n`, 'src/x.ts': '1', 'wrangler.json': '{"name":"example-api"}' });
+  return { other, apiMain: (await git(['rev-parse', 'HEAD'], other.work)).trim() };
+}
+const REQUIRES_API = "[{ repo: 't/api', deployable: 'app' }]";
+
+test('the floors are read before the merge and recorded under the merge commit before the land waits', { timeout: 90_000 }, async () => {
+  const { other, apiMain } = await apiOrigin();
+  const { s, deps } = await setupLandLive({ requires: REQUIRES_API, workers: { 'example-api': at(apiMain) }, remote: (origin) => (repo) => (repo === 't/api' ? other.origin : origin) });
+  let atWait = null;
+  const out = (l) => {
+    s.lines.push(l);
+    if (/^▸ PR #7 merged as/.test(l)) atWait = readdirSync(join(landDir({ tmpRoot: s.deps.tmpRoot }, 't/r'), 'floors'));
+  };
+  assert.equal(await land(s, { deps: { ...deps, out } }), 0, s.lines.join('\n'));
+  const merged = await s.originMain();
+  assert.deepEqual(atWait, [`${merged}.json`], 'the record existed when afterMerge started');
+  const rec = JSON.parse(await readFile(join(landDir({ tmpRoot: s.deps.tmpRoot }, 't/r'), 'floors', `${merged}.json`), 'utf8'));
+  assert.deepEqual(rec.floors, { 't/api': apiMain });
+});
+
+test('floors that cannot be read are an error before the merge: exit 4, nothing merged', { timeout: 90_000 }, async () => {
+  const { other, apiMain } = await apiOrigin();
+  let broken = false;
+  const { s, deps } = await setupLandLive({ requires: REQUIRES_API, workers: { 'example-api': at(apiMain) },
+    remote: (origin) => (repo) => { if (repo === 't/api') { if (broken) throw new Error('unreachable'); return other.origin; } return origin; } });
+  const before = await s.originMain();
+  broken = true;
+  assert.equal(await land(s, { deps }), 4, s.lines.join('\n'));
+  assert.match(s.lines.at(-1), /^✗ PR #7 not merged: could not read the floors of the requirements \(.+\); landing again is safe$/);
+  assert.equal((await s.merges()).length, 0);
+  assert.equal(await s.originMain(), before);
+});
+
+test('a head whose config does not load on its own still lands: main\'s requirements are the floors', { timeout: 90_000 }, async () => {
+  const { other, apiMain } = await apiOrigin();
+  // Loads in the merged tree (which has b.txt, from main) but not at the head alone.
+  const needsMain = (text) => `${text.replace('export default {', 'const cfg = {')}
+export default async ({ root }) => {
+  const { readFileSync } = await import('node:fs');
+  readFileSync(root + '/b.txt');
+  return cfg;
+};\n`;
+  const { s, deps } = await setupLandLive({ requires: REQUIRES_API, workers: { 'example-api': at(apiMain) }, headConfig: needsMain,
+    remote: (origin) => (repo) => (repo === 't/api' ? other.origin : origin) });
+  assert.equal(await land(s, { deps }), 0, s.lines.join('\n'));
+  const merged = await s.originMain();
+  const rec = JSON.parse(await readFile(join(landDir({ tmpRoot: s.deps.tmpRoot }, 't/r'), 'floors', `${merged}.json`), 'utf8'));
+  assert.deepEqual(rec.floors, { 't/api': apiMain });
+});
+
+test('the floor record is written as soon as the merge commit is known, before the wait for the mirror', { timeout: 90_000 }, async () => {
+  const { other, apiMain } = await apiOrigin();
+  let s;
+  let before = null;
+  let atFirstLook = null;
+  const dir = () => join(landDir({ tmpRoot: s.deps.tmpRoot }, 't/r'), 'floors');
+  const mainNow = () => execFileSync('git', ['--git-dir', s.origin, 'rev-parse', 'refs/heads/main'], { encoding: 'utf8' }).trim();
+  // seeMerge's first act is to read the mirror; the first read after main moved shows what exists by then.
+  const remote = (origin) => (repo) => {
+    if (repo === 't/api') return other.origin;
+    if (s && before && atFirstLook === null && mainNow() !== before) atFirstLook = existsSync(dir()) ? readdirSync(dir()) : [];
+    return origin;
+  };
+  const set = await setupLandLive({ requires: REQUIRES_API, workers: { 'example-api': at(apiMain) }, remote });
+  s = set.s;
+  before = mainNow();
+  assert.equal(await land(s, { deps: set.deps }), 0, s.lines.join('\n'));
+  assert.deepEqual(atFirstLook, [`${await s.originMain()}.json`]);
 });
 
 test('two lands started at the same moment: the one that meets the other on the head lock refuses as a duplicate (exit 2)', async () => {
