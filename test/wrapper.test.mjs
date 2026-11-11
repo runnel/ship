@@ -66,3 +66,17 @@ test('a second Ctrl-C during the unwind does not kill the helper that posts the 
     await killShip(w.child);
   }
 });
+
+// A reader that stops early (`ship queue | head`) closes the pipe: ship ends normally, without a
+// stack trace about an unhandled EPIPE.
+test('output into a pipe that was closed ends ship normally', { timeout: 30_000 }, async () => {
+  const dir = await tempDir();
+  const env = { ...process.env, SHIP_TMP: join(dir, 'tmp'), SHIP_HOME: join(dir, 'home') };
+  const child = spawn(process.execPath, [BIN, 'queue'], { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  child.stdout.destroy(); // the reader is gone before ship writes its first line
+  let err = '';
+  child.stderr.on('data', (b) => { err += b; });
+  const code = await Promise.race([new Promise((resolve) => child.on('close', resolve)), deadline(20_000, 'ship exit')]);
+  assert.equal(err, '');
+  assert.equal(code, 0);
+});

@@ -230,7 +230,7 @@ cache, and does the first of these that applies:
    Otherwise it says when the deploy will start.
 
 **`liveWaitHours`: exit 3.** A land that is not live after `liveWaitHours` (12 by default, at most
-24) says so and ends 3: the merge stays. A failure inside a tick (a Cloudflare read, a spawn of the
+24) says so, naming any hold on a deployable it touches, and ends 3: the merge stays. A failure inside a tick (a Cloudflare read, a spawn of the
 deploy runner that fails) is said once and tried again at the next tick, until that limit.
 
 **The floors.** `requires` names a deployable of another repository that must be live before this
