@@ -326,6 +326,8 @@ test('onQueue hands over the way to withdraw the place, and a withdrawn place st
   let abort = false;
   const waiter = await lineUp(dir, async () => acquire(dir, await ownerInfo({ label: 'w' }), { pollMs: 10, priority: 1, onQueue: (l) => { leave = l; }, isAborted: () => abort })
     .catch((e) => e));
+  // The ticket is on disk a moment before onQueue hands over the way to withdraw it.
+  await waitUntil(() => typeof leave === 'function', 'onQueue to hand over the way to withdraw');
   await leave();
   await sleep(100); // several polls: a waiter that re-filed its ticket would show up here
   assert.deepEqual(ticketsOf(dir), []);

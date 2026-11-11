@@ -245,7 +245,7 @@ live commit is older than the floor, when nothing it changed since is pending.
 ships (it fetches main again once it holds the heavy lane, see above), which can be later than the
 tip the land decided on. So the runner, and only the runner, gives the deploy a `floorsAt(sha)`
 function: the combined floors for a commit, that is the newest recorded floor (one file per merge in
-`$SHIP_TMP/land/<owner>__<repo>/floors/`) of every merge the commit carries, per required repository,
+`$SHIP_TMP/land/<owner>__<repo>/floors/`) of every merge the commit carries and of every pending record, per required repository,
 the same pick the land makes before it starts the deploy. The deploy's `requires` gate asks it for
 the commit it planned, and when main moves while it waits, for the commit it would move to, with
 every requirement asked again. An unmet floor stops the deploy as an unmet `requires` does today

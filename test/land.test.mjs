@@ -482,10 +482,10 @@ test('an error after the merge is exit 3: "merged, but ship failed after the mer
 // PR #7 changes app (a deployable); the fake cloud has app and tick live at the first commit, and time
 // moves only when the land sleeps. `requires` is a JS array literal for the config; `extra(cloudDir)`
 // may add workers and repositories.
-async function setupLandLive({ requires = '[]', workers = {}, remote = null, headConfig = null } = {}) {
+async function setupLandLive({ requires = '[]', workers = {}, remote = null, headConfig = null, ghOptions = {} } = {}) {
   const cloudDir = join(await tempDir('cloud-'), 'cloud');
   const text = configText(join(cloudDir, 'bin', 'wrangler'), { requires, ...(headConfig ? { guard: 'true' } : {}) });
-  const s = await setupLand({ configText: text, baseFiles: FILES, featFiles: { 'app/src/a.ts': 'export const a = 2;\n', ...(headConfig ? { 'ship.config.mjs': headConfig(text) } : {}) } });
+  const s = await setupLand({ configText: text, baseFiles: FILES, ghOptions, featFiles: { 'app/src/a.ts': 'export const a = 2;\n', ...(headConfig ? { 'ship.config.mjs': headConfig(text) } : {}) } });
   const first = (await git(['--git-dir', s.origin, 'rev-list', '--max-parents=0', 'main'], s.work)).trim();
   const cloud = await fakeCloud({ dir: cloudDir, workers: { 'example-app': at(first), 'example-tick': at(first), ...workers }, probe: healthy,
     hosts: { 'https://app.example.com': 'example-app', 'https://tick.example.com': 'example-tick' } });
@@ -591,6 +591,49 @@ test('the floor record is written as soon as the merge commit is known, before t
   before = mainNow();
   assert.equal(await land(s, { deps: set.deps }), 0, s.lines.join('\n'));
   assert.deepEqual(atFirstLook, [`${await s.originMain()}.json`]);
+});
+
+test('a merge commit GitHub names late: the floors are on record before the merge, under the head, until it is named', { timeout: 90_000 }, async () => {
+  const { other, apiMain } = await apiOrigin();
+  const { s, deps } = await setupLandLive({ requires: REQUIRES_API, workers: { 'example-api': at(apiMain) },
+    remote: (origin) => (repo) => (repo === 't/api' ? other.origin : origin), ghOptions: { afterMerge: { mergeCommit: null } } });
+  const head = await headOf(s);
+  const before = await s.originMain();
+  const dir = join(landDir({ tmpRoot: s.deps.tmpRoot }, 't/r'), 'floors');
+  let unnamed = null;
+  // The first wait after main moved: the merge is in, GitHub has not named it. Then GitHub names it.
+  const sleep = async (ms) => {
+    const now = await s.originMain();
+    if (unnamed === null && now !== before) {
+      unnamed = existsSync(dir) ? readdirSync(dir) : [];
+      const live = JSON.parse(await readFile(join(s.root, 'pr-live.json'), 'utf8'));
+      await s.setPr({ ...live, mergeCommit: { oid: now } });
+    }
+    return deps.sleep(ms);
+  };
+  assert.equal(await land(s, { deps: { ...deps, sleep } }), 0, s.lines.join('\n'));
+  const merged = await s.originMain();
+  assert.deepEqual(unnamed, [`pending-${head}.json`]);
+  assert.deepEqual(readdirSync(dir), [`${merged}.json`], 'the record under the merge commit took the pending one\'s place');
+  const rec = JSON.parse(await readFile(join(dir, `${merged}.json`), 'utf8'));
+  assert.deepEqual(rec.floors, { 't/api': apiMain });
+});
+
+test('a merge GitHub refuses leaves no pending floor record behind; one whose outcome is unknown keeps it', { timeout: 90_000 }, async () => {
+  const { other, apiMain } = await apiOrigin();
+  const setup = (ghOptions) => setupLandLive({ requires: REQUIRES_API, workers: { 'example-api': at(apiMain) },
+    remote: (origin) => (repo) => (repo === 't/api' ? other.origin : origin), ghOptions });
+  const floorsIn = (s) => {
+    const dir = join(landDir({ tmpRoot: s.deps.tmpRoot }, 't/r'), 'floors');
+    return existsSync(dir) ? readdirSync(dir) : [];
+  };
+  const refused = await setup({ squash: false, mergeFail: 'Pull request is not mergeable' });
+  assert.equal(await land(refused.s, { deps: refused.deps }), 4, refused.s.lines.join('\n'));
+  assert.deepEqual(floorsIn(refused.s), []);
+
+  const dark = await setup({ squash: false, mergeFail: 'connection reset', afterMerge: { fail: true } });
+  assert.equal(await land(dark.s, { deps: dark.deps }), 5, dark.s.lines.join('\n'));
+  assert.deepEqual(floorsIn(dark.s), [`pending-${await headOf(dark.s)}.json`], 'it may have merged: every deploy is held to its floors');
 });
 
 test('two lands started at the same moment: the one that meets the other on the head lock refuses as a duplicate (exit 2)', async () => {
