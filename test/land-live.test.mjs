@@ -1,4 +1,6 @@
 import { afterEach, test } from 'node:test';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import assert from 'node:assert/strict';
 import { landDeps } from '../lib/land.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -369,6 +371,46 @@ test('a direct deploy\'s own in-progress hold does not end the land: it waits, t
   assert.equal(l.starts.length, 1);
   assert.ok(l.s.lines.includes('… a deploy of this repository is running; waiting for it to end'), l.s.lines.join('\n'));
   assert.match(l.s.lines.at(-1), /^✓ PR #9 is live \(merged as [0-9a-f]{7}\): app at [0-9a-f]{7}$/);
+});
+
+// The other half of the order above: once the runner is gone without an end, the marker it left is
+// a hold like any other, and the land ends with 3 at once instead of waiting out liveWaitHours.
+test('a marker left by a deploy runner that died ends the land with 3, naming the hold', async () => {
+  const l = await landed();
+  const dead = spawn(process.execPath, ['-e', '0'], { stdio: 'ignore' });
+  await once(dead, 'close');
+  l.d.startDeploy = async ({ d, repo, tip }) => {
+    l.starts.push({ tip, at: d.now() });
+    await recordDeployStart({ d, repo, id: 'r1', tip, log: '/dev/null', owner: { pid: dead.pid, pgid: dead.pid, startTime: null } });
+    await writeHold(l.s.deps.stateRoot, repo, 'app', { reason: `deploy of ${tip.slice(0, 7)} in progress since 12:00: if ship is not running, the result was never verified` });
+    return { id: 'r1', log: '/dev/null', pid: dead.pid };
+  };
+  assert.equal(await l.wait(), 3, l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1);
+  assert.match(l.s.lines.at(-1), /^✗ PR #9 merged as [0-9a-f]{7} but not live: app is held since .+: deploy of [0-9a-f]{7} in progress /);
+});
+
+// A deploy that never reads as ended (its runner alive, or a pid reused) keeps the land waiting until
+// liveWaitHours; the line it ends with then names the hold it waited past, so the owner sees why.
+test('the liveWaitHours line names a hold on a touched deployable', async () => {
+  const l = await landed({ land: { liveWaitHours: 0.05 } }); // 3 min: six ticks
+  l.d.startDeploy = async ({ d, repo, tip }) => {
+    l.starts.push({ tip, at: d.now() });
+    await recordDeployStart({ d, repo, id: 'r1', tip, log: '/dev/null', owner: await ownerInfo() });
+    await writeHold(l.s.deps.stateRoot, repo, 'app', { reason: `deploy of ${tip.slice(0, 7)} in progress since 12:00: if ship is not running, the result was never verified` });
+    return { id: 'r1', log: '/dev/null', pid: process.pid };
+  };
+  assert.equal(await l.wait(), 3, l.s.lines.join('\n'));
+  assert.match(l.s.lines.at(-1), /^✗ PR #9 merged as [0-9a-f]{7} but not live after 0\.05 h; app is held since .+: deploy of [0-9a-f]{7} in progress since 12:00: if ship is not running, the result was never verified — ship status$/);
+
+  const plain = await landed({ land: { liveWaitHours: 0.05 } });
+  plain.d.startDeploy = async ({ d, repo, tip }) => {
+    plain.starts.push({ tip, at: d.now() });
+    await recordDeployStart({ d, repo, id: 'r1', tip, log: '/dev/null', owner: await ownerInfo() });
+    return { id: 'r1', log: '/dev/null', pid: process.pid };
+  };
+  assert.equal(await plain.wait(), 3, plain.s.lines.join('\n'));
+  assert.match(plain.s.lines.at(-1), /^✗ PR #9 merged as [0-9a-f]{7} but not live after 0\.05 h — ship status$/);
 });
 
 test('a migration-only PR prints the clearing hint, waits, and is live once its migration is cleared', async () => {
