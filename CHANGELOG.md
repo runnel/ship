@@ -17,6 +17,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `ship land` no longer fails every tick with `could not read what is live` when the directory it was started in is removed while it waits: every git command on a mirror now runs in the directory that holds the mirror, since git reads the working directory before it looks at `--git-dir`.
+- The deploy a land starts is no longer a child of the land: a short-lived intermediate starts the runner and exits, so the runner's parent is init and a tool that stops a session by walking its process tree cannot reach it.
 - `ship land` no longer ends 3 with `not live: … held: deploy of <sha> in progress` while its own `direct` deploy is still running: a running deploy now makes the land wait, and a marker left by a deploy that died is still a hold once nothing runs.
 - When GitHub does not take the first `queued` status, `ship check` prints `✗ local-ci not started: …` and exits 1, instead of an unhandled `Command failed: gh api …` error.
 - `ship check` re-checks a head whose stored result file is torn or malformed, instead of failing.
