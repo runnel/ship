@@ -2,27 +2,27 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.2 - 2026-11-11
 
 ### Added
 
-- `ship land` checks and merges a pull request through a serial line per repository ([Land](docs/checks-and-merge.md#land)), then waits until the merge is live, starting a detached deploy when one is due ([Deploys that ship land starts](docs/deploy.md#deploys-that-ship-land-starts)). It ends 0 when the pull request is live, 3 when it merged but cannot become live. Every land writes a line to `~/.ship/land/<owner>__<repo>.jsonl`.
-- The optional `land` config block (`deployAfterMin`, `debounceSec`, `liveWaitHours`) ([Configure a repository](docs/configuration.md#land)).
+- `ship land --pr N`, a merge queue per repository ([Land](docs/checks-and-merge.md#land)). It checks the pull request against the main it merges onto, one at a time, merges it, starts the deploy when one is due (120 s after the line goes quiet, or within an hour) and ends when the change is live. Exit codes: 0 live, 1 a check failed, 2 refused, 3 merged but not live, 4 error before the merge, 5 merge outcome unknown.
+- The deploy a land starts runs detached from the session that started it, and finishes even if that session is closed ([Deploys that ship land starts](docs/deploy.md#deploys-that-ship-land-starts)).
+- `requires` floors for lands: a deploy waits until what it requires is live at least where it was when each merge it carries was made.
+- One ledger line per land in `~/.ship/land/<owner>__<repo>.jsonl`, for measuring waits.
+- The optional `land` config block: `deployAfterMin`, `debounceSec`, `liveWaitHours` ([Configure a repository](docs/configuration.md#land)).
 
 ### Changed
 
-- The heavy lane has a land priority class between deploy work and checks, for the coming `ship land`; `ship queue` labels each waiter `deploy work, ahead of checks`, `land check, ahead of other checks` or `check`.
-- Ship-internal helpers (check, merge and deploy reads) are exported for the coming `ship land`; no behaviour change.
-- A timed-out `git fetch` now kills the whole process tree, including git's remote helper. Time limits are opt-in, and only `ship land` will set them, so today's commands are unaffected.
+- The heavy lane serves deploy work first, then land checks, then other checks. `ship queue` labels each waiter and shows the land lines.
+- With `ship land`, `ship check` is optional early feedback; the land is the gate.
 
 ### Fixed
 
-- `ship land` no longer fails every tick with `could not read what is live` when the directory it was started in is removed while it waits: every git command on a mirror now runs in the directory that holds the mirror, since git reads the working directory before it looks at `--git-dir`.
-- The deploy a land starts is no longer a child of the land: a short-lived intermediate starts the runner and exits, so the runner's parent is init and a tool that stops a session by walking its process tree cannot reach it.
-- `ship land` no longer ends 3 with `not live: … held: deploy of <sha> in progress` while its own `direct` deploy is still running: a running deploy now makes the land wait, and a marker left by a deploy that died is still a hold once nothing runs.
-- When GitHub does not take the first `queued` status, `ship check` prints `✗ local-ci not started: …` and exits 1, instead of an unhandled `Command failed: gh api …` error.
-- `ship check` re-checks a head whose stored result file is torn or malformed, instead of failing.
-- A check on Cloudflare Workers Builds whose build has not started after 5 minutes goes back in line, instead of waiting out `timeoutMin` for a build that may have been skipped: a skipped build leaves no check run to read.
+- `ship check` exits 1 with `✗ local-ci not started: …` when GitHub does not take the first status, instead of an unhandled error.
+- `ship check` re-checks a head whose stored result file is torn.
+- A Cloudflare Workers Builds check whose build has not started after 5 minutes goes back in line instead of waiting out `timeoutMin`.
+- A timed-out `git fetch` kills its whole process tree. Git calls on a mirror no longer depend on the current directory, and `SHIP_HOME`/`SHIP_TMP` are made absolute.
 
 ## 0.1 - 2026-11-03
 
