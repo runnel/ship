@@ -283,3 +283,17 @@ test('git calls on a mirror do not depend on the process\'s working directory', 
     process.chdir(before);
   }
 });
+
+test('a relative SHIP_HOME and SHIP_TMP still give a working mirror: git runs beside it with absolute paths', async () => {
+  const o = await makeOrigin({ 'a.txt': 'a\n' });
+  const cwd = await tempDir('relative-');
+  const script = `
+    import { ensureMirror, revParse } from ${JSON.stringify(new URL('../lib/git.mjs', import.meta.url).href)};
+    const mirror = await ensureMirror('t/r', { url: ${JSON.stringify(o.origin)} });
+    console.log(mirror, await revParse(mirror, 'refs/heads/main'));
+  `;
+  const out = await capture(process.execPath, ['--input-type=module', '-e', script], { cwd, env: { ...process.env, SHIP_HOME: 'rel-home', SHIP_TMP: 'rel-tmp' } });
+  const [mirror, sha] = out.trim().split(' ');
+  assert.ok(mirror.startsWith('/'), `the mirror path is absolute: ${mirror}`);
+  assert.match(sha, /^[0-9a-f]{40}$/);
+});
