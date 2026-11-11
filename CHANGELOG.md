@@ -17,6 +17,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `ship land` no longer ends 3 with `not live: … held: deploy of <sha> in progress` while its own `direct` deploy is still running: a running deploy now makes the land wait, and a marker left by a deploy that died is still a hold once nothing runs.
 - When GitHub does not take the first `queued` status, `ship check` prints `✗ local-ci not started: …` and exits 1, instead of an unhandled `Command failed: gh api …` error.
 - `ship check` re-checks a head whose stored result file is torn or malformed, instead of failing.
 - A check on Cloudflare Workers Builds whose build has not started after 5 minutes goes back in line, instead of waiting out `timeoutMin` for a build that may have been skipped: a skipped build leaves no check run to read.

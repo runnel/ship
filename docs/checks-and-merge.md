@@ -216,11 +216,13 @@ cache, and does the first of these that applies:
    deploy. The pull request that added it prints the hint how to clear it (`! PR #42 added
    migration(s) not cleared for deploy: …`); every other land prints `… waiting for migration
    <file> (#<pr>)`. They wait: the owner clears it, a deploy never goes past one.
-4. **A hold on a deployable the merge touched: exit 3**, naming the hold; the owner decides.
-5. **`requires`.** Each `requires` entry of the config must be live at or past its floor (below);
+4. **A deploy is running.** One a land started, or any other that holds the deploy lock: the land
+   waits for it to end. This comes before the hold check, because a `direct` deploy writes its own
+   `deploy of <sha> in progress` hold while it runs and clears it when it ends 0.
+5. **A hold on a deployable the merge touched: exit 3**, naming the hold; the owner decides. With
+   nothing running, a marker a dead deploy left is such a hold.
+6. **`requires`.** Each `requires` entry of the config must be live at or past its floor (below);
    until then the land waits and says what for.
-6. **A deploy is running.** One a land started, or any other that holds the deploy lock: the land
-   waits for it to end.
 7. **A deploy that ended 0 for this tip.** A deploy that ended with code 0 for the current tip of
    main is never run again; the land waits for it to show as live.
 8. **Start the deploy**, once the land line has been quiet for `debounceSec`, or a merge has

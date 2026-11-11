@@ -230,11 +230,12 @@ test('decide: a migration-only PR is live once its migration is cleared, and wai
   assert.deepEqual(step(facts(), only), { done: 0, line: '✓ PR #7 is live (merged as aaaaaaa): 1 migration(s) cleared' });
 });
 
-test('decide, steps 6 and 2–4 in order: a failed deploy, a migration at the tip, a hold, a requirement', () => {
+test('decide, steps 6 and 2–4 in order: a failed deploy, a migration at the tip, a running deploy, a hold, a requirement', () => {
   const failed = { tip: TIP, code: 1, log: '/x.out' };
   assert.deepEqual(step(facts({ failed, tipUncleared: [{ file: 'db/9.sql', ours: false, by: '#12' }] })), { done: 3, line: '✗ PR #7 merged as aaaaaaa but not live: the deploy of main@bbbbbbb ended with exit 1 (output: /x.out) — the owner decides; ship status' });
   assert.deepEqual(step(facts({ tipUncleared: [{ file: 'db/9.sql', ours: false, by: '#12' }], holds: { app: { reason: 'x', at: null } } })), { wait: 'migration' }, 'the migration gate comes before the hold');
   assert.equal(step(facts({ holds: { app: { reason: 'x', at: null } } })).done, 3);
+  assert.deepEqual(step(facts({ deployRunning: true, holds: { app: { reason: 'deploy of bbbbbbb in progress since 12:00', at: null } } })), { wait: 'deploying', line: '… a deploy of this repository is running; waiting for it to end' }, 'a running deploy comes before the hold: its own in-progress marker is not a verdict');
   const unmet = { repo: 't/api', deployable: 'app', floor: 'c'.repeat(40), met: false, now: 'live at ddddddd' };
   assert.deepEqual(step(facts({ requires: [unmet] })), { wait: 'requires', line: '… waiting for t/api app to be live at or past ccccccc (live at ddddddd)' });
   assert.deepEqual(step(facts({ deployRunning: true })), { wait: 'deploying', line: '… a deploy of this repository is running; waiting for it to end' });
@@ -254,11 +255,12 @@ test('decide: an ok deploy of an older tip is ignored; this merge deploys on deb
   assert.equal(step(facts({ deployedOk: { tip: OLD }, tipAtMs: T0 - 10_000 })).wait, 'debounce');
 });
 
-test('decide: failed, a migration, a hold, a requirement and a running deploy all outrank a matching deployedOk', () => {
+test('decide: failed, a migration, a running deploy, a hold and a requirement all outrank a matching deployedOk', () => {
   const ok = { deployedOk: { tip: TIP } };
   assert.equal(step(facts({ ...ok, failed: { tip: TIP, code: 1, log: '/x.out' } })).done, 3);
   assert.equal(step(facts({ ...ok, tipUncleared: [{ file: 'db/9.sql', ours: false, by: '#12' }] })).wait, 'migration');
   assert.equal(step(facts({ ...ok, holds: { app: { reason: 'x', at: null } } })).done, 3);
+  assert.equal(step(facts({ ...ok, deployRunning: true, holds: { app: { reason: 'x', at: null } } })).wait, 'deploying');
   assert.equal(step(facts({ ...ok, requires: [{ repo: 't/api', deployable: 'app', floor: 'c'.repeat(40), now: 'd'.repeat(7), met: false }] })).wait, 'requires');
   assert.equal(step(facts({ ...ok, deployRunning: true })).wait, 'deploying');
 });
@@ -343,6 +345,30 @@ test('a hold on a deployable the PR touches ends the land with 3; a hold elsewhe
   assert.equal(await elsewhere.wait(), 0, elsewhere.s.lines.join('\n'));
   assert.equal(elsewhere.starts.length, 1, 'the deploy ran (and returned 1 for the held tick)');
   assert.match(elsewhere.s.lines.at(-1), /^✓ PR #9 is live \(merged as [0-9a-f]{7}\): app at [0-9a-f]{7}$/);
+});
+
+test('a direct deploy\'s own in-progress hold does not end the land: it waits, then is live when the deploy ends 0', async () => {
+  // As in a real run: the deploy is running and its adapter has written `deploy of <sha> in progress`
+  // for the touched deployable. It ends 0 a tick later, clears the hold and the deployable is live.
+  let sinceStart = 0;
+  const l = await landed({ onTick: async (n, { s, d, starts }) => {
+    if (starts.length === 0 || ++sinceStart < 3) return; // two ticks pass with the deploy running
+    if (sinceStart > 3) return;
+    const v = s.cloud.addVersion('example-app', { message: `sha:${s.head} x` });
+    s.cloud.addDeployment('example-app', v.id, { message: `sha:${s.head} x` });
+    await clearHold(s.deps.stateRoot, 't/r', 'app');
+    await recordDeployEnd({ d, repo: 't/r', id: 'r1', tip: starts[0].tip, code: 0, log: '/dev/null' });
+  } });
+  l.d.startDeploy = async ({ d, repo, tip }) => {
+    l.starts.push({ tip, at: d.now() });
+    await recordDeployStart({ d, repo, id: 'r1', tip, log: '/dev/null', owner: await ownerInfo() });
+    await writeHold(l.s.deps.stateRoot, repo, 'app', { reason: `deploy of ${tip.slice(0, 7)} in progress since 12:00: if ship is not running, the result was never verified` });
+    return { id: 'r1', log: '/dev/null', pid: process.pid };
+  };
+  assert.equal(await l.wait(), 0, l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1);
+  assert.ok(l.s.lines.includes('… a deploy of this repository is running; waiting for it to end'), l.s.lines.join('\n'));
+  assert.match(l.s.lines.at(-1), /^✓ PR #9 is live \(merged as [0-9a-f]{7}\): app at [0-9a-f]{7}$/);
 });
 
 test('a migration-only PR prints the clearing hint, waits, and is live once its migration is cleared', async () => {
