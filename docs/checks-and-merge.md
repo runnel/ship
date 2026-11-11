@@ -239,11 +239,15 @@ at the moment of the merge, read before the merge while the land holds the merge
 requirements of main's config and of the pull request's are both read; a pull request whose config
 does not load under this ship (an old branch, a function config that needs files only main has) is
 held to main's `requires` only, and one the pull request adds itself is held by the strict rule
-below. A floor that cannot be read, or main's config, is exit 4 before the merge. The floors are
-recorded per merge commit in `$SHIP_TMP/land/<owner>__<repo>/floors/<sha>.json` as soon as the
-merge commit is named, and pruned after 24 hours. A deploy is held to the newest floor of every
-merge it carries, so a deploy another land starts does not skip a requirement of yours. A merge
-with no record is held to the required repository's main now.
+below. A floor that cannot be read, or main's config, is exit 4 before the merge. An object config
+is read straight from the mirror; only a function config is evaluated in a checkout. Before the
+merge the floors are recorded under the head (`floors/pending-<head>.json`): until GitHub names the
+merge commit, no deploy can tell whether it carries the merge, so every deploy of the repository is
+held to a pending record. Once the merge commit is named, the record moves to
+`$SHIP_TMP/land/<owner>__<repo>/floors/<sha>.json`; a merge GitHub refused drops it, and one whose
+outcome is unknown keeps it. Records are pruned after 24 hours. A deploy is held to the newest
+floor of every merge it carries, so a deploy another land starts does not skip a requirement of
+yours. A merge with no record is held to the required repository's main now.
 
 **What is live.** The land does not call Cloudflare itself. It reads
 `$SHIP_TMP/land/<owner>__<repo>/live.json`, a cache that the deploy plan refreshes: whichever land
