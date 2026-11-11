@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, readFile, mkdir, readdir, utimes, writeFile, chmod } from 'node:fs/promises';
+import { access, readFile, mkdir, readdir, rm, utimes, writeFile, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ensureMirror, mirrorPath, fetchCommit, revParse, addWorktree, removeWorktree, mergeInto, changedFiles, showFile, isAncestor, listTree, commitsTouching, subject, lastCommitBefore, commitTimeMs, addedIn } from '../lib/git.mjs';
 import { validateConfig } from '../lib/config.mjs';
@@ -259,4 +259,27 @@ test('commitTimeMs and addedIn: a commit\'s time, and the commit that added a fi
   assert.equal(await addedIn(mirror, 'refs/heads/main', 'db/none.sql'), null);
   const t = await commitTimeMs(mirror, added);
   assert.ok(Math.abs(t - Date.now()) < 120_000 && t % 1000 === 0, String(t));
+});
+
+test('git calls on a mirror do not depend on the process\'s working directory', async () => {
+  const { head, mirror, root } = await branchAndMain({ feat: { 'src/x.ts': 'x\n' }, main: { 'b.txt': 'b\n' } });
+  await fetchCommit(mirror, head, 1);
+  const url = (await capture('git', ['--git-dir', mirror, 'config', 'remote.origin.url'], { cwd: root })).trim();
+  const gone = await tempDir('gone-cwd-');
+  const before = process.cwd();
+  process.chdir(gone);
+  try {
+    await rm(gone, { recursive: true, force: true });
+    assert.equal(await ensureMirror('t/r', { root: join(root, 'mirrors'), url, fetchTimeoutMs: 30_000 }), mirror);
+    assert.equal(await ensureMirror('t/r', { root: join(root, 'mirrors'), url }), mirror);
+    const mainSha = await revParse(mirror, 'refs/heads/main');
+    assert.equal(await isAncestor(mirror, head, mainSha), false);
+    assert.deepEqual(await changedFiles(mirror, mainSha, head), ['src/x.ts']);
+    assert.equal(await showFile(mirror, 'refs/heads/main', 'a.txt'), 'a\n');
+    assert.equal(await subject(mirror, mainSha), 'main moves');
+    assert.ok((await commitTimeMs(mirror, mainSha)) > 0);
+    assert.deepEqual((await commitsTouching(mirror, head, mainSha, ['b.txt'])).map((c) => c.subject), ['main moves']);
+  } finally {
+    process.chdir(before);
+  }
 });
