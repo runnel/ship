@@ -165,6 +165,29 @@ test('an ensureMirror sweeps the stale staging directory of a clone that was kil
   assert.deepEqual((await readdir(root)).sort(), ['other__repo.git.new-old', 't__r.git', 't__r.git.new-fresh']);
 });
 
+test('a fetch killed outright leaves ref locks behind: the next ensureMirror removes the stale ones and fetches', async () => {
+  const o = await makeOrigin({ 'a.txt': 'a\n' });
+  const root = join(await tempDir(), 'mirrors');
+  const mirror = await ensureMirror('t/r', { root, url: o.origin });
+  const sha = await commitFiles(o.work, { 'c.txt': 'c\n' }, 'more');
+  await git(['push', '--quiet', 'origin', 'main'], o.work);
+  // What a SIGKILLed fetch leaves: the lock of the ref it was moving, and of packed-refs and config.
+  const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000);
+  const stale = ['refs/heads/main.lock', 'packed-refs.lock', 'config.lock'];
+  for (const name of stale) {
+    await writeFile(join(mirror, name), '');
+    await utimes(join(mirror, name), twoMinutesAgo, twoMinutesAgo);
+  }
+  // A fresh lock may be a git call that runs now (an overflow check moves its own refs outside the
+  // mirror lock): it stays.
+  await mkdir(join(mirror, 'refs', 'ship', 'cloudflare'), { recursive: true });
+  await writeFile(join(mirror, 'refs', 'ship', 'cloudflare', 'abc.lock'), '');
+  await ensureMirror('t/r', { root, url: o.origin });
+  assert.equal(await revParse(mirror, 'refs/heads/main'), sha);
+  for (const name of stale) assert.equal(await access(join(mirror, name)).then(() => true, () => false), false, name);
+  await access(join(mirror, 'refs', 'ship', 'cloudflare', 'abc.lock'));
+});
+
 test('isAncestor, listTree, commitsTouching, subject', async () => {
   const { origin, work, root } = await makeOrigin({ 'app/a.ts': '1', 'db/001.sql': '' });
   const first = (await git(['rev-parse', 'HEAD'], work)).trim();

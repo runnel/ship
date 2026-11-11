@@ -1,10 +1,13 @@
 import { afterEach, test } from 'node:test';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import assert from 'node:assert/strict';
 import { landDeps } from '../lib/land.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { contains, decide, landedChanges, liveFor, readLiveCache, recordFloors, waitLive } from '../lib/land-live.mjs';
+import { contains, decide, landedChanges, liveFor, readLiveCache, recordFloors, requiredFloors, waitLive } from '../lib/land-live.mjs';
+import { recordPendingFloors } from '../lib/land-floors.mjs';
 import { recordDeployEnd, recordDeployStart } from '../lib/land-deploy.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { iso, landDir } from '../lib/land-line.mjs';
@@ -371,6 +374,47 @@ test('a direct deploy\'s own in-progress hold does not end the land: it waits, t
   assert.match(l.s.lines.at(-1), /^✓ PR #9 is live \(merged as [0-9a-f]{7}\): app at [0-9a-f]{7}$/);
 });
 
+// The other half of the order above: once the runner is gone without an end, the marker it left is
+// a hold like any other, and the land ends with 3 at once instead of waiting out liveWaitHours.
+test('a marker left by a deploy runner that died ends the land with 3, naming the hold', async () => {
+  const l = await landed();
+  const dead = spawn(process.execPath, ['-e', '0'], { stdio: 'ignore' });
+  await once(dead, 'close');
+  l.d.startDeploy = async ({ d, repo, tip }) => {
+    l.starts.push({ tip, at: d.now() });
+    await recordDeployStart({ d, repo, id: 'r1', tip, log: '/dev/null', owner: { pid: dead.pid, pgid: dead.pid, startTime: null } });
+    await writeHold(l.s.deps.stateRoot, repo, 'app', { reason: `deploy of ${tip.slice(0, 7)} in progress since 12:00: if ship is not running, the result was never verified` });
+    return { id: 'r1', log: '/dev/null', pid: dead.pid };
+  };
+  assert.equal(await l.wait(), 3, l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1);
+  assert.match(l.s.lines.at(-1), /^✗ PR #9 merged as [0-9a-f]{7} but not live: app is held since .+: deploy of [0-9a-f]{7} in progress /);
+});
+
+// A deploy that never reads as ended (its runner alive, or a pid reused) keeps the land waiting until
+// liveWaitHours; the line it ends with then names the hold it waited past, so the owner sees why.
+test('the liveWaitHours line names a hold on a touched deployable', async () => {
+  const land = { liveWaitHours: 0.05, debounceSec: 30 }; // 3 min: six ticks; the deploy starts on the second
+  const l = await landed({ land });
+  l.d.startDeploy = async ({ d, repo, tip }) => {
+    l.starts.push({ tip, at: d.now() });
+    await recordDeployStart({ d, repo, id: 'r1', tip, log: '/dev/null', owner: await ownerInfo() });
+    await writeHold(l.s.deps.stateRoot, repo, 'app', { reason: `deploy of ${tip.slice(0, 7)} in progress since 12:00: if ship is not running, the result was never verified` });
+    return { id: 'r1', log: '/dev/null', pid: process.pid };
+  };
+  assert.equal(await l.wait(), 3, l.s.lines.join('\n'));
+  assert.match(l.s.lines.at(-1), /^✗ PR #9 merged as [0-9a-f]{7} but not live after 0\.05 h; app is held since .+: deploy of [0-9a-f]{7} in progress since 12:00: if ship is not running, the result was never verified — ship status$/);
+
+  const plain = await landed({ land });
+  plain.d.startDeploy = async ({ d, repo, tip }) => {
+    plain.starts.push({ tip, at: d.now() });
+    await recordDeployStart({ d, repo, id: 'r1', tip, log: '/dev/null', owner: await ownerInfo() });
+    return { id: 'r1', log: '/dev/null', pid: process.pid };
+  };
+  assert.equal(await plain.wait(), 3, plain.s.lines.join('\n'));
+  assert.match(plain.s.lines.at(-1), /^✗ PR #9 merged as [0-9a-f]{7} but not live after 0\.05 h — ship status$/);
+});
+
 test('a migration-only PR prints the clearing hint, waits, and is live once its migration is cleared', async () => {
   const m = await landed({ change: { 'db/002_x.sql': '' }, onTick: async (n, { s }) => { if (n === 2) await addAcks(s.deps.stateRoot, 't/r', ['db/002_x.sql']); } });
   assert.equal(await m.wait(), 0, m.s.lines.join('\n'));
@@ -559,6 +603,50 @@ test('a floor recorded for a merge the tip does not carry is not held to', async
   await recordFloors({ d: l.d, repo: 't/r', mergeSha: 'c'.repeat(40), floors: { 't/api': rq.otherSecond } });
   assert.equal(await l.wait({ floors: { 't/api': rq.otherFirst } }), 0, l.s.lines.join('\n'));
   assert.equal(l.starts.length, 1);
+});
+
+test('a pending floor record (the merge commit not named yet) is held to by every tip until the named record replaces it', async () => {
+  const rq = await requiresSetup();
+  const head = 'c'.repeat(40);
+  let resolvedAt = null;
+  const l = await landed({ from: rq.s, ack: [], onTick: async (n, { d }) => {
+    if (n !== 7) return; // the deploy is due from the fifth tick on
+    resolvedAt = d.now();
+    // Named at last: a merge commit this tip does not carry, so its floor no longer applies here.
+    await recordFloors({ d, repo: 't/r', mergeSha: 'd'.repeat(40), floors: { 't/api': rq.otherSecond }, headSha: head });
+  } });
+  await recordPendingFloors({ d: l.d, repo: 't/r', headSha: head, floors: { 't/api': rq.otherSecond } });
+  assert.equal(await l.wait({ floors: { 't/api': rq.otherFirst } }), 0, l.s.lines.join('\n'));
+  assert.ok(l.s.lines.some((x) => x.startsWith(`… waiting for t/api app to be live at or past ${rq.otherSecond.slice(0, 7)} (live at ${rq.otherFirst.slice(0, 7)}) before deploying`)), l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1);
+  assert.ok(l.starts[0].at >= resolvedAt, 'the deploy waited until the pending record was resolved');
+});
+
+test('requiredFloors reads an object config without a checkout', async () => {
+  const rq = await requiresSetup();
+  const tmpRoot = join(rq.s.root, 'tmp-no-worktrees');
+  await mkdir(tmpRoot, { recursive: true });
+  await writeFile(join(tmpRoot, 'w'), 'a file where the worktrees would go: none can be made');
+  const d = { ...landDeps(), ...rq.s.deps, tmpRoot };
+  const r = await syncMirror({ repo: 't/r', d });
+  assert.deepEqual(await requiredFloors({ d, r, head: rq.s.head }), { 't/api': rq.otherSecond });
+});
+
+test('requiredFloors evaluates a function config in a checkout of its commit', async () => {
+  const rq = await requiresSetup();
+  const text = await readFile(join(rq.s.work, 'ship.config.mjs'), 'utf8');
+  const fn = `${text.replace('export default {', 'const cfg = {')}
+export default async ({ root }) => {
+  const { readFileSync } = await import('node:fs');
+  readFileSync(root + '/ship.config.mjs');
+  return cfg;
+};\n`;
+  const head = await commitFiles(rq.s.work, { 'ship.config.mjs': fn }, 'function config (#10)');
+  await git(['push', '--quiet', rq.s.deps.remoteUrl('t/r'), 'main'], rq.s.work);
+  const d = { ...landDeps(), ...rq.s.deps };
+  const r = await syncMirror({ repo: 't/r', d });
+  assert.equal(r.mainSha, head);
+  assert.deepEqual(await requiredFloors({ d, r, head }), { 't/api': rq.otherSecond });
 });
 
 test('waitLive with no floor for a required repository holds it to that repository\'s main now', async () => {

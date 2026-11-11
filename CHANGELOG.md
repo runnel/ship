@@ -2,6 +2,19 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Changed
+
+- A land reads an object `ship.config.mjs` for its floors straight from the mirror; only a function config is evaluated in a checkout.
+
+### Fixed
+
+- `ship queue | head` and other early-closing readers no longer end ship with an unhandled `EPIPE`; the command runs to its own end.
+- A land that waits out `liveWaitHours` names the hold on a deployable it touches in its last line.
+- A land records its floors under the head before the merge, so a deploy in the moments before GitHub names the merge commit is held to them too.
+- A git killed outright no longer leaves the shared mirror locked: ref, `packed-refs`, `HEAD` and `config` locks older than a minute are removed before the next fetch.
+
 ## 0.2 - 2026-11-11
 
 ### Added
