@@ -4,7 +4,8 @@ import { landDeps } from '../lib/land.mjs';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { contains, decide, landedChanges, liveFor, readLiveCache, recordFloors, waitLive } from '../lib/land-live.mjs';
+import { contains, decide, landedChanges, liveFor, readLiveCache, recordFloors, requiredFloors, waitLive } from '../lib/land-live.mjs';
+import { recordPendingFloors } from '../lib/land-floors.mjs';
 import { recordDeployEnd, recordDeployStart } from '../lib/land-deploy.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { iso, landDir } from '../lib/land-line.mjs';
@@ -559,6 +560,50 @@ test('a floor recorded for a merge the tip does not carry is not held to', async
   await recordFloors({ d: l.d, repo: 't/r', mergeSha: 'c'.repeat(40), floors: { 't/api': rq.otherSecond } });
   assert.equal(await l.wait({ floors: { 't/api': rq.otherFirst } }), 0, l.s.lines.join('\n'));
   assert.equal(l.starts.length, 1);
+});
+
+test('a pending floor record (the merge commit not named yet) is held to by every tip until the named record replaces it', async () => {
+  const rq = await requiresSetup();
+  const head = 'c'.repeat(40);
+  let resolvedAt = null;
+  const l = await landed({ from: rq.s, ack: [], onTick: async (n, { d }) => {
+    if (n !== 7) return; // the deploy is due from the fifth tick on
+    resolvedAt = d.now();
+    // Named at last: a merge commit this tip does not carry, so its floor no longer applies here.
+    await recordFloors({ d, repo: 't/r', mergeSha: 'd'.repeat(40), floors: { 't/api': rq.otherSecond }, headSha: head });
+  } });
+  await recordPendingFloors({ d: l.d, repo: 't/r', headSha: head, floors: { 't/api': rq.otherSecond } });
+  assert.equal(await l.wait({ floors: { 't/api': rq.otherFirst } }), 0, l.s.lines.join('\n'));
+  assert.ok(l.s.lines.some((x) => x.startsWith(`… waiting for t/api app to be live at or past ${rq.otherSecond.slice(0, 7)} (live at ${rq.otherFirst.slice(0, 7)}) before deploying`)), l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1);
+  assert.ok(l.starts[0].at >= resolvedAt, 'the deploy waited until the pending record was resolved');
+});
+
+test('requiredFloors reads an object config without a checkout', async () => {
+  const rq = await requiresSetup();
+  const tmpRoot = join(rq.s.root, 'tmp-no-worktrees');
+  await mkdir(tmpRoot, { recursive: true });
+  await writeFile(join(tmpRoot, 'w'), 'a file where the worktrees would go: none can be made');
+  const d = { ...landDeps(), ...rq.s.deps, tmpRoot };
+  const r = await syncMirror({ repo: 't/r', d });
+  assert.deepEqual(await requiredFloors({ d, r, head: rq.s.head }), { 't/api': rq.otherSecond });
+});
+
+test('requiredFloors evaluates a function config in a checkout of its commit', async () => {
+  const rq = await requiresSetup();
+  const text = await readFile(join(rq.s.work, 'ship.config.mjs'), 'utf8');
+  const fn = `${text.replace('export default {', 'const cfg = {')}
+export default async ({ root }) => {
+  const { readFileSync } = await import('node:fs');
+  readFileSync(root + '/ship.config.mjs');
+  return cfg;
+};\n`;
+  const head = await commitFiles(rq.s.work, { 'ship.config.mjs': fn }, 'function config (#10)');
+  await git(['push', '--quiet', rq.s.deps.remoteUrl('t/r'), 'main'], rq.s.work);
+  const d = { ...landDeps(), ...rq.s.deps };
+  const r = await syncMirror({ repo: 't/r', d });
+  assert.equal(r.mainSha, head);
+  assert.deepEqual(await requiredFloors({ d, r, head }), { 't/api': rq.otherSecond });
 });
 
 test('waitLive with no floor for a required repository holds it to that repository\'s main now', async () => {

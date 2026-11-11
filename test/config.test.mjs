@@ -58,6 +58,13 @@ test('loads a function export and passes root', async () => {
   assert.deepEqual(c.checks[0].paths, ['r/**']);
 });
 
+test('without a checkout (root null): an object export loads, a function export is not called', async () => {
+  const c = await loadConfigSource(`export default ${JSON.stringify(base)};`, { root: null });
+  assert.equal(c.repo, 'acme/app');
+  const src = `export default () => { throw new Error('called'); };`;
+  await assert.rejects(() => loadConfigSource(src, { root: null }), (e) => e.needsTree === true && /needs a checkout/.test(e.message));
+});
+
 test('a syntax error surfaces as an error', async () => {
   await assert.rejects(() => loadConfigSource('export default {', { root: '.' }));
 });
