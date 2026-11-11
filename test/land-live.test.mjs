@@ -393,7 +393,8 @@ test('a marker left by a deploy runner that died ends the land with 3, naming th
 // A deploy that never reads as ended (its runner alive, or a pid reused) keeps the land waiting until
 // liveWaitHours; the line it ends with then names the hold it waited past, so the owner sees why.
 test('the liveWaitHours line names a hold on a touched deployable', async () => {
-  const l = await landed({ land: { liveWaitHours: 0.05 } }); // 3 min: six ticks
+  const land = { liveWaitHours: 0.05, debounceSec: 30 }; // 3 min: six ticks; the deploy starts on the second
+  const l = await landed({ land });
   l.d.startDeploy = async ({ d, repo, tip }) => {
     l.starts.push({ tip, at: d.now() });
     await recordDeployStart({ d, repo, id: 'r1', tip, log: '/dev/null', owner: await ownerInfo() });
@@ -403,7 +404,7 @@ test('the liveWaitHours line names a hold on a touched deployable', async () => 
   assert.equal(await l.wait(), 3, l.s.lines.join('\n'));
   assert.match(l.s.lines.at(-1), /^✗ PR #9 merged as [0-9a-f]{7} but not live after 0\.05 h; app is held since .+: deploy of [0-9a-f]{7} in progress since 12:00: if ship is not running, the result was never verified — ship status$/);
 
-  const plain = await landed({ land: { liveWaitHours: 0.05 } });
+  const plain = await landed({ land });
   plain.d.startDeploy = async ({ d, repo, tip }) => {
     plain.starts.push({ tip, at: d.now() });
     await recordDeployStart({ d, repo, id: 'r1', tip, log: '/dev/null', owner: await ownerInfo() });
