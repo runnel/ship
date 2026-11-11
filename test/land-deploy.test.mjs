@@ -6,6 +6,7 @@ import { readdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
+import { capture } from '../lib/proc.mjs';
 import { addAcks } from '../lib/state.mjs';
 import { landDir } from '../lib/land-line.mjs';
 import { deployRunning, migrationRefusal, readDeploys, recordDeployEnd, recordDeployStart, runDetachedDeploy, startDetachedDeploy } from '../lib/land-deploy.mjs';
@@ -154,11 +155,58 @@ setInterval(() => {}, 1000);
   assert.equal(await isGone(runnerPid, 10_000), true);
 });
 
+test('the runner is started by a short-lived intermediate: it is adopted, not a child of the land, its pid is the one recorded, it leads its own group', { timeout: 60_000 }, async () => {
+  const dir = await tempDir('double-fork-');
+  const d = { tmpRoot: join(dir, 'tmp'), logRoot: join(dir, 'logs'), mirrorRoot: join(dir, 'm'), stateRoot: join(dir, 'state') };
+  const go = join(dir, 'go');
+  const runner = join(dir, 'runner.mjs');
+  await writeFile(runner, `
+import { existsSync } from 'node:fs';
+export async function runDetachedDeploy() {
+  process.stdout.write('runner pid ' + process.pid + '\\n');
+  while (!existsSync(${JSON.stringify(go)})) await new Promise((r) => setTimeout(r, 20));
+  return 0;
+}
+`);
+  let starterPid;
+  const spawnFn = (...a) => { const c = spawn(...a); starterPid = c.pid; return c; };
+  const s = await startDetachedDeploy({ d, repo: 't/r', cwd: dir, tip: TIP, floors: {}, runnerUrl: pathToFileURL(runner).href, spawnFn });
+  atTestEnd(() => { writeFile(go, '').catch(() => {}); killQuietly(s.pid); });
+  await waitUntil(async () => (await readFile(s.log, 'utf8').catch(() => '')).includes('runner pid'), 'the runner runs');
+  assert.ok((await readFile(s.log, 'utf8')).includes(`runner pid ${s.pid}`), 'the returned pid is the runner, not the intermediate');
+  const [ppid, pgid] = (await capture('ps', ['-o', 'ppid=,pgid=', '-p', String(s.pid)])).trim().split(/\s+/).map(Number);
+  assert.ok(starterPid > 0 && starterPid !== s.pid, 'the intermediate is a process of its own');
+  assert.notEqual(ppid, process.pid, 'the runner is not a child of the land');
+  assert.notEqual(ppid, starterPid, 'nor of the intermediate that started it (init, or a subreaper, adopted it)');
+  assert.equal(await isGone(starterPid, 10_000), true, 'the intermediate has exited');
+  assert.equal(pgid, s.pid, 'it leads a process group of its own');
+  assert.deepEqual((await readDeploys({ d, repo: 't/r' })).running.map((x) => [x.pid, x.pgid]), [[s.pid, s.pid]]);
+  await writeFile(go, '');
+  assert.equal(await isGone(s.pid, 10_000), true);
+});
+
 test('a runner that cannot be spawned is an error, not a start record without a pid', async () => {
   const dir = await tempDir('nospawn-');
   const d = { tmpRoot: join(dir, 'tmp'), logRoot: join(dir, 'logs'), mirrorRoot: join(dir, 'm'), stateRoot: join(dir, 'state') };
   const failing = () => { const c = new EventEmitter(); c.pid = undefined; c.unref = () => {}; return c; };
   await assert.rejects(startDetachedDeploy({ d, repo: 't/r', cwd: dir, tip: TIP, floors: {}, spawnFn: failing }), /could not start the deploy runner/);
+  assert.deepEqual(await records(d), []);
+});
+
+test('an intermediate that exits non-zero or reports no valid pid is an error and leaves no start record', async () => {
+  const dir = await tempDir('badstarter-');
+  const d = { tmpRoot: join(dir, 'tmp'), logRoot: join(dir, 'logs'), mirrorRoot: join(dir, 'm'), stateRoot: join(dir, 'state') };
+  const starter = (code, said) => () => {
+    const c = new EventEmitter();
+    c.pid = 4242; c.stdout = new EventEmitter(); c.kill = () => {};
+    setImmediate(() => { if (said !== null) c.stdout.emit('data', said); c.emit('close', code); });
+    return c;
+  };
+  for (const [code, said] of [[1, '4242\n'], [0, ''], [0, 'junk\n'], [0, '0\n'], [0, '-5\n']]) {
+    await assert.rejects(startDetachedDeploy({ d, repo: 't/r', cwd: dir, tip: TIP, floors: {}, spawnFn: starter(code, said) }),
+      (e) => /could not start the deploy runner/.test(e.message) && e.message.includes(`exited ${code}`) && /\.out\b/.test(e.message) && e.message.includes(d.logRoot),
+      `${code} ${JSON.stringify(said)}`);
+  }
   assert.deepEqual(await records(d), []);
 });
 

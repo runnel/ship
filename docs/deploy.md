@@ -210,7 +210,10 @@ decide at the same moment take a lock, so only one starts it.
 
 The deploy is **detached**: its own session and process group, nothing ties it to the land, so a
 closed terminal or an interrupted land does not reach it (an interrupt in the promote step would
-leave a hold). It runs in `$SHIP_TMP`, not in the checkout the land was started from, which may be
+leave a hold). The land starts it through a short-lived intermediate process that starts the runner
+and exits at once, so the runner's parent is init, not the land: a tool that closes a session by
+walking its process tree does not find it. The land takes the runner's pid from the intermediate
+and records that one. It runs in `$SHIP_TMP`, not in the checkout the land was started from, which may be
 removed meanwhile. It is ship that runs there, with the land's time limits for `gh` calls and
 fetches: one that hits its limit fails that deploy like any other failure, so the lands whose merge
 it carried exit 3 and no land deploys that tip again. Its steps get the minimal environment as
