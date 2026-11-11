@@ -2,6 +2,13 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- `ship queue | head` and other early-closing readers no longer end ship with an unhandled `EPIPE`; the command runs to its own end.
+- A land that waits out `liveWaitHours` names the hold on a deployable it touches in its last line.
+
 ## 0.2 - 2026-11-11
 
 ### Added

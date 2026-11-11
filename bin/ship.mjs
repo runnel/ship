@@ -17,6 +17,11 @@ if (process.env.SHIP_GROUP_LEADER !== '1') {
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => forward(sig));
   child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
 } else {
+  // A reader that stops early (`ship queue | head`) closes the pipe: the output has nowhere to go,
+  // and the command runs to its own end without it. A land or a deploy is never cut short by it.
+  for (const stream of [process.stdout, process.stderr]) {
+    stream.on('error', (e) => { if (e.code !== 'EPIPE') throw e; });
+  }
   const { main } = await import('../lib/cli.mjs');
   process.exitCode = await main(process.argv.slice(2));
 }
