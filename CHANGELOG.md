@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - A land reads an object `ship.config.mjs` for its floors straight from the mirror; only a function config is evaluated in a checkout.
+- One helper writes ship's state files atomically; a write that fails no longer leaves a `.tmp` file beside its target.
 
 ### Fixed
 

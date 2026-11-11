@@ -1,15 +1,28 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { readdirSync } from 'node:fs';
-import { repoKeyOf, runSteps, newLogFile, withLane, acquireShared, laneWaitReporter, ordinal, LANE_PRIORITY, lockWithin } from '../lib/shared.mjs';
+import { repoKeyOf, runSteps, newLogFile, withLane, acquireShared, laneWaitReporter, ordinal, LANE_PRIORITY, lockWithin, writeFileAtomic, writeJsonAtomic } from '../lib/shared.mjs';
 import { acquire, ownerInfo } from '../lib/lock.mjs';
 import { syncMirror } from '../lib/repo.mjs';
 import { tempDir, waitUntil } from './helpers.mjs';
 
 test('repoKeyOf', () => {
   assert.equal(repoKeyOf('acme/app'), 'acme__app');
+});
+
+test('writeFileAtomic: the file appears whole in a directory it makes, with the mode asked for; a failed write leaves nothing beside it', async () => {
+  const dir = await tempDir();
+  const file = join(dir, 'a', 'b', 'x.json');
+  await writeJsonAtomic(file, { a: 1 });
+  assert.equal(await readFile(file, 'utf8'), '{"a":1}\n');
+  await writeFileAtomic(join(dir, 'private'), 'secret\n', { mode: 0o600 });
+  assert.equal((await stat(join(dir, 'private'))).mode & 0o777, 0o600);
+  // The rename onto a directory fails: the write aside is removed, not left as a .tmp.
+  await mkdir(join(dir, 'taken'));
+  await assert.rejects(writeFileAtomic(join(dir, 'taken'), 'x'));
+  assert.deepEqual((await readdir(dir)).filter((n) => n.endsWith('.tmp')), []);
 });
 
 test('runSteps runs steps in order, honours step cwd and env, stops at the first failure', async () => {
