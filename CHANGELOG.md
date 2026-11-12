@@ -6,6 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- A land ends with exit 3 at once, naming the block, when a deployable it touches is blocked for a reason that does not clear by itself (imports outside its paths, a live commit not in the repository or not on main). It no longer waits for the debounce and a deploy that fails. `live unknown` still goes to the deploy, which reads live again.
 - A land reads an object `ship.config.mjs` for its floors straight from the mirror; only a function config is evaluated in a checkout.
 - One helper writes ship's state files atomically; a write that fails no longer leaves a `.tmp` file beside its target.
 
