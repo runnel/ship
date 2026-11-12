@@ -178,7 +178,20 @@ test('a blocked deployable\'s backlog is left out too (it imports files outside 
   const { d } = landD(s);
   const cache = await liveFor({ d, repo: 't/r' });
   assert.equal(cache.deployables.tick.status, 'blocked');
+  assert.match(cache.deployables.tick.blockedFor, /^imports files outside its paths: /, 'a block that does not clear by itself is named');
   assert.equal(cache.oldestUnliveAtMs, null);
+});
+
+test('the cache names a block that does not clear by itself; live unknown is not one', async () => {
+  const missing = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': at('c'.repeat(40)) }), change: { 'app/src/a.ts': '2' } });
+  let cache = await liveFor({ d: landD(missing).d, repo: 't/r' });
+  assert.equal(cache.deployables.tick.status, 'blocked');
+  assert.equal(cache.deployables.tick.blockedFor, 'live commit ccccccc is not in t/r');
+  assert.equal(cache.deployables.app.blockedFor, null);
+  const unknown = await setupDeploy({ seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': { versions: [{ message: 'by hand' }], deployments: [{ versionId: null }] } }), change: { 'app/src/a.ts': '2' } });
+  cache = await liveFor({ d: landD(unknown).d, repo: 't/r' });
+  assert.equal(cache.deployables.tick.status, 'blocked');
+  assert.equal(cache.deployables.tick.blockedFor, null, 'live unknown: the deploy reads live again itself, and a split deployment clears');
 });
 
 test('liveFor with no cache yet and another land reading: the tick waits, saying it has not been read', async () => {
@@ -242,6 +255,15 @@ test('decide, steps 6 and 2–4 in order: a failed deploy, a migration at the ti
   const unmet = { repo: 't/api', deployable: 'app', floor: 'c'.repeat(40), met: false, now: 'live at ddddddd' };
   assert.deepEqual(step(facts({ requires: [unmet] })), { wait: 'requires', line: '… waiting for t/api app to be live at or past ccccccc (live at ddddddd)' });
   assert.deepEqual(step(facts({ deployRunning: true })), { wait: 'deploying', line: '… a deploy of this repository is running; waiting for it to end' });
+});
+
+test('decide: a touched deployable blocked for good ends the land with 3; a running deploy and a hold come first', () => {
+  const stuck = { sha: TIP, contains: true, blocked: true, blockedFor: 'live ccccccc is not an ancestor of main: code that is not on main is deployed' };
+  assert.deepEqual(step(facts({ live: { app: stuck } })), { done: 3, line: '✗ PR #7 merged as aaaaaaa but not live: app is blocked: live ccccccc is not an ancestor of main: code that is not on main is deployed — the owner decides; ship status' });
+  assert.equal(step(facts({ live: { app: stuck }, deployRunning: true })).wait, 'deploying');
+  assert.match(step(facts({ live: { app: stuck }, holds: { app: { reason: 'x', at: null } } })).line, /: app is held since \?: x — /);
+  assert.equal(step(facts({ live: { app: { sha: null, contains: false, blocked: false, blockedFor: null } } })).wait, 'debounce', 'live unknown is not blocked for good');
+  assert.equal(step(facts({ live: { app: facts().live.app, tick: stuck } })).wait, 'debounce', 'one the PR does not touch does not end it');
 });
 
 test('decide: the current tip whose deploy ended ok is not deployed again; it waits for the live cache', () => {
@@ -348,6 +370,42 @@ test('a hold on a deployable the PR touches ends the land with 3; a hold elsewhe
   assert.equal(await elsewhere.wait(), 0, elsewhere.s.lines.join('\n'));
   assert.equal(elsewhere.starts.length, 1, 'the deploy ran (and returned 1 for the held tick)');
   assert.match(elsewhere.s.lines.at(-1), /^✓ PR #9 is live \(merged as [0-9a-f]{7}\): app at [0-9a-f]{7}$/);
+});
+
+test('a touched deployable blocked for good ends the land with 3 at once, naming the block; no deploy is started', async () => {
+  const l = await landed({ change: { 'workers/tick/src/index.ts': "import '../../../app/src/a.ts';\nexport default {};\n" } });
+  assert.equal(await l.wait(), 3);
+  assert.match(l.s.lines.at(-1), /^✗ PR #9 merged as [0-9a-f]{7} but not live: tick is blocked: imports files outside its paths: .+ — the owner decides; ship status$/);
+  assert.deepEqual(l.starts, []);
+  assert.equal(l.ticks.length, 0, 'at the first look, not after the debounce');
+});
+
+test('a block in a cache read before the merge is read again: the merge may have cleared it', async () => {
+  const bad = { 'workers/tick/src/index.ts': "import '../../../app/src/a.ts';\nexport default {};\n" };
+  const s = await setupDeploy({ seed: seedFirst, change: bad });
+  const before = landD(s, { now: () => Date.now() - 60_000 });
+  assert.match((await liveFor({ d: before.d, repo: 't/r' })).deployables.tick.blockedFor, /^imports files outside/);
+  const l = await landed({ from: s, merge: async () => {
+    const fixed = await commitFiles(s.work, { 'workers/tick/src/index.ts': 'export default { fixed: 1 };\n' }, 'fix (#9)');
+    await git(['push', '--quiet', s.deps.remoteUrl(), 'main'], s.work);
+    return fixed;
+  } });
+  assert.equal(await l.wait(), 0, l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1);
+});
+
+test('a touched deployable whose live is unknown is not ended at once: the deploy reads live again, and a read that clears ships', async () => {
+  const l = await landed({
+    seed: ({ first }) => ({ 'example-app': at(first), 'example-tick': { versions: [{ message: 'by hand' }], deployments: [{ versionId: null }] } }),
+    change: { 'workers/tick/src/index.ts': 'export default { x: 1 };\n' },
+    onTick: async (n, { s }) => {
+      if (n !== 1) return;
+      const v = s.cloud.addVersion('example-tick', { message: `sha:${s.first} x` });
+      s.cloud.addDeployment('example-tick', v.id, { message: `sha:${s.first} x` });
+    },
+  });
+  assert.equal(await l.wait(), 0, l.s.lines.join('\n'));
+  assert.equal(l.starts.length, 1);
 });
 
 test('a direct deploy\'s own in-progress hold does not end the land: it waits, then is live when the deploy ends 0', async () => {

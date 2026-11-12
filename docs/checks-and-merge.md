@@ -221,11 +221,18 @@ cache, and does the first of these that applies:
    `deploy of <sha> in progress` hold while it runs and clears it when it ends 0.
 5. **A hold on a deployable the merge touched: exit 3**, naming the hold; the owner decides. With
    nothing running, a marker a dead deploy left is such a hold.
-6. **`requires`.** Each `requires` entry of the config must be live at or past its floor (below);
+6. **A deployable the merge touched is blocked for good: exit 3**, naming the block; no deploy is
+   started, as it would refuse the deployable the same way. Such a block is one that does not clear
+   by itself: the deployable imports files outside its paths, or its live commit is not in the
+   repository or not an ancestor of main. Only a plan of a main that has the merge counts; a cache
+   read before the merge that names a block is read again at once, since the merge may clear it.
+   `live unknown` is not such a block: the deploy reads live again itself, and a split deployment
+   during a rollout clears.
+7. **`requires`.** Each `requires` entry of the config must be live at or past its floor (below);
    until then the land waits and says what for.
-7. **A deploy that ended 0 for this tip.** A deploy that ended with code 0 for the current tip of
+8. **A deploy that ended 0 for this tip.** A deploy that ended with code 0 for the current tip of
    main is never run again; the land waits for it to show as live.
-8. **Start the deploy**, once the land line has been quiet for `debounceSec`, or a merge has
+9. **Start the deploy**, once the land line has been quiet for `debounceSec`, or a merge has
    waited `deployAfterMin` ([Deploys that ship land starts](deploy.md#deploys-that-ship-land-starts)).
    Otherwise it says when the deploy will start.
 
@@ -276,7 +283,7 @@ Exit codes:
 | 0 | landed: live, or merged with nothing to deploy |
 | 1 | a check step failed (the output ends with the step's last lines and the log path) |
 | 2 | refused, nothing merged: not open, from a fork, base not main, a conflict with main, a new head was pushed, the same PR and head already landing, main kept moving, a PR merged by someone else, or GitHub still shows an older head after 60 s |
-| 3 | merged, not live: the deploy that carried the merge failed, a deployable it touched is held, `liveWaitHours` passed, GitHub or the mirror does not show the merge commit in time, or ship failed after the merge (`ship status`) |
+| 3 | merged, not live: the deploy that carried the merge failed, a deployable it touched is held or blocked for good, `liveWaitHours` passed, GitHub or the mirror does not show the merge commit in time, or ship failed after the merge (`ship status`) |
 | 4 | not merged: an error in ship, the config, GitHub or a time limit, before the merge; landing again is safe |
 | 5 | the merge outcome is unknown: `gh pr merge` failed and the pull request could not be read |
 | 130 | interrupted |
