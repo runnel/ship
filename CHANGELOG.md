@@ -12,6 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A versioned deploy no longer refuses to promote because Cloudflare's versions list is late: it waits (up to 90 s) until its own upload is listed and refuses only when a version with a higher number than ours exists. An upload that never shows ends with `our upload … is not in the versions list`, not `was made after ours`.
 - `ship queue | head` and other early-closing readers no longer end ship with an unhandled `EPIPE`; the command runs to its own end.
 - A land that waits out `liveWaitHours` names the hold on a deployable it touches in its last line.
 - A land records its floors under the head before the merge, so a deploy in the moments before GitHub names the merge commit is held to them too.
