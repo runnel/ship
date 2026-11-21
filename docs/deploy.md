@@ -142,7 +142,11 @@ older one is fine.
    config whose `name` is not the deployable's `worker`. `versioned`: refuses when a setting only
    `wrangler deploy` applies differs (crons, routes, workers.dev and preview URLs, Durable Object
    migrations, observability, logpush, tail consumers); builds; `wrangler versions upload`; probes
-   the preview URL; checks that live has not moved and that the newest version is ours; promotes.
+   the preview URL; checks that live has not moved and that no version with a higher number than
+   ours exists; promotes. Cloudflare can list a fresh upload some seconds late, and until it does
+   the newest listed version is an older one, so ship reads the list again, for up to 90 s, until
+   our upload is in it. An upload that is still not listed then ends the deploy with live untouched
+   (`our upload … is not in the versions list`).
    `direct`: builds; checks that live has not moved; `wrangler deploy`. Both: the current version
    must be ours, live probes (a probe that gets no answer reports the error and its cause, such as
    `fetch failed (ECONNREFUSED)`), then (versioned, with a `liveMarker`) a check that the live host

@@ -499,6 +499,84 @@ const clock = () => {
   return { now: () => t, sleep: async (ms) => { t += ms; } };
 };
 
+// The versions list as Cloudflare answers it just after an upload: our version (the one whose
+// message starts with the target commit) is missing from the first `reads` reads that would have shown it.
+const lagListing = (reads) => (inner) => {
+  let left = reads;
+  return async (url, init = {}) => {
+    const res = await inner(url, init);
+    if (left === 0 || (init.method ?? 'GET') !== 'GET' || !/\/versions\?/.test(url)) return res;
+    const body = await res.clone().json();
+    const items = body.result.items.filter((v) => !v.annotations?.['workers/message']?.startsWith(`sha:${NEW}`));
+    if (items.length === body.result.items.length) return res;
+    left -= 1;
+    return new Response(JSON.stringify({ ...body, result: { ...body.result, items } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+};
+const listWait = (c, uploadListWindowMs = 90_000) => ({ uploadListWindowMs, probeIntervalMs: 1000, now: c.now, sleep: c.sleep });
+// An upload an earlier deploy left behind: never promoted, and numbered below the next one.
+const undeployedUpload = (cloud) => cloud.addVersion('example-app', { message: `sha:${'c'.repeat(40)} app run:earlier #5` });
+
+test('a versions list that lags the upload is waited out; the older upload listed first is no rival', async () => {
+  const c = clock();
+  const fx = await fixture({ fetchWrap: lagListing(3), deps: listWait(c) });
+  undeployedUpload(fx.cloud);
+  const res = await deployOne(fx.ctx);
+  assert.equal(res.outcome, 'deployed', res.detail);
+  assert.equal(posts(fx.cloud).length, 1);
+  assert.equal(await readHold(fx.stateRoot, 't/r', 'app'), null);
+  assert.ok(c.now() >= 3000 && c.now() < 90_000, `waited ${c.now()} ms`);
+});
+
+test('a lower-numbered upload listed beside ours does not block the promote, and nothing is waited on', async () => {
+  const c = clock();
+  const fx = await fixture({ deps: listWait(c) });
+  undeployedUpload(fx.cloud);
+  const res = await deployOne(fx.ctx);
+  assert.equal(res.outcome, 'deployed', res.detail);
+  assert.equal(posts(fx.cloud).length, 1);
+  assert.equal(c.now(), 0);
+});
+
+test('an upload with a higher number than ours blocks the promote at once', async () => {
+  const c = clock();
+  let once = true;
+  const { cloud } = await failsWith({ deps: listWait(c), probe: (p) => {
+    if (p.preview && once) { once = false; p.cloud.addVersion('example-app', { message: 'sha:' + 'd'.repeat(40) + ' app run:rival' }); }
+    return healthy(p);
+  } }, /was made after ours; not promoting/);
+  assert.deepEqual(posts(cloud), []);
+  assert.equal(c.now(), 0, 'ours is listed: there is nothing to wait for');
+});
+
+test('an upload that is never listed ends with its own message after the whole window, live untouched', async () => {
+  const c = clock();
+  const { cloud } = await failsWith({ fetchWrap: lagListing(1000), deps: listWait(c) }, /^our upload [0-9a-f]{8} is not in the versions list after 90 s; live untouched, not promoting — ship deploy again$/);
+  assert.deepEqual(posts(cloud), []);
+  assert.equal(c.now(), 90_000);
+});
+
+test('live moving while our upload is not listed yet ends the wait at once', async () => {
+  const other = 'c'.repeat(40);
+  const c = clock();
+  let cloud;
+  let moved = false;
+  const fx = await fixture({ deps: listWait(c), fetchWrap: (inner) => lagListing(1000)(async (url, init = {}) => {
+    if (cloud && !moved && /\/versions\?/.test(url)) {
+      moved = true;
+      const v = cloud.addVersion('example-app', { message: `sha:${other} other` });
+      cloud.addDeployment('example-app', v.id, { message: `sha:${other} other` });
+    }
+    return inner(url, init);
+  }) });
+  cloud = fx.cloud;
+  const res = await deployOne(fx.ctx);
+  assert.equal(res.outcome, 'failed');
+  assert.match(res.detail, /live changed during the deploy .*; not promoting/);
+  assert.deepEqual(posts(cloud), []);
+  assert.ok(c.now() < 90_000, `waited ${c.now()} ms`);
+});
+
 test('another version current right after the promote is held, not rolled over', async () => {
   const other = 'c'.repeat(40);
   const c = clock();
