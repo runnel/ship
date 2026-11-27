@@ -4,6 +4,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Added
+
+- The optional `notify` config block ([Notify](docs/configuration.md#notify)): when a land merges and then waits for a migration nobody has cleared, ship tells the owner once per file (the file, the command that clears it, and the merged pull requests waiting behind it) through a command that gets the message on stdin, with a macOS notification as a fallback, and once more when it is cleared and live.
+
 ### Changed
 
 - A land ends with exit 3 at once, naming the block, when a deployable it touches is blocked for a reason that does not clear by itself (imports outside its paths, a live commit not in the repository or not on main). It no longer waits for the debounce and a deploy that fails. `live unknown` still goes to the deploy, which reads live again.

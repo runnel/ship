@@ -72,3 +72,35 @@ land: { deployAfterMin: 60, debounceSec: 120, liveWaitHours: 12 },
   24, because the records of the deploys a land started are kept a day.
 
 Each must be a positive number; an unknown key in the block is a config error.
+
+## Notify
+
+A land that has merged and then waits for a migration nobody has cleared holds back the deploy of
+everything merged after it. `ship land` usually runs in the background, where nobody reads its
+output, so the optional `notify` block tells the owner some other way.
+
+```js
+notify: { command: ['node', '/path/to/post.mjs', 'post', 'D0123456789', '-'], desktop: true, timeoutSec: 30 },
+```
+
+- `command`: an argv array, run without a shell and with ship's plain child environment. It gets the
+  message on stdin; exit 0 means it was sent. Optional.
+- `desktop`: when there is no `command`, or it fails, show a macOS notification instead. Default
+  `true`.
+- `timeoutSec`: how long the command may take (default 30, at most 300).
+
+What is sent:
+
+- Once per migration file and hold, by the first land that sees it uncleared at main's tip: the
+  repository, the file and the pull request that added it, the command that clears it (`ship
+  migrations apply …`, or `ship migrations ack …` without `migrations.apply`), and the merged pull
+  requests that wait behind it. A marker in `~/.ship/notified/<owner>__<repo>/` keeps every other
+  land from sending it again.
+- Once the file is cleared and nothing waits for a deploy any more (every deployable is live at its
+  last change on main): a short second message from the land that ends live and sees that. This
+  removes the marker. A marker whose file is no longer a migration at main's tip (its pull request
+  was reverted), or that is older than a day, is dropped without a message, so a later hold of the
+  same file is told again.
+
+A notification that cannot be sent is said in the land's own output; the land goes on. Without the
+block ship sends nothing. Notification only: nothing about applying or clearing changes.
