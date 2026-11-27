@@ -17,6 +17,7 @@ import { commitTimeMs, mirrorPath } from '../lib/git.mjs';
 import { syncMirror } from '../lib/repo.mjs';
 import { at, inProcessDeploy, requiresSetup, setupDeploy } from './deploy-fixture.mjs';
 import { capture } from '../lib/proc.mjs';
+import { claimMarker, markedFiles } from '../lib/notify.mjs';
 import { atTestEnd, commitFiles, git, stopBackground } from './helpers.mjs';
 
 afterEach(stopBackground, { timeout: 30_000 });
@@ -343,7 +344,7 @@ async function landed({ change = { 'app/src/a.ts': '2' }, seed = seedFirst, ack 
   const changes = await landedChanges({ d, r, mergeSha });
   changes.config = { ...changes.config, land: { ...changes.config.land, ...land } };
   const wait = (over = {}) => waitLive({ d, repo: 't/r', cwd: s.work, pr: 9, mergeSha, mergedAtMs: clock.t, changes, floors: {}, ...over });
-  return { s, d, clock, starts, ticks, mergeSha, wait };
+  return { s, d, clock, starts, ticks, mergeSha, wait, changes };
 }
 const tipTime = (l) => commitTimeMs(mirrorPath('t/r', l.d.mirrorRoot), l.s.head);
 
@@ -491,6 +492,91 @@ test('an uncleared migration at the tip from another PR makes the land wait with
   assert.ok(!o.s.lines.some((l) => l.includes('ship migrations ack')), 'the hint is for the PR that added it');
   assert.deepEqual(o.starts, []);
   assert.equal(o.s.lines.at(-1), `✗ PR #9 merged as ${o.s.head.slice(0, 7)} but not live after 0.02 h — ship status`);
+});
+
+// The owner is told once per migration file and hold, through config.notify, and once more when it
+// is cleared and what waited is live.
+function withNotify(l, notify = { command: ['notify-test'], desktop: true, timeoutSec: 30 }) {
+  const sent = [];
+  const desktop = [];
+  l.d.notifyCommand = async (command, text) => { sent.push({ command, text }); return l.failNotify ?? null; };
+  l.d.desktopNotify = async (title, text) => { desktop.push({ title, text }); return null; };
+  return { sent, desktop, wait: () => l.wait({ changes: { ...l.changes, config: { ...l.changes.config, notify } } }) };
+}
+
+test('notify: a migration-only PR tells the owner once while it waits, then once that it is cleared', async () => {
+  const m = await landed({ change: { 'db/002_x.sql': '' }, onTick: async (n, { s }) => { if (n === 4) await addAcks(s.deps.stateRoot, 't/r', ['db/002_x.sql']); } });
+  const n = withNotify(m);
+  assert.equal(await n.wait(), 0, m.s.lines.join('\n'));
+  assert.equal(n.sent.length, 2, JSON.stringify(n.sent));
+  const [held, cleared] = n.sent.map((x) => x.text);
+  assert.deepEqual(n.sent[0].command, ['notify-test']);
+  assert.match(held, /^⏸ t\/r: the deploy waits for migration\(s\) not cleared for deploy\n  db\/002_x\.sql \(#9\)\nIn a checkout of t\/r:\n/);
+  assert.ok(held.includes('ship migrations ack 002_x.sql'), held);
+  assert.ok(held.endsWith('\nMerged and waiting behind it: #9'), held);
+  assert.match(cleared, /^✓ t\/r: db\/002_x\.sql cleared; nothing waits for a deploy any more \(main@[0-9a-f]{7} is live\)$/);
+  assert.deepEqual(n.desktop, [], 'the command worked: no desktop notification');
+  assert.ok(m.s.lines.includes('· told the owner that db/002_x.sql holds the deploy back'), m.s.lines.join('\n'));
+});
+
+test('notify: a land behind another PR\'s migration names what waits, and says the deploy is live once it is', async () => {
+  const o = await landed({ onTick: async (n, { s }) => { if (n === 3) await addAcks(s.deps.stateRoot, 't/r', ['db/003_y.sql']); } });
+  await commitFiles(o.s.work, { 'db/003_y.sql': '' }, 'another migration (#10)');
+  await git(['push', '--quiet', o.d.remoteUrl(), 'main'], o.s.work);
+  const n = withNotify(o);
+  assert.equal(await n.wait(), 0, o.s.lines.join('\n'));
+  assert.equal(o.starts.length, 1);
+  assert.equal(n.sent.length, 2, JSON.stringify(n.sent));
+  assert.ok(n.sent[0].text.includes('  db/003_y.sql (#10)'), n.sent[0].text);
+  assert.ok(n.sent[0].text.endsWith('\nMerged and waiting behind it: #9 #10'), n.sent[0].text);
+  assert.match(n.sent[1].text, /^✓ t\/r: db\/003_y\.sql cleared; nothing waits for a deploy any more \(main@[0-9a-f]{7} is live\)$/);
+});
+
+test('notify: a second land waiting on the same file does not tell the owner again', async () => {
+  const land = { liveWaitHours: 0.02 };
+  const first = await landed({ change: { 'db/002_x.sql': '' }, land });
+  const a = withNotify(first);
+  assert.equal(await a.wait(), 3);
+  const again = withNotify(first);
+  assert.equal(await again.wait(), 3);
+  assert.equal(a.sent.length, 1);
+  assert.equal(again.sent.length, 0, 'the marker of the first is still there: the file is still uncleared');
+});
+
+test('notify: markers that stand for no hold are dropped: a file gone from main, and one older than a day', async () => {
+  const l = await landed({ change: { 'db/002_x.sql': '' }, land: { liveWaitHours: 0.01 } });
+  const root = l.s.deps.stateRoot;
+  await claimMarker(root, 't/r', 'db/001_reverted.sql', { at: new Date(l.clock.t).toISOString() });
+  await claimMarker(root, 't/r', 'db/002_x.sql', { at: new Date(l.clock.t - 25 * 3_600_000).toISOString() });
+  const n = withNotify(l);
+  assert.equal(await n.wait(), 3);
+  assert.equal(n.sent.length, 1, 'the day-old marker of 002 no longer silences it');
+  assert.deepEqual(await markedFiles(root, 't/r'), ['db/002_x.sql']);
+});
+
+test('notify: a failing command falls back to a desktop notification; desktop: false stays quiet', async () => {
+  const l = await landed({ change: { 'db/002_x.sql': '' }, land: { liveWaitHours: 0.01 } });
+  l.failNotify = 'exit 1: no token';
+  const n = withNotify(l);
+  assert.equal(await n.wait(), 3);
+  assert.equal(n.sent.length, 1);
+  assert.equal(n.desktop.length, 1);
+  assert.equal(n.desktop[0].title, 'ship: t/r waits for a migration');
+  assert.ok(l.s.lines.includes('! the notify command failed (exit 1: no token); showing a desktop notification instead'), l.s.lines.join('\n'));
+
+  const q = await landed({ change: { 'db/002_x.sql': '' }, land: { liveWaitHours: 0.01 } });
+  q.failNotify = 'exit 1';
+  const quiet = withNotify(q, { command: ['notify-test'], desktop: false, timeoutSec: 30 });
+  assert.equal(await quiet.wait(), 3);
+  assert.equal(quiet.desktop.length, 0);
+});
+
+test('notify: without a notify block nothing is sent and no marker is made', async () => {
+  const l = await landed({ change: { 'db/002_x.sql': '' }, land: { liveWaitHours: 0.01 } });
+  const n = withNotify(l, null);
+  assert.equal(await n.wait(), 3);
+  assert.deepEqual([n.sent, n.desktop], [[], []]);
+  assert.deepEqual(await markedFiles(l.s.deps.stateRoot, 't/r'), []);
 });
 
 test('the deploy starts once the line has been quiet for debounceSec; ticks make no Cloudflare calls between refreshes', async () => {
